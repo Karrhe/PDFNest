@@ -109,6 +109,9 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertIn("latex-frac", html)
         self.assertIn("latex-sqrt", html)
         self.assertIn("<table>", html)
+        self.assertNotIn("<p><div class=\"math-block\"", html)
+        self.assertIn("margin: 4px 0 6px 0", html)
+        self.assertIn("padding: 4px 8px", html)
 
     def test_pdf_canvas_tints_white_pages_beige(self) -> None:
         pixmap = QPixmap(40, 40)
@@ -159,8 +162,7 @@ class GuiSmokeTest(unittest.TestCase):
                 self.app.processEvents()
 
                 target_canvas = first_window.page_canvases[3]
-                target_value = target_canvas.y() + target_canvas.height() // 2 - first_window.scroll_area.viewport().height() // 2
-                first_window.scroll_area.verticalScrollBar().setValue(target_value)
+                first_window.scroll_area.verticalScrollBar().setValue(target_canvas.y())
                 first_window._sync_current_page_from_scroll()
                 self.assertEqual(first_window.page_index, 3)
             finally:
@@ -170,6 +172,43 @@ class GuiSmokeTest(unittest.TestCase):
             second_window.load_pdf(pdf_path)
             self.assertEqual(second_window.page_index, 3)
             second_window.close()
+
+    def test_history_open_restores_last_page_for_existing_pdf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=5)
+            pdf_key = pdf_key_for_path(pdf_path)
+            save_history(
+                [
+                    PdfHistoryEntry(
+                        pdf_key=pdf_key,
+                        path=str(pdf_path),
+                        title="sample.pdf",
+                        last_page_index=3,
+                        page_count=5,
+                        opened_at="2026-01-01T00:00:00+00:00",
+                        updated_at="2026-01-01T00:00:00+00:00",
+                    )
+                ]
+            )
+
+            window = MainWindow()
+            self.assertEqual(window.page_index, 3)
+            window.close_document()
+            window.page_index = 0
+            window.show_home()
+            window.open_history_entry(pdf_key)
+            self.assertEqual(window.page_index, 3)
+            window.close()
+
+    def test_reader_blank_area_uses_beige_palette(self) -> None:
+        window = MainWindow()
+        beige = "#f0ead8"
+        self.assertEqual(window.scroll_area.viewport().palette().color(window.scroll_area.viewport().backgroundRole()).name(), beige)
+        self.assertEqual(window.pages_container.palette().color(window.pages_container.backgroundRole()).name(), beige)
+        window.close()
 
     def test_missing_history_entry_can_be_relocated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

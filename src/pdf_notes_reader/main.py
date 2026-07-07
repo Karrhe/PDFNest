@@ -7,8 +7,8 @@ from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QPoint, QSize, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -145,12 +145,14 @@ def restore_placeholders(text: str, placeholders: dict[str, str]) -> str:
 
 def render_markdown_preview(text: str) -> str:
     placeholders: dict[str, str] = {}
+    block_tokens: set[str] = set()
     prepared, protected_code = protect_code_segments(text)
 
     def replace_block(match: re.Match[str]) -> str:
         token = f"@@PDF_NOTES_MATH_BLOCK_{len(placeholders)}@@"
         formula = latex_to_html(match.group(1))
         placeholders[token] = f'<div class="math-block">{formula}</div>'
+        block_tokens.add(token)
         return token
 
     def replace_inline(match: re.Match[str]) -> str:
@@ -170,6 +172,8 @@ def render_markdown_preview(text: str) -> str:
         prepared,
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
     )
+    for token in block_tokens:
+        body = body.replace(f"<p>{token}</p>", placeholders[token])
     for token, rendered in placeholders.items():
         body = body.replace(token, rendered)
 
@@ -182,6 +186,9 @@ def render_markdown_preview(text: str) -> str:
             font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
             font-size: 14px;
             line-height: 1.55;
+          }}
+          p {{
+            margin: 0 0 8px 0;
           }}
           code {{
             background: #eee5cf;
@@ -246,8 +253,9 @@ def render_markdown_preview(text: str) -> str:
             border-radius: 6px;
             color: #7a4d00;
             font-family: Cambria Math, Times New Roman, serif;
-            margin: 10px 0;
-            padding: 10px;
+            line-height: 1.2;
+            margin: 4px 0 6px 0;
+            padding: 4px 8px;
             text-align: center;
           }}
         </style>
@@ -540,12 +548,14 @@ class MainWindow(QMainWindow):
         self.zoom = 1.25
         self.render_scale = 2.0
         self.continuous_scroll = True
+        self._suppress_scroll_sync = False
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.canvas = PdfCanvas()
         self.page_canvases: dict[int, PdfCanvas] = {}
 
         self.pages_container = QWidget()
+        self.pages_container.setObjectName("PagesContainer")
         self.pages_layout = QVBoxLayout(self.pages_container)
         self.pages_layout.setContentsMargins(24, 24, 24, 24)
         self.pages_layout.setSpacing(18)
@@ -556,6 +566,8 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         self.scroll_area.setBackgroundRole(self.backgroundRole())
+        self.scroll_area.viewport().setObjectName("ReaderViewport")
+        self.scroll_area.viewport().setAutoFillBackground(True)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
@@ -584,7 +596,7 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._render_empty_state()
         self.apply_theme()
-        self.show_home()
+        self.restore_last_session()
         self._refresh_actions()
 
     def _build_toolbar(self) -> None:
@@ -723,6 +735,15 @@ class MainWindow(QMainWindow):
         if self.document is not None:
             self.main_stack.setCurrentWidget(self.reader_splitter)
         self._refresh_actions()
+
+    def restore_last_session(self) -> bool:
+        for entry in self.history_entries:
+            path = Path(entry.path)
+            if path.exists():
+                self.load_pdf(path, pdf_key=entry.pdf_key, restore_last_page=True)
+                return True
+        self.show_home()
+        return False
 
     def render_page(self) -> None:
         if self.document is None:
@@ -872,18 +893,42 @@ class MainWindow(QMainWindow):
     def _scroll_to_page(self, page_index: int) -> None:
         canvas = self.page_canvases.get(page_index)
         if canvas is not None:
+            self._suppress_scroll_sync = True
+            self.pages_layout.activate()
+            self.pages_container.adjustSize()
             self.scroll_area.ensureWidgetVisible(canvas, 0, 0)
+            self.scroll_area.verticalScrollBar().setValue(max(0, canvas.y() - self.pages_layout.spacing()))
+            self.page_index = page_index
+            self.canvas = canvas
+            self._refresh_actions()
+            self._suppress_scroll_sync = False
+            QTimer.singleShot(0, lambda page=page_index: self._finish_programmatic_scroll(page))
+
+    def _finish_programmatic_scroll(self, page_index: int) -> None:
+        canvas = self.page_canvases.get(page_index)
+        if canvas is not None:
+            self._suppress_scroll_sync = True
+            self.scroll_area.ensureWidgetVisible(canvas, 0, 0)
+            self.scroll_area.verticalScrollBar().setValue(max(0, canvas.y() - self.pages_layout.spacing()))
+            self.page_index = page_index
+            self.canvas = canvas
+            self._refresh_actions()
+        self._suppress_scroll_sync = False
 
     def _sync_current_page_from_scroll(self) -> None:
-        if self.document is None or not self.continuous_scroll or not self.page_canvases:
+        if self._suppress_scroll_sync or self.document is None or not self.continuous_scroll or not self.page_canvases:
             return
 
-        visible_center = self.scroll_area.verticalScrollBar().value() + self.scroll_area.viewport().height() / 2
+        visible_y = self.scroll_area.verticalScrollBar().value() + 12
         closest_page = self.page_index
         closest_distance = float("inf")
         for page_index, canvas in self.page_canvases.items():
-            canvas_center = canvas.y() + canvas.height() / 2
-            distance = abs(canvas_center - visible_center)
+            canvas_top = canvas.y()
+            canvas_bottom = canvas_top + canvas.height()
+            if canvas_top <= visible_y <= canvas_bottom:
+                closest_page = page_index
+                break
+            distance = abs(canvas_top - visible_y)
             if distance < closest_distance:
                 closest_distance = distance
                 closest_page = page_index
@@ -942,6 +987,14 @@ class MainWindow(QMainWindow):
         self.zoom_label.setText(f"{round(self.zoom * 100)}%")
 
     def apply_theme(self) -> None:
+        reader_background = QColor("#f0ead8")
+        for widget in (self.scroll_area, self.scroll_area.viewport(), self.pages_container):
+            palette = widget.palette()
+            palette.setColor(QPalette.Window, reader_background)
+            palette.setColor(QPalette.Base, reader_background)
+            widget.setPalette(palette)
+            widget.setAutoFillBackground(True)
+
         self.setStyleSheet(
             """
             QMainWindow {
@@ -973,6 +1026,12 @@ class MainWindow(QMainWindow):
             QScrollArea {
                 background: #e8dfc8;
                 border: 0;
+            }
+            QScrollArea > QWidget > QWidget {
+                background: #f0ead8;
+            }
+            #ReaderViewport, #PagesContainer {
+                background: #f0ead8;
             }
             QSplitter::handle {
                 background: #c7b98f;

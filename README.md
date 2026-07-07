@@ -9,7 +9,7 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Navigate pages with toolbar buttons or keyboard arrow keys.
 - Zoom in or out.
 - Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
-- Apply a warm beige reading tint to the PDF page content as well as the UI.
+- Apply a warm beige reading tint to the PDF page content, the reader blank area, and the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
 - Show note markers as colored dots on the page.
@@ -194,6 +194,7 @@ When opening a PDF from history:
 
 - If `path` exists, the app opens it and jumps to `last_page_index`.
 - In continuous scroll mode, the current page is updated from the scroll position and saved when returning Home or closing the window.
+- On app startup, the most recent existing PDF is reopened at its saved page; opening an existing PDF from Home history also restores its saved page.
 - If `path` no longer exists, the app asks whether to relocate the PDF.
 - If relocated, the history entry keeps the same `pdf_key`, updates the absolute path, and restores the last-read page.
 
