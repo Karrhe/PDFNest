@@ -5,7 +5,7 @@ from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,26 +31,35 @@ from pdf_notes_reader.notes import Note, find_note, load_notes, pdf_key_for_path
 
 
 class PdfCanvas(QWidget):
-    add_note_requested = Signal(float, float)
+    add_note_requested = Signal(int, float, float)
     note_selected = Signal(str)
 
-    def __init__(self) -> None:
+    def __init__(self, page_index: int = 0) -> None:
         super().__init__()
+        self.page_index = page_index
         self._pixmap: QPixmap | None = None
+        self._page_size = QSize(640, 480)
         self._notes: list[Note] = []
         self._marker_radius = 7
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-    def set_page(self, pixmap: QPixmap | None, notes: list[Note]) -> None:
+    def set_page(self, pixmap: QPixmap | None, notes: list[Note], display_size: QSize | None = None) -> None:
         self._pixmap = pixmap
         self._notes = notes
         if pixmap is None:
-            self.setFixedSize(640, 480)
+            self._page_size = QSize(640, 480)
         else:
-            self.setFixedSize(pixmap.size())
+            self._page_size = display_size or pixmap.deviceIndependentSize().toSize()
+        self.setFixedSize(self._page_size)
         self.update()
+
+    def render_device_pixel_ratio(self) -> float:
+        if self._pixmap is None:
+            return 1.0
+        return self._pixmap.devicePixelRatio()
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
@@ -61,7 +70,8 @@ class PdfCanvas(QWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, "Open a PDF to begin")
             return
 
-        painter.drawPixmap(0, 0, self._pixmap)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.rect(), self._pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         for note in self._notes:
@@ -80,7 +90,7 @@ class PdfCanvas(QWidget):
         chosen = menu.exec(event.globalPos())
         if chosen == add_action:
             x_norm, y_norm = self._point_to_norm(event.pos())
-            self.add_note_requested.emit(x_norm, y_norm)
+            self.add_note_requested.emit(self.page_index, x_norm, y_norm)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.button() != Qt.LeftButton or self._pixmap is None:
@@ -93,17 +103,17 @@ class PdfCanvas(QWidget):
     def _inside_page(self, point: QPoint) -> bool:
         if self._pixmap is None:
             return False
-        return 0 <= point.x() < self._pixmap.width() and 0 <= point.y() < self._pixmap.height()
+        return 0 <= point.x() < self._page_size.width() and 0 <= point.y() < self._page_size.height()
 
     def _point_to_norm(self, point: QPoint) -> tuple[float, float]:
-        if self._pixmap is None or self._pixmap.width() == 0 or self._pixmap.height() == 0:
+        if self._pixmap is None or self._page_size.width() == 0 or self._page_size.height() == 0:
             return 0.0, 0.0
-        return point.x() / self._pixmap.width(), point.y() / self._pixmap.height()
+        return point.x() / self._page_size.width(), point.y() / self._page_size.height()
 
     def _note_center(self, note: Note) -> QPoint:
         if self._pixmap is None:
             return QPoint()
-        return QPoint(round(note.x_norm * self._pixmap.width()), round(note.y_norm * self._pixmap.height()))
+        return QPoint(round(note.x_norm * self._page_size.width()), round(note.y_norm * self._page_size.height()))
 
     def _note_at(self, point: QPoint) -> Note | None:
         for note in reversed(self._notes):
@@ -202,22 +212,31 @@ class MainWindow(QMainWindow):
         self.notes: list[Note] = []
         self.page_index = 0
         self.zoom = 1.25
+        self.render_scale = 2.0
+        self.continuous_scroll = True
 
+        self.setFocusPolicy(Qt.StrongFocus)
         self.canvas = PdfCanvas()
-        self.canvas.add_note_requested.connect(self.add_note)
-        self.canvas.note_selected.connect(self.select_note)
+        self.page_canvases: dict[int, PdfCanvas] = {}
 
-        scroll = QScrollArea()
-        scroll.setWidget(self.canvas)
-        scroll.setAlignment(Qt.AlignCenter)
-        scroll.setBackgroundRole(self.backgroundRole())
+        self.pages_container = QWidget()
+        self.pages_layout = QVBoxLayout(self.pages_container)
+        self.pages_layout.setContentsMargins(24, 24, 24, 24)
+        self.pages_layout.setSpacing(18)
+        self.pages_layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidget(self.pages_container)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setAlignment(Qt.AlignCenter)
+        self.scroll_area.setBackgroundRole(self.backgroundRole())
 
         self.note_panel = NotePanel()
         self.note_panel.save_requested.connect(self.save_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(scroll)
+        splitter.addWidget(self.scroll_area)
         splitter.addWidget(self.note_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
@@ -227,6 +246,7 @@ class MainWindow(QMainWindow):
         self.page_label = QLabel("No PDF")
         self.zoom_label = QLabel("125%")
         self._build_toolbar()
+        self._render_empty_state()
         self._refresh_actions()
 
     def _build_toolbar(self) -> None:
@@ -247,6 +267,14 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.next_action)
 
         toolbar.addWidget(self.page_label)
+        toolbar.addSeparator()
+
+        self.continuous_action = QAction("Continuous Scroll", self)
+        self.continuous_action.setCheckable(True)
+        self.continuous_action.setChecked(self.continuous_scroll)
+        self.continuous_action.triggered.connect(self.set_continuous_scroll)
+        toolbar.addAction(self.continuous_action)
+
         toolbar.addSeparator()
 
         self.zoom_out_action = QAction("Zoom Out", self)
@@ -288,29 +316,79 @@ class MainWindow(QMainWindow):
 
     def render_page(self) -> None:
         if self.document is None:
-            self.canvas.set_page(None, [])
+            self._render_empty_state()
             self._refresh_actions()
             return
 
-        page = self.document.load_page(self.page_index)
-        pix = page.get_pixmap(matrix=fitz.Matrix(self.zoom, self.zoom), alpha=False)
+        self._clear_page_widgets()
+        page_indexes = range(self.document.page_count) if self.continuous_scroll else [self.page_index]
+        for page_index in page_indexes:
+            canvas = self._create_canvas(page_index)
+            pixmap, display_size = self._render_page_pixmap(page_index)
+            page_notes = [note for note in self.notes if note.page_index == page_index]
+            canvas.set_page(pixmap, page_notes, display_size)
+            self.pages_layout.addWidget(canvas, 0, Qt.AlignHCenter)
+            self.page_canvases[page_index] = canvas
+
+        self.canvas = self.page_canvases.get(self.page_index) or next(iter(self.page_canvases.values()))
+        self._refresh_actions()
+        if self.continuous_scroll:
+            self._scroll_to_page(self.page_index)
+
+    def _render_page_pixmap(self, page_index: int) -> tuple[QPixmap, QSize]:
+        if self.document is None:
+            raise RuntimeError("No document loaded")
+
+        page = self.document.load_page(page_index)
+        render_zoom = self.zoom * self.render_scale
+        pix = page.get_pixmap(matrix=fitz.Matrix(render_zoom, render_zoom), alpha=False)
         image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
         pixmap = QPixmap.fromImage(image)
-        page_notes = [note for note in self.notes if note.page_index == self.page_index]
-        self.canvas.set_page(pixmap, page_notes)
-        self._refresh_actions()
+        pixmap.setDevicePixelRatio(self.render_scale)
+        display_size = QSize(round(pix.width / self.render_scale), round(pix.height / self.render_scale))
+        return pixmap, display_size
 
-    def add_note(self, x_norm: float, y_norm: float) -> None:
+    def _create_canvas(self, page_index: int) -> PdfCanvas:
+        canvas = PdfCanvas(page_index)
+        canvas.add_note_requested.connect(self.add_note)
+        canvas.note_selected.connect(self.select_note)
+        return canvas
+
+    def _render_empty_state(self) -> None:
+        self._clear_page_widgets()
+        self.canvas = self._create_canvas(0)
+        self.canvas.set_page(None, [])
+        self.pages_layout.addWidget(self.canvas, 0, Qt.AlignHCenter)
+        self.page_canvases[0] = self.canvas
+
+    def _clear_page_widgets(self) -> None:
+        while self.pages_layout.count():
+            item = self.pages_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+        self.page_canvases = {}
+
+    def add_note(self, *args: float) -> None:
         if self.document is None or self.pdf_key is None:
             return
+        if len(args) == 2:
+            page_index = self.page_index
+            x_norm, y_norm = args
+        elif len(args) == 3:
+            page_index = int(args[0])
+            x_norm, y_norm = args[1], args[2]
+        else:
+            raise TypeError("add_note expects x/y or page_index/x/y")
 
         note = Note.create(
             pdf_key=self.pdf_key,
-            page_index=self.page_index,
+            page_index=page_index,
             x_norm=x_norm,
             y_norm=y_norm,
             markdown="# New note\n",
         )
+        self.page_index = page_index
         self.notes.append(note)
         self.persist_notes()
         self.render_page()
@@ -361,14 +439,32 @@ class MainWindow(QMainWindow):
     def previous_page(self) -> None:
         if self.document is None or self.page_index <= 0:
             return
-        self.page_index -= 1
-        self.note_panel.set_note(None)
-        self.render_page()
+        self.go_to_page(self.page_index - 1)
 
     def next_page(self) -> None:
         if self.document is None or self.page_index >= self.document.page_count - 1:
             return
-        self.page_index += 1
+        self.go_to_page(self.page_index + 1)
+
+    def go_to_page(self, page_index: int) -> None:
+        if self.document is None:
+            return
+        self.page_index = max(0, min(page_index, self.document.page_count - 1))
+        self.note_panel.set_note(None)
+        if self.continuous_scroll:
+            self.canvas = self.page_canvases.get(self.page_index, self.canvas)
+            self._refresh_actions()
+            self._scroll_to_page(self.page_index)
+        else:
+            self.render_page()
+
+    def _scroll_to_page(self, page_index: int) -> None:
+        canvas = self.page_canvases.get(page_index)
+        if canvas is not None:
+            self.scroll_area.ensureWidgetVisible(canvas, 0, 0)
+
+    def set_continuous_scroll(self, checked: bool) -> None:
+        self.continuous_scroll = checked
         self.note_panel.set_note(None)
         self.render_page()
 
@@ -378,6 +474,27 @@ class MainWindow(QMainWindow):
         self.zoom = max(0.3, min(4.0, self.zoom + delta))
         self.render_page()
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        focus = QApplication.focusWidget()
+        if focus is not None and (
+            focus is self.note_panel.editor
+            or self.note_panel.editor.isAncestorOf(focus)
+            or focus is self.note_panel.preview
+            or self.note_panel.preview.isAncestorOf(focus)
+        ):
+            super().keyPressEvent(event)
+            return
+
+        if event.key() in (Qt.Key_Left, Qt.Key_Up, Qt.Key_PageUp):
+            self.previous_page()
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Right, Qt.Key_Down, Qt.Key_PageDown):
+            self.next_page()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _refresh_actions(self) -> None:
         has_document = self.document is not None
         page_count = self.document.page_count if self.document is not None else 0
@@ -385,6 +502,7 @@ class MainWindow(QMainWindow):
         self.next_action.setEnabled(has_document and self.page_index < page_count - 1)
         self.zoom_in_action.setEnabled(has_document)
         self.zoom_out_action.setEnabled(has_document)
+        self.continuous_action.setEnabled(has_document)
 
         if has_document:
             self.page_label.setText(f"Page {self.page_index + 1} / {page_count}")

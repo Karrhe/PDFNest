@@ -5,7 +5,10 @@ A Python desktop PDF reader with external anchored Markdown notes.
 ## Features
 
 - Open and render local PDF files.
-- Navigate pages and zoom in or out.
+- Read in continuous vertical scroll mode by default, or switch to single-page mode from the toolbar.
+- Navigate pages with toolbar buttons or keyboard arrow keys.
+- Zoom in or out.
+- Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
 - Right-click anywhere on a PDF page to add an anchored note.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
 - Show note markers as colored dots on the page.
@@ -37,6 +40,16 @@ If installed with `pip install -e .`, you can also run:
 ```powershell
 .\.venv\Scripts\pdf-notes-reader.exe
 ```
+
+## Reading Controls
+
+- `Continuous Scroll`: toolbar toggle. Enabled by default to show all pages stacked vertically.
+- `Previous` / `Next`: toolbar page navigation.
+- Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
+- `PageUp` / `PageDown`: previous or next page.
+- `Zoom In` / `Zoom Out`: re-renders the visible document at the selected zoom level.
+
+Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions.
 
 ## Data Storage
 
