@@ -731,6 +731,7 @@ class MainWindow(QMainWindow):
         self.fit_mode: str | None = None
         self.render_scale = 2.0
         self.render_page_buffer = 1
+        self.page_margin = 24
         self.continuous_scroll = True
         self.note_export_dir = default_data_dir() / "markdown_notes"
         self.page_widgets: dict[int, QWidget] = {}
@@ -749,7 +750,7 @@ class MainWindow(QMainWindow):
         self.pages_container = QWidget()
         self.pages_container.setObjectName("PagesContainer")
         self.pages_layout = QVBoxLayout(self.pages_container)
-        self.pages_layout.setContentsMargins(24, 24, 24, 24)
+        self.pages_layout.setContentsMargins(self.page_margin, self.page_margin, self.page_margin, self.page_margin)
         self.pages_layout.setSpacing(18)
         self.pages_layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
 
@@ -986,6 +987,7 @@ class MainWindow(QMainWindow):
             self._refresh_actions()
             return
 
+        self._update_page_layout_margins()
         was_suppressed = self._suppress_scroll_sync
         self._suppress_scroll_sync = True
         try:
@@ -1152,7 +1154,13 @@ class MainWindow(QMainWindow):
     def _lock_pages_container_to_layout(self) -> None:
         self.pages_layout.activate()
         if self.continuous_scroll and self.document is not None:
-            self.pages_container.setFixedSize(self.document_content_size)
+            viewport_size = self.scroll_area.viewport().size()
+            self.pages_container.setFixedSize(
+                QSize(
+                    max(self.document_content_size.width(), viewport_size.width()),
+                    max(self.document_content_size.height(), viewport_size.height()),
+                )
+            )
             return
 
         margins = self.pages_layout.contentsMargins()
@@ -1454,22 +1462,41 @@ class MainWindow(QMainWindow):
             return
         self.fit_mode = mode
         self._apply_fit_mode()
+        self._schedule_fit_refresh()
 
     def _apply_fit_mode(self) -> None:
         if self.document is None or self.fit_mode is None:
             return
+        self._update_page_layout_margins()
         page = self.document.load_page(self.page_index)
         rect = page.rect
         margins = self.pages_layout.contentsMargins()
         if self.fit_mode == "width":
-            available = self.scroll_area.viewport().width() - margins.left() - margins.right() - 24
+            available = self.scroll_area.viewport().width() - margins.left() - margins.right()
             self.zoom = max(0.3, min(4.0, available / rect.width))
         elif self.fit_mode == "height":
-            available = self.scroll_area.viewport().height() - margins.top() - margins.bottom() - 24
+            available = self.scroll_area.viewport().height() - margins.top() - margins.bottom()
             self.zoom = max(0.3, min(4.0, available / rect.height))
         else:
             return
         self.render_page(render_neighbors=False)
+
+    def _update_page_layout_margins(self) -> None:
+        if self.fit_mode == "width":
+            margins = (0, self.page_margin, 0, self.page_margin)
+        elif self.fit_mode == "height":
+            margins = (self.page_margin, 0, self.page_margin, 0)
+        else:
+            margins = (self.page_margin, self.page_margin, self.page_margin, self.page_margin)
+
+        current = self.pages_layout.contentsMargins()
+        if (
+            current.left(),
+            current.top(),
+            current.right(),
+            current.bottom(),
+        ) != margins:
+            self.pages_layout.setContentsMargins(*margins)
 
     def _handle_reader_splitter_moved(self, _pos: int, _index: int) -> None:
         self._schedule_fit_refresh()
@@ -1478,17 +1505,21 @@ class MainWindow(QMainWindow):
         if self.fit_mode is not None and self.document is not None:
             QTimer.singleShot(0, self._apply_fit_mode)
             QTimer.singleShot(50, self._apply_fit_mode)
+            QTimer.singleShot(150, self._apply_fit_mode)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
         self._schedule_fit_refresh()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
-        if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
-            if event.modifiers() & Qt.ControlModifier:
-                self.change_zoom(0.1 if event.angleDelta().y() > 0 else -0.1)
-                event.accept()
-                return True
+        if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport():
+            if event.type() == QEvent.Resize:
+                self._schedule_fit_refresh()
+            elif event.type() == QEvent.Wheel:
+                if event.modifiers() & Qt.ControlModifier:
+                    self.change_zoom(0.1 if event.angleDelta().y() > 0 else -0.1)
+                    event.accept()
+                    return True
         return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override

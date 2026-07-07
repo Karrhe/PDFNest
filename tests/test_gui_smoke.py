@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import QAction, QColor, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import QMessageBox
 
@@ -270,15 +271,25 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.fit_mode, "width")
                 self.assertEqual(window.page_index, 2)
                 self.assertGreater(width_zoom, 0.3)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
+                window.fit_page("width")
+                self.assertAlmostEqual(window.zoom, width_zoom)
                 window._sync_current_page_from_scroll()
                 self.assertEqual(window.page_index, 2)
 
                 window.reader_splitter.setSizes([0, 630, 774])
                 window._handle_reader_splitter_moved(0, 1)
                 self.app.processEvents()
-                window._apply_fit_mode()
+                QTest.qWait(180)
                 self.assertNotEqual(window.zoom, width_zoom)
                 self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
 
                 window.fit_page("height")
                 height_zoom = window.zoom
@@ -319,6 +330,38 @@ class GuiSmokeTest(unittest.TestCase):
                 scroll_bar = window.scroll_area.verticalScrollBar()
                 expected_scroll = max(0, min(scroll_bar.maximum(), expected_scroll))
                 self.assertLessEqual(abs(scroll_bar.value() - expected_scroll), 2)
+            finally:
+                window.close()
+
+    def test_fit_width_converges_when_scrollbars_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "short.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1, page_size=(300, 180))
+
+            window = MainWindow()
+            try:
+                window.resize(1000, 700)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+
+                window.fit_page("width")
+                QTest.qWait(180)
+                width_zoom = window.zoom
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
+
+                window.fit_page("width")
+                QTest.qWait(180)
+                self.assertAlmostEqual(window.zoom, width_zoom)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
             finally:
                 window.close()
 
@@ -434,19 +477,31 @@ class GuiSmokeTest(unittest.TestCase):
                 window.fit_page("width")
                 zoom_with_outline = window.zoom
                 self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
 
                 window.set_outline_visible(False)
                 self.app.processEvents()
-                window._apply_fit_mode()
+                QTest.qWait(180)
                 zoom_without_outline = window.zoom
                 self.assertGreater(zoom_without_outline, zoom_with_outline)
                 self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
 
                 window.set_outline_visible(True)
                 self.app.processEvents()
-                window._apply_fit_mode()
+                QTest.qWait(180)
                 self.assertLess(window.zoom, zoom_without_outline)
                 self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
+                    window.scroll_area.viewport().width(),
+                )
             finally:
                 window.close()
 
@@ -488,10 +543,15 @@ class GuiSmokeTest(unittest.TestCase):
             window.close()
 
     @staticmethod
-    def _create_sample_pdf(path: Path, page_count: int = 1, toc: list[list] | None = None) -> None:
+    def _create_sample_pdf(
+        path: Path,
+        page_count: int = 1,
+        toc: list[list] | None = None,
+        page_size: tuple[int, int] = (300, 200),
+    ) -> None:
         document = fitz.open()
         for page_number in range(page_count):
-            page = document.new_page(width=300, height=200)
+            page = document.new_page(width=page_size[0], height=page_size[1])
             page.insert_text((40, 80), f"PDF smoke test {page_number + 1}")
         if toc:
             document.set_toc(toc)
@@ -502,6 +562,11 @@ class GuiSmokeTest(unittest.TestCase):
     def _press_key(window: MainWindow, key: Qt.Key) -> None:
         event = QKeyEvent(QEvent.KeyPress, key, Qt.NoModifier)
         window.keyPressEvent(event)
+
+    @staticmethod
+    def _horizontal_page_margins(window: MainWindow) -> int:
+        margins = window.pages_layout.contentsMargins()
+        return margins.left() + margins.right()
 
 
 if __name__ == "__main__":
