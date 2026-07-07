@@ -1270,12 +1270,13 @@ class MainWindow(QMainWindow):
         if self.pdf_path is None:
             return None
 
-        self.note_export_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         pdf_name = self._safe_filename(self.pdf_path.stem)
+        export_dir = self.note_export_dir / pdf_name
+        export_dir.mkdir(parents=True, exist_ok=True)
         location = self._safe_filename(self._chapter_name_for_page(note.page_index) or f"page-{note.page_index + 1}")
         note_number = self._note_number(note)
-        path = self.note_export_dir / f"{timestamp}-{pdf_name}-{location}-{note_number}.md"
+        path = export_dir / f"{timestamp}-{pdf_name}-{location}-{note_number}.md"
         path = self._unique_markdown_path(path)
         path.write_text(note.markdown, encoding="utf-8")
         return path
@@ -1472,8 +1473,9 @@ class MainWindow(QMainWindow):
         rect = page.rect
         margins = self.pages_layout.contentsMargins()
         if self.fit_mode == "width":
+            widest_page_width = max((size[0] for size in self.page_base_sizes), default=float(rect.width))
             available = self.scroll_area.viewport().width() - margins.left() - margins.right()
-            self.zoom = max(0.3, min(4.0, available / rect.width))
+            self.zoom = max(0.3, min(4.0, available / widest_page_width))
         elif self.fit_mode == "height":
             available = self.scroll_area.viewport().height() - margins.top() - margins.bottom()
             self.zoom = max(0.3, min(4.0, available / rect.height))

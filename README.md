@@ -11,6 +11,7 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Zoom by editing the bottom zoom percentage, using context menu fit commands, or pressing `Ctrl` + mouse wheel.
 - `Ctrl` + mouse wheel zooms around the current reading page center instead of the mouse pointer.
 - Fit width and fit height keep adapting when the reader window changes size or when the reader/notes splitter is moved.
+- Fit width uses the widest page in the PDF as the reference width, matching browser-style PDF readers and avoiding horizontal scrolling on mixed-width PDFs.
 - Browse PDF outlines from the left Contents panel when the PDF provides a table of contents.
 - Keep full-document page geometry in continuous mode so the scrollbar represents the whole PDF, while rasterizing only the current visible page window and nearby buffered pages.
 - Render only the current reading page during zoom and fit changes first, so zoom controls respond faster.
@@ -92,7 +93,7 @@ Formula content is parsed and rendered into styled inline or block formula eleme
 
 The local formula renderer supports common LaTeX-style commands used in notes, including Greek symbols such as `\beta`, superscripts/subscripts such as `$x_i^2$`, fractions such as `$\frac{1}{2}$`, roots such as `$\sqrt{x}$`, and common math operators such as `\times`, `\leq`, `\sum`, and arrows.
 
-The right note sidebar has a `Notes folder` button and an `Export MD` button. `Notes folder` selects where standalone `.md` files are written. `Save` updates the JSON anchor store. `Export MD` first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
+The right note sidebar has a `Notes folder` button and an `Export MD` button. `Notes folder` selects the base folder for standalone `.md` files. `Export MD` creates a subfolder named after the current PDF inside that base folder, first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
 
 ```text
 YYYYMMDD-HHMMSS-<pdf-name>-<chapter-name-or-page-number>-<number>.md
@@ -104,17 +105,22 @@ YYYYMMDD-HHMMSS-<pdf-name>-<chapter-name-or-page-number>-<number>.md
 
 Notes and PDF-related metadata are saved outside the original PDF. The app never writes notes back into the PDF file.
 
-Default storage locations:
+Default storage location:
 
-- Windows: `%APPDATA%\PDFNotesReader\notes\`
-- Linux: `$XDG_DATA_HOME/PDFNotesReader/notes/` or `~/.local/share/PDFNotesReader/notes/`
-- Other systems: `~/.PDFNotesReader\notes\`
+```text
+<project-or-program-folder>\.local-data\
+```
+
+Note JSON files are stored under:
+
+```text
+<project-or-program-folder>\.local-data\notes\
+```
 
 The default Markdown export folder is:
 
-- Windows: `%APPDATA%\PDFNotesReader\markdown_notes\`
-- Linux: `$XDG_DATA_HOME/PDFNotesReader/markdown_notes/` or `~/.local/share/PDFNotesReader/markdown_notes/`
-- Other systems: `~/.PDFNotesReader\markdown_notes\`
+- Base folder: `<project-or-program-folder>\.local-data\markdown_notes\`
+- Per-PDF folder: `<project-or-program-folder>\.local-data\markdown_notes\<pdf-name>\`
 
 To store note files inside this project while developing, set `PDF_NOTES_READER_DATA_DIR` before launching the app:
 
@@ -129,10 +135,10 @@ With that setting, note files are written under:
 .\.local-data\notes\<pdf_key>.json
 ```
 
-Markdown exports are written under this folder unless changed from the right sidebar:
+Markdown exports are written under this folder unless the base folder is changed from the right sidebar:
 
 ```text
-.\.local-data\markdown_notes\
+.\.local-data\markdown_notes\<pdf-name>\
 ```
 
 The PDF history file is written under:
@@ -141,7 +147,7 @@ The PDF history file is written under:
 .\.local-data\pdf_history.json
 ```
 
-The project `.gitignore` ignores `.local-data/`, so private local notes are not picked up by Git by default.
+The project `.gitignore` ignores `.local-data/`, so private local notes, Markdown exports, and history are not picked up by Git by default.
 
 ### PDF Key And File Naming
 

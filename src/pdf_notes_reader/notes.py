@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -80,18 +81,11 @@ def default_data_dir() -> Path:
     if override:
         return Path(override).expanduser()
 
-    if os.name == "nt":
-        root = os.environ.get("APPDATA")
-        if root:
-            return Path(root) / APP_NAME
-
-    if os.name == "posix":
-        xdg = os.environ.get("XDG_DATA_HOME")
-        if xdg:
-            return Path(xdg) / APP_NAME
-        return Path.home() / ".local" / "share" / APP_NAME
-
-    return Path.home() / f".{APP_NAME}"
+    if getattr(sys, "frozen", False):
+        app_dir = Path(sys.executable).resolve().parent
+    else:
+        app_dir = Path(__file__).resolve().parents[2]
+    return app_dir / ".local-data"
 
 
 def notes_dir(data_dir: Path | None = None) -> Path:

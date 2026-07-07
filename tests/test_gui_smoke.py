@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QMessageBox
 from pdf_notes_reader.history import PdfHistoryEntry, save_history
 from pdf_notes_reader.main import MainWindow, PdfCanvas
 from pdf_notes_reader.main import render_markdown_preview
+from pdf_notes_reader.notes import default_data_dir
 from pdf_notes_reader.notes import load_notes
 from pdf_notes_reader.notes import pdf_key_for_path
 
@@ -365,6 +366,39 @@ class GuiSmokeTest(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_fit_width_uses_widest_pdf_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "mixed-width.pdf"
+            document = fitz.open()
+            document.new_page(width=420, height=240)
+            document.new_page(width=300, height=240)
+            document.new_page(width=360, height=240)
+            document.save(pdf_path)
+            document.close()
+
+            window = MainWindow()
+            try:
+                window.resize(1000, 700)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.go_to_page(1)
+                self.app.processEvents()
+
+                window.fit_page("width")
+                QTest.qWait(180)
+                widest_display_width = max(window.page_widths)
+                current_canvas = window.page_canvases[1]
+                self.assertEqual(widest_display_width, window.scroll_area.viewport().width())
+                self.assertLess(current_canvas.width(), window.scroll_area.viewport().width())
+                self.assertGreater(current_canvas.x(), 0)
+                self.assertFalse(window.scroll_area.horizontalScrollBar().isVisible())
+                self.assertEqual(window.page_index, 1)
+            finally:
+                window.close()
+
     def test_continuous_scroll_uses_full_document_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -421,6 +455,8 @@ class GuiSmokeTest(unittest.TestCase):
                 window.export_current_note(window.note_panel.editor.toPlainText())
 
                 markdown_files = list(window.note_export_dir.glob("*.md"))
+                self.assertEqual(markdown_files, [])
+                markdown_files = list((window.note_export_dir / "sample").glob("*.md"))
                 self.assertEqual(len(markdown_files), 1)
                 self.assertIn("sample", markdown_files[0].name)
                 self.assertIn("Chapter One", markdown_files[0].name)
@@ -428,6 +464,11 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(markdown_files[0].read_text(encoding="utf-8"), "# Exported\n\nBody")
             finally:
                 window.close()
+
+    def test_default_data_dir_is_project_local(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            expected = Path(__file__).resolve().parents[1] / ".local-data"
+            self.assertEqual(default_data_dir(), expected)
 
     def test_toolbar_no_longer_exposes_mode_or_zoom_controls(self) -> None:
         window = MainWindow()
