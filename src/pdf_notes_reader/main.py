@@ -43,25 +43,129 @@ from pdf_notes_reader.notes import Note, find_note, load_notes, pdf_key_for_path
 
 MATH_BLOCK_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
 MATH_INLINE_RE = re.compile(r"(?<!\\)\$(?!\$)(.+?)(?<!\\)\$", re.DOTALL)
+CODE_SEGMENT_RE = re.compile(r"(```.*?```|`[^`\n]+`)", re.DOTALL)
+
+LATEX_SYMBOLS = {
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "varepsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "vartheta": "θ",
+    "lambda": "λ",
+    "mu": "μ",
+    "nu": "ν",
+    "xi": "ξ",
+    "pi": "π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "φ",
+    "varphi": "φ",
+    "chi": "χ",
+    "psi": "ψ",
+    "omega": "ω",
+    "Gamma": "Γ",
+    "Delta": "Δ",
+    "Theta": "Θ",
+    "Lambda": "Λ",
+    "Xi": "Ξ",
+    "Pi": "Π",
+    "Sigma": "Σ",
+    "Phi": "Φ",
+    "Psi": "Ψ",
+    "Omega": "Ω",
+    "times": "×",
+    "cdot": "·",
+    "pm": "±",
+    "le": "≤",
+    "leq": "≤",
+    "ge": "≥",
+    "geq": "≥",
+    "neq": "≠",
+    "approx": "≈",
+    "infty": "∞",
+    "sum": "∑",
+    "prod": "∏",
+    "int": "∫",
+    "partial": "∂",
+    "nabla": "∇",
+    "rightarrow": "→",
+    "to": "→",
+    "leftarrow": "←",
+    "Rightarrow": "⇒",
+    "Leftarrow": "⇐",
+}
+
+
+def latex_to_html(expression: str) -> str:
+    compiled = html.escape(expression.strip())
+    compiled = compiled.replace(r"\left", "").replace(r"\right", "")
+
+    frac_re = re.compile(r"\\frac\{([^{}]+)\}\{([^{}]+)\}")
+    sqrt_re = re.compile(r"\\sqrt\{([^{}]+)\}")
+    for _ in range(10):
+        next_compiled = frac_re.sub(r'<span class="latex-frac"><span>\1</span><span>\2</span></span>', compiled)
+        next_compiled = sqrt_re.sub(r'<span class="latex-sqrt">√<span>\1</span></span>', next_compiled)
+        if next_compiled == compiled:
+            break
+        compiled = next_compiled
+
+    symbol_pattern = re.compile(r"\\(" + "|".join(re.escape(key) for key in sorted(LATEX_SYMBOLS, key=len, reverse=True)) + r")\b")
+    compiled = symbol_pattern.sub(lambda match: LATEX_SYMBOLS[match.group(1)], compiled)
+    compiled = re.sub(r"\^\{([^{}]+)\}", r"<sup>\1</sup>", compiled)
+    compiled = re.sub(r"_\{([^{}]+)\}", r"<sub>\1</sub>", compiled)
+    compiled = re.sub(r"\^([A-Za-z0-9+\-=])", r"<sup>\1</sup>", compiled)
+    compiled = re.sub(r"_([A-Za-z0-9+\-=])", r"<sub>\1</sub>", compiled)
+    compiled = compiled.replace(r"\,", " ").replace(r"\;", " ").replace(r"\ ", " ")
+    return compiled
+
+
+def protect_code_segments(text: str) -> tuple[str, dict[str, str]]:
+    protected: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        token = f"@@PDF_NOTES_CODE_{len(protected)}@@"
+        protected[token] = match.group(0)
+        return token
+
+    return CODE_SEGMENT_RE.sub(replace, text), protected
+
+
+def restore_placeholders(text: str, placeholders: dict[str, str]) -> str:
+    restored = text
+    for token, value in placeholders.items():
+        restored = restored.replace(token, value)
+    return restored
 
 
 def render_markdown_preview(text: str) -> str:
     placeholders: dict[str, str] = {}
+    prepared, protected_code = protect_code_segments(text)
 
     def replace_block(match: re.Match[str]) -> str:
         token = f"@@PDF_NOTES_MATH_BLOCK_{len(placeholders)}@@"
-        formula = html.escape(match.group(1).strip())
+        formula = latex_to_html(match.group(1))
         placeholders[token] = f'<div class="math-block">{formula}</div>'
         return token
 
     def replace_inline(match: re.Match[str]) -> str:
         token = f"@@PDF_NOTES_MATH_INLINE_{len(placeholders)}@@"
-        formula = html.escape(match.group(1).strip())
+        formula = latex_to_html(match.group(1))
         placeholders[token] = f'<span class="math-inline">{formula}</span>'
         return token
 
-    prepared = MATH_BLOCK_RE.sub(replace_block, text)
+    prepared = MATH_BLOCK_RE.sub(replace_block, prepared)
     prepared = MATH_INLINE_RE.sub(replace_inline, prepared)
+    standalone_symbol_re = re.compile(
+        r"\\(" + "|".join(re.escape(key) for key in sorted(LATEX_SYMBOLS, key=len, reverse=True)) + r")\b"
+    )
+    prepared = standalone_symbol_re.sub(lambda match: LATEX_SYMBOLS[match.group(1)], prepared)
+    prepared = restore_placeholders(prepared, protected_code)
     body = markdown.markdown(
         prepared,
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
@@ -115,6 +219,26 @@ def render_markdown_preview(text: str) -> str:
           .math-inline {{
             color: #7a4d00;
             font-family: Cambria Math, Times New Roman, serif;
+          }}
+          .latex-frac {{
+            display: inline-flex;
+            flex-direction: column;
+            font-size: 0.9em;
+            line-height: 1.05;
+            margin: 0 2px;
+            text-align: center;
+            vertical-align: middle;
+          }}
+          .latex-frac span:first-child {{
+            border-bottom: 1px solid #7a4d00;
+            padding: 0 3px;
+          }}
+          .latex-frac span:last-child {{
+            padding: 0 3px;
+          }}
+          .latex-sqrt span {{
+            border-top: 1px solid #7a4d00;
+            padding-left: 2px;
           }}
           .math-block {{
             background: #f8f0dc;
@@ -175,6 +299,9 @@ class PdfCanvas(QWidget):
 
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(self.rect(), self._pixmap)
+        painter.setCompositionMode(QPainter.CompositionMode_Multiply)
+        painter.fillRect(self.rect(), QColor("#f3ecd6"))
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         for note in self._notes:
@@ -429,6 +556,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         self.scroll_area.setBackgroundRole(self.backgroundRole())
+        self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
         self.note_panel.save_requested.connect(self.save_current_note)
@@ -586,6 +714,7 @@ class MainWindow(QMainWindow):
         self.history_panel.set_entries(self.history_entries)
 
     def show_home(self) -> None:
+        self._record_current_pdf()
         self.history_panel.set_entries(self.history_entries)
         self.main_stack.setCurrentWidget(self.history_panel)
         self._refresh_actions()
@@ -744,6 +873,25 @@ class MainWindow(QMainWindow):
         canvas = self.page_canvases.get(page_index)
         if canvas is not None:
             self.scroll_area.ensureWidgetVisible(canvas, 0, 0)
+
+    def _sync_current_page_from_scroll(self) -> None:
+        if self.document is None or not self.continuous_scroll or not self.page_canvases:
+            return
+
+        visible_center = self.scroll_area.verticalScrollBar().value() + self.scroll_area.viewport().height() / 2
+        closest_page = self.page_index
+        closest_distance = float("inf")
+        for page_index, canvas in self.page_canvases.items():
+            canvas_center = canvas.y() + canvas.height() / 2
+            distance = abs(canvas_center - visible_center)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_page = page_index
+
+        if closest_page != self.page_index:
+            self.page_index = closest_page
+            self.canvas = self.page_canvases.get(self.page_index, self.canvas)
+            self._refresh_actions()
 
     def set_continuous_scroll(self, checked: bool) -> None:
         self.continuous_scroll = checked

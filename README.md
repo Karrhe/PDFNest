@@ -9,6 +9,7 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Navigate pages with toolbar buttons or keyboard arrow keys.
 - Zoom in or out.
 - Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
+- Apply a warm beige reading tint to the PDF page content as well as the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
 - Show note markers as colored dots on the page.
@@ -78,6 +79,8 @@ print("hello")
 - Formula blocks: `$$E = mc^2$$`
 
 Formula content is parsed and rendered into styled inline or block formula elements in the preview. It keeps the original LaTeX-style text in storage, so notes remain portable.
+
+The local formula renderer supports common LaTeX-style commands used in notes, including Greek symbols such as `\beta`, superscripts/subscripts such as `$x_i^2$`, fractions such as `$\frac{1}{2}$`, roots such as `$\sqrt{x}$`, and common math operators such as `\times`, `\leq`, `\sum`, and arrows.
 
 ## Data Storage
 
@@ -190,6 +193,7 @@ The history file stores one entry per opened PDF:
 When opening a PDF from history:
 
 - If `path` exists, the app opens it and jumps to `last_page_index`.
+- In continuous scroll mode, the current page is updated from the scroll position and saved when returning Home or closing the window.
 - If `path` no longer exists, the app asks whether to relocate the PDF.
 - If relocated, the history entry keeps the same `pdf_key`, updates the absolute path, and restores the last-read page.
 
