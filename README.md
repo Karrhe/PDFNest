@@ -18,11 +18,12 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
 - Apply a warm beige reading tint to the PDF page content, the reader blank area, and the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
-- Drag across digital PDF text to select text, then press `Ctrl+C` to copy it.
-- Right-click selected text to create a highlight or underline annotation with an editable Markdown note.
+- Drag across digital PDF text to select continuous line-by-line text, then press `Ctrl+C` to copy it.
+- Right-click selected text to create a colored highlight or underline annotation with an editable Markdown note.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
-- Show note markers as colored dots on the page.
+- Show note markers as colored dots on the page, with configurable marker size in Settings.
 - Click a marker, highlight, or underline to edit or preview its Markdown note in the right sidebar.
+- Right-click a marker, highlight, or underline to change its color or delete it.
 - Preview Markdown with tables, fenced code blocks, inline code, block quotes, and `$...$` / `$$...$$` math formula styling.
 - Save note anchors/content in external JSON files without modifying the original PDF.
 - Export individual notes as Markdown files to a selectable local folder.
@@ -30,7 +31,7 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Restore the last-read page when opening a PDF again.
 - Prompt for relocation when a PDF history item points to a missing absolute path.
 - Use a beige reading theme inspired by notebook/library reading tools.
-- Switch between the beige theme and a white theme in Settings. Theme colors can be customized through `.local-data/settings.json`.
+- Switch themes in Settings. Theme names are loaded from standalone JSON files in `.local-data/themes/`.
 - Use `Icon.png` as the application icon.
 
 ## Install
@@ -71,15 +72,15 @@ The older command name is kept as an alias:
 - `Open`: opens a local PDF and records its absolute path in history.
 - `Reader`: returns to the active PDF reader.
 - `Contents`: toggles the PDF outline panel.
-- `Settings`: opens app settings, including theme selection and storage paths.
 - Bottom page control: `- Page n / l +`, where `-` goes to the previous page, `+` goes to the next page, and the page number field can be edited directly.
 - Bottom zoom control: edit the percentage field to set the PDF zoom directly.
 - Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
 - `PageUp` / `PageDown`: previous or next page.
 - `Ctrl` + mouse wheel over the PDF area: zooms in or out around the current reading page center.
-- Right-click a PDF page for `Add note`, `Fit width`, `Fit height`, `Continuous scroll`, and `Single page`.
-- Drag-select digital PDF text, then press `Ctrl+C` to copy the selected text. `Ctrl+V` also copies the current PDF selection for compatibility with the original shortcut request.
-- Right-click a text selection for `Copy selected text`, `Highlight selection`, and `Underline selection`.
+- Right-click a PDF page for `Add note`, `Fit width`, `Fit height`, `Continuous scroll`, `Single page`, and `Settings`.
+- Open Settings from the Home page or from the PDF right-click menu.
+- Drag-select digital PDF text, then press `Ctrl+C` to copy the selected text. Selection follows PDF reading order: the start line, full middle lines, and end line are selected as continuous line spans. `Ctrl+V` also copies the current PDF selection for compatibility with the original shortcut request.
+- Right-click a text selection for `Copy selected text`, colored `Highlight selection`, and colored `Underline selection`.
 - Click an item in the left Contents panel to jump to that PDF outline page.
 
 Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions. In continuous mode, the reader keeps geometry for every page so the scrollbar range matches the whole PDF, but it only creates widgets for the current page window and a few merged spacer runs. It rasterizes only the current page plus nearby buffered pages, then refreshes that window as you scroll or jump. Zoom and fit commands prioritize the current reading page to reduce interaction lag.
@@ -135,6 +136,22 @@ The default Markdown export folder is:
 - Base folder: `<project-or-program-folder>\.local-data\markdown_notes\`
 - Per-PDF folder: `<project-or-program-folder>\.local-data\markdown_notes\<pdf-name>\`
 
+The app settings file is:
+
+```text
+<project-or-program-folder>\.local-data\settings.json
+```
+
+It stores the selected theme name and note marker size. It does not store theme color definitions.
+
+Theme files are stored as independent JSON files under:
+
+```text
+<project-or-program-folder>\.local-data\themes\
+```
+
+Each `*.json` filename becomes a theme name in Settings. For example, `.local-data\themes\white.json` appears as `white`. Default `beige.json` and `white.json` files are created automatically if they are missing.
+
 To store note files inside this project while developing, set `PDF_NOTES_READER_DATA_DIR` before launching the app:
 
 ```powershell
@@ -160,7 +177,14 @@ The PDF history file is written under:
 .\.local-data\pdf_history.json
 ```
 
-The project `.gitignore` ignores `.local-data/`, so private local notes, Markdown exports, and history are not picked up by Git by default.
+The settings file and theme folder are written under:
+
+```text
+.\.local-data\settings.json
+.\.local-data\themes\*.json
+```
+
+The project `.gitignore` ignores `.local-data/`, so private local notes, Markdown exports, history, settings, and local themes are not picked up by Git by default.
 
 ### PDF Key And File Naming
 
@@ -203,7 +227,8 @@ Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded w
       "updated_at": "...",
       "note_type": "point",
       "rects_norm": [],
-      "selected_text": ""
+      "selected_text": "",
+      "color": "#e11d48"
     }
   ]
 }
@@ -220,6 +245,7 @@ Field meanings:
 - `notes[].note_type`: `point`, `highlight`, or `underline`.
 - `notes[].rects_norm`: normalized text rectangles for text annotations.
 - `notes[].selected_text`: copied text captured when the text annotation was created.
+- `notes[].color`: optional per-note marker, highlight, or underline color.
 - `created_at` and `updated_at`: UTC ISO timestamps.
 
 Saves are written through a temporary sibling file named `<pdf_key>.tmp`, then atomically replaced as `<pdf_key>.json`.

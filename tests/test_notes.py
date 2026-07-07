@@ -20,6 +20,7 @@ class NotesStorageTest(unittest.TestCase):
                 x_norm=0.25,
                 y_norm=0.75,
                 markdown="**hello**",
+                color="#93c5fd",
             )
 
             saved_path = save_notes(pdf_key=pdf_key, pdf_path=pdf_path, notes=[note], data_dir=data_dir)
@@ -32,6 +33,7 @@ class NotesStorageTest(unittest.TestCase):
             self.assertEqual(loaded[0].x_norm, 0.25)
             self.assertEqual(loaded[0].y_norm, 0.75)
             self.assertEqual(loaded[0].markdown, "**hello**")
+            self.assertEqual(loaded[0].color, "#93c5fd")
 
     def test_normalized_coordinates_are_clamped(self) -> None:
         note = Note.create(pdf_key="abc", page_index=0, x_norm=-1, y_norm=2)

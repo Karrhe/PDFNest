@@ -27,6 +27,7 @@ class Note:
     note_type: str = "point"
     rects_norm: list[list[float]] = field(default_factory=list)
     selected_text: str = ""
+    color: str = ""
 
     @classmethod
     def create(
@@ -40,6 +41,7 @@ class Note:
         note_type: str = "point",
         rects_norm: list[list[float]] | None = None,
         selected_text: str = "",
+        color: str = "",
     ) -> "Note":
         now = utc_now()
         return cls(
@@ -54,6 +56,7 @@ class Note:
             note_type=note_type,
             rects_norm=rects_norm or [],
             selected_text=selected_text,
+            color=str(color),
         )
 
     @classmethod
@@ -70,6 +73,7 @@ class Note:
             note_type=str(data.get("note_type") or "point"),
             rects_norm=normalize_rects(data.get("rects_norm", [])),
             selected_text=str(data.get("selected_text", "")),
+            color=str(data.get("color", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:

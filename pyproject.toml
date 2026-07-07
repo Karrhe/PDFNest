@@ -20,3 +20,6 @@ pdf-notes-reader = "pdf_notes_reader.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+pdf_notes_reader = ["assets/*.png"]

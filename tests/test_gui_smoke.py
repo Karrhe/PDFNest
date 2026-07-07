@@ -10,9 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QAction, QColor, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QToolBar
 from PySide6.QtWidgets import QMessageBox
 
 from pdf_notes_reader.history import PdfHistoryEntry, save_history
@@ -21,6 +21,7 @@ from pdf_notes_reader.main import render_markdown_preview
 from pdf_notes_reader.notes import default_data_dir
 from pdf_notes_reader.notes import load_notes
 from pdf_notes_reader.notes import pdf_key_for_path
+from pdf_notes_reader.settings import load_settings, load_theme_files, save_settings, themes_dir
 
 
 class GuiSmokeTest(unittest.TestCase):
@@ -153,7 +154,33 @@ class GuiSmokeTest(unittest.TestCase):
         canvas.copy_selected_text()
 
         self.assertEqual(QApplication.clipboard().text(), "Hello PDF")
-        self.assertEqual(len(canvas._selected_rects_norm), 2)
+        self.assertEqual(canvas._selected_rects_norm, [[0.1, 0.1, 0.5, 0.3]])
+
+    def test_pdf_canvas_selects_contiguous_lines_and_merges_rects(self) -> None:
+        pixmap = QPixmap(300, 180)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas()
+        canvas.set_page(
+            pixmap,
+            [],
+            text_words=[
+                {"rect": [0.1, 0.10, 0.2, 0.18], "text": "A1", "block": 0, "line": 0, "word_no": 0},
+                {"rect": [0.22, 0.10, 0.4, 0.18], "text": "A2", "block": 0, "line": 0, "word_no": 1},
+                {"rect": [0.1, 0.25, 0.2, 0.33], "text": "B1", "block": 0, "line": 1, "word_no": 0},
+                {"rect": [0.22, 0.25, 0.4, 0.33], "text": "B2", "block": 0, "line": 1, "word_no": 1},
+                {"rect": [0.1, 0.40, 0.2, 0.48], "text": "C1", "block": 0, "line": 2, "word_no": 0},
+                {"rect": [0.22, 0.40, 0.4, 0.48], "text": "C2", "block": 0, "line": 2, "word_no": 1},
+            ],
+        )
+        canvas._selection_start = QPoint(25, 20)
+        canvas._selection_end = QPoint(65, 78)
+        canvas._update_text_selection()
+
+        self.assertEqual(canvas._selected_text, "A1 A2\nB1 B2\nC1")
+        self.assertEqual(
+            canvas._selected_rects_norm,
+            [[0.1, 0.1, 0.4, 0.18], [0.1, 0.25, 0.4, 0.33], [0.1, 0.4, 0.2, 0.48]],
+        )
 
     def test_reopens_pdf_at_last_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,6 +281,8 @@ class GuiSmokeTest(unittest.TestCase):
                     window.scroll_area.viewport().palette().color(window.scroll_area.viewport().backgroundRole()).name(),
                     "#e5e7eb",
                 )
+                self.assertIn("white", window.themes)
+                self.assertTrue((themes_dir(Path(tmp) / "data") / "white.json").exists())
             finally:
                 window.close()
 
@@ -513,16 +542,51 @@ class GuiSmokeTest(unittest.TestCase):
             window = MainWindow()
             try:
                 window.load_pdf(pdf_path)
-                window.add_text_annotation(0, "highlight", [[0.1, 0.2, 0.4, 0.25]], "selected text")
+                window.add_text_annotation(0, "highlight", [[0.1, 0.2, 0.4, 0.25]], "selected text", "#86efac")
 
                 self.assertEqual(len(window.notes), 1)
                 self.assertEqual(window.notes[0].note_type, "highlight")
                 self.assertEqual(window.notes[0].selected_text, "selected text")
+                self.assertEqual(window.notes[0].color, "#86efac")
                 self.assertEqual(window.note_panel.current_note_id, window.notes[0].id)
+                note_id = window.notes[0].id
+
+                window.select_note(note_id)
+                self.assertEqual(window.note_panel.current_note_id, note_id)
+                window.set_note_color(note_id, "#93c5fd")
+                self.assertEqual(window.notes[0].color, "#93c5fd")
 
                 loaded = load_notes(window.pdf_key)
                 self.assertEqual(loaded[0].note_type, "highlight")
                 self.assertEqual(loaded[0].rects_norm, [[0.1, 0.2, 0.4, 0.25]])
+                self.assertEqual(loaded[0].color, "#93c5fd")
+
+                window.delete_note_by_id(note_id)
+                self.assertEqual(window.notes, [])
+                self.assertEqual(load_notes(window.pdf_key), [])
+            finally:
+                window.close()
+
+    def test_settings_store_marker_size_without_embedded_themes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(data_dir)
+            window = MainWindow()
+            try:
+                window.note_marker_radius = 13
+                window.settings["note_marker_radius"] = 13
+                window.settings["theme"] = "white"
+                save_settings(window.settings)
+
+                settings = load_settings()
+                self.assertEqual(settings["note_marker_radius"], 13)
+                self.assertEqual(settings["theme"], "white")
+                self.assertNotIn("themes", settings)
+                self.assertIn("beige", load_theme_files())
+                self.assertTrue((data_dir / "themes" / "beige.json").exists())
+                custom_theme = data_dir / "themes" / "ocean.json"
+                custom_theme.write_text('{"reader": "#ffffff", "window": "#ffffff"}\n', encoding="utf-8")
+                self.assertIn("ocean", load_theme_files())
             finally:
                 window.close()
 
@@ -531,13 +595,19 @@ class GuiSmokeTest(unittest.TestCase):
             expected = Path(__file__).resolve().parents[1] / ".local-data"
             self.assertEqual(default_data_dir(), expected)
 
-    def test_toolbar_no_longer_exposes_mode_or_zoom_controls(self) -> None:
+    def test_toolbar_no_longer_exposes_mode_zoom_or_settings_controls(self) -> None:
         window = MainWindow()
-        action_texts = [action.text() for action in window.findChildren(QAction)]
-        self.assertNotIn("Continuous Scroll", action_texts)
-        self.assertNotIn("Zoom In", action_texts)
-        self.assertNotIn("Zoom Out", action_texts)
-        window.close()
+        try:
+            action_texts = [action.text() for toolbar in window.findChildren(QToolBar) for action in toolbar.actions()]
+            self.assertIn("Home", action_texts)
+            self.assertIn("Open", action_texts)
+            self.assertIn("Reader", action_texts)
+            self.assertNotIn("Continuous Scroll", action_texts)
+            self.assertNotIn("Zoom In", action_texts)
+            self.assertNotIn("Zoom Out", action_texts)
+            self.assertNotIn("Settings", action_texts)
+        finally:
+            window.close()
 
     def test_pdf_outline_jumps_to_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,7 +626,7 @@ class GuiSmokeTest(unittest.TestCase):
             window.load_pdf(pdf_path)
             self.assertEqual(window.outline_panel.tree.topLevelItemCount(), 2)
             item = window.outline_panel.tree.topLevelItem(1)
-            window.outline_panel.tree.itemClicked.emit(item, 0)
+            window.outline_panel.tree.itemPressed.emit(item, 0)
             self.assertEqual(window.page_index, 2)
             window.close()
 
@@ -603,6 +673,32 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(
                     window._page_display_size(window.page_index).width() + self._horizontal_page_margins(window),
                     window.scroll_area.viewport().width(),
+                )
+
+                window.fit_page("height")
+                self.assertEqual(window.fit_mode, "height")
+                self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).height() + self._vertical_page_margins(window),
+                    window.scroll_area.viewport().height(),
+                )
+
+                window.set_outline_visible(False)
+                self.app.processEvents()
+                QTest.qWait(320)
+                self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).height() + self._vertical_page_margins(window),
+                    window.scroll_area.viewport().height(),
+                )
+
+                window.set_outline_visible(True)
+                self.app.processEvents()
+                QTest.qWait(320)
+                self.assertEqual(window.page_index, 2)
+                self.assertEqual(
+                    window._page_display_size(window.page_index).height() + self._vertical_page_margins(window),
+                    window.scroll_area.viewport().height(),
                 )
             finally:
                 window.close()
@@ -669,6 +765,11 @@ class GuiSmokeTest(unittest.TestCase):
     def _horizontal_page_margins(window: MainWindow) -> int:
         margins = window.pages_layout.contentsMargins()
         return margins.left() + margins.right()
+
+    @staticmethod
+    def _vertical_page_margins(window: MainWindow) -> int:
+        margins = window.pages_layout.contentsMargins()
+        return margins.top() + margins.bottom()
 
 
 if __name__ == "__main__":

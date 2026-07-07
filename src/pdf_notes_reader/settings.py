@@ -48,16 +48,61 @@ DEFAULT_THEMES: dict[str, dict[str, str]] = {
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "theme": "beige",
-    "themes": DEFAULT_THEMES,
+    "note_marker_radius": 7,
 }
+
+
+def clamp_marker_radius(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 7
+    return max(3, min(24, number))
 
 
 def settings_path(data_dir: Path | None = None) -> Path:
     return (data_dir or default_data_dir()) / "settings.json"
 
 
+def themes_dir(data_dir: Path | None = None) -> Path:
+    return (data_dir or default_data_dir()) / "themes"
+
+
+def ensure_default_themes(data_dir: Path | None = None) -> Path:
+    directory = themes_dir(data_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, colors in DEFAULT_THEMES.items():
+        path = directory / f"{name}.json"
+        if not path.exists():
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(colors, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+    return directory
+
+
+def load_theme_files(data_dir: Path | None = None) -> dict[str, dict[str, str]]:
+    directory = ensure_default_themes(data_dir)
+    themes: dict[str, dict[str, str]] = {}
+    for path in sorted(directory.glob("*.json")):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        base = DEFAULT_THEMES.get(path.stem, DEFAULT_THEMES["beige"])
+        colors = dict(base)
+        colors.update({str(key): str(value) for key, value in payload.items()})
+        themes[path.stem] = colors
+    if not themes:
+        themes = deepcopy(DEFAULT_THEMES)
+    return themes
+
+
 def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
     settings = deepcopy(DEFAULT_SETTINGS)
+    ensure_default_themes(data_dir)
     path = settings_path(data_dir)
     if not path.exists():
         return settings
@@ -67,24 +112,20 @@ def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         return settings
 
-    settings.update({key: value for key, value in loaded.items() if key != "themes"})
-    loaded_themes = loaded.get("themes")
-    if isinstance(loaded_themes, dict):
-        for name, colors in loaded_themes.items():
-            if isinstance(colors, dict):
-                base = settings["themes"].get(name, {})
-                merged = dict(base)
-                merged.update({str(key): str(value) for key, value in colors.items()})
-                settings["themes"][str(name)] = merged
+    settings.update({key: value for key, value in loaded.items() if key in DEFAULT_SETTINGS})
+    settings["note_marker_radius"] = clamp_marker_radius(settings.get("note_marker_radius"))
     return settings
 
 
 def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Path:
     path = settings_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = deepcopy(DEFAULT_SETTINGS)
+    payload.update({key: value for key, value in settings.items() if key in DEFAULT_SETTINGS})
+    payload["note_marker_radius"] = clamp_marker_radius(payload.get("note_marker_radius"))
     tmp_path = path.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(settings, handle, ensure_ascii=False, indent=2)
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
     tmp_path.replace(path)
     return path
