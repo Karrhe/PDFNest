@@ -66,6 +66,23 @@ The older command name is kept as an alias:
 .\.venv\Scripts\pdf-notes-reader.exe
 ```
 
+## Windows EXE Release
+
+For end-user distribution on Windows, build the executable package with PyInstaller:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyinstaller
+.\scripts\build_windows_exe.ps1
+```
+
+The release outputs are written under `release\`:
+
+- `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
+- `PDFNest-0.1.0-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.1.0-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+
+The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
+
 ## Reading Controls
 
 - `Home`: returns to the recent PDFs page.

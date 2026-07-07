@@ -4,4 +4,6 @@ __pycache__/
 .local-data/
 build/
 dist/
+release/
+release_assets/
 *.egg-info/
