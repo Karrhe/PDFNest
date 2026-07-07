@@ -13,7 +13,12 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
 - Show note markers as colored dots on the page.
 - Click a marker to edit or preview its Markdown note in the right sidebar.
+- Preview Markdown with tables, fenced code blocks, inline code, block quotes, and `$...$` / `$$...$$` math formula styling.
 - Save notes in external JSON files without modifying the original PDF.
+- Reopen known PDFs from the Home history page.
+- Restore the last-read page when opening a PDF again.
+- Prompt for relocation when a PDF history item points to a missing absolute path.
+- Use a beige reading theme inspired by notebook/library reading tools.
 
 ## Install
 
@@ -43,6 +48,9 @@ If installed with `pip install -e .`, you can also run:
 
 ## Reading Controls
 
+- `Home`: returns to the recent PDFs page.
+- `Open`: opens a local PDF and records its absolute path in history.
+- `Reader`: returns to the active PDF reader.
 - `Continuous Scroll`: toolbar toggle. Enabled by default to show all pages stacked vertically.
 - `Previous` / `Next`: toolbar page navigation.
 - Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
@@ -50,6 +58,26 @@ If installed with `pip install -e .`, you can also run:
 - `Zoom In` / `Zoom Out`: re-renders the visible document at the selected zoom level.
 
 Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions.
+
+## Markdown Notes
+
+The preview tab supports common Markdown authoring features:
+
+- Inline code: `` `x = 1` ``
+- Fenced code blocks:
+
+````markdown
+```python
+print("hello")
+```
+````
+
+- Block quotes: `> quoted text`
+- Tables
+- Inline formulas: `$a^2 + b^2 = c^2$`
+- Formula blocks: `$$E = mc^2$$`
+
+Formula content is parsed and rendered into styled inline or block formula elements in the preview. It keeps the original LaTeX-style text in storage, so notes remain portable.
 
 ## Data Storage
 
@@ -72,6 +100,12 @@ With that setting, note files are written under:
 
 ```text
 .\.local-data\notes\<pdf_key>.json
+```
+
+The PDF history file is written under:
+
+```text
+.\.local-data\pdf_history.json
 ```
 
 The project `.gitignore` ignores `.local-data/`, so private local notes are not picked up by Git by default.
@@ -131,6 +165,33 @@ Field meanings:
 - `created_at` and `updated_at`: UTC ISO timestamps.
 
 Saves are written through a temporary sibling file named `<pdf_key>.tmp`, then atomically replaced as `<pdf_key>.json`.
+
+### PDF History Contents
+
+The history file stores one entry per opened PDF:
+
+```json
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "pdf_key": "24-character-path-hash",
+      "path": "F:\\path\\to\\example.pdf",
+      "title": "example.pdf",
+      "last_page_index": 3,
+      "page_count": 20,
+      "opened_at": "...",
+      "updated_at": "..."
+    }
+  ]
+}
+```
+
+When opening a PDF from history:
+
+- If `path` exists, the app opens it and jumps to `last_page_index`.
+- If `path` no longer exists, the app asks whether to relocate the PDF.
+- If relocated, the history entry keeps the same `pdf_key`, updates the absolute path, and restores the last-read page.
 
 ## Tests
 

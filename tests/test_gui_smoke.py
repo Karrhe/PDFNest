@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -11,9 +12,13 @@ import fitz
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QMessageBox
 
+from pdf_notes_reader.history import PdfHistoryEntry, save_history
 from pdf_notes_reader.main import MainWindow
+from pdf_notes_reader.main import render_markdown_preview
 from pdf_notes_reader.notes import load_notes
+from pdf_notes_reader.notes import pdf_key_for_path
 
 
 class GuiSmokeTest(unittest.TestCase):
@@ -80,6 +85,74 @@ class GuiSmokeTest(unittest.TestCase):
             self.assertEqual(notes[0].page_index, 1)
             self.assertEqual(notes[0].x_norm, 0.25)
             self.assertEqual(notes[0].y_norm, 0.75)
+            window.close()
+
+    def test_markdown_preview_supports_math_code_and_quotes(self) -> None:
+        html = render_markdown_preview(
+            "> quoted\n\n"
+            "Inline code `x = 1` and math $a^2+b^2=c^2$.\n\n"
+            "```python\nprint('hello')\n```\n\n"
+            "$$E = mc^2$$"
+        )
+
+        self.assertIn("<blockquote>", html)
+        self.assertIn("<code>", html)
+        self.assertIn("math-inline", html)
+        self.assertIn("math-block", html)
+        self.assertIn("E = mc^2", html)
+
+    def test_reopens_pdf_at_last_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=4)
+
+            first_window = MainWindow()
+            first_window.load_pdf(pdf_path)
+            first_window.go_to_page(2)
+            first_window.close()
+
+            second_window = MainWindow()
+            second_window.load_pdf(pdf_path)
+            self.assertEqual(second_window.page_index, 2)
+            second_window.close()
+
+    def test_missing_history_entry_can_be_relocated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            missing_path = tmp_path / "missing.pdf"
+            relocated_path = tmp_path / "relocated.pdf"
+            self._create_sample_pdf(relocated_path, page_count=2)
+
+            old_key = pdf_key_for_path(missing_path)
+            save_history(
+                [
+                    PdfHistoryEntry(
+                        pdf_key=old_key,
+                        path=str(missing_path),
+                        title="missing.pdf",
+                        last_page_index=1,
+                        page_count=2,
+                        opened_at="2026-01-01T00:00:00+00:00",
+                        updated_at="2026-01-01T00:00:00+00:00",
+                    )
+                ]
+            )
+
+            window = MainWindow()
+            with patch("pdf_notes_reader.main.QMessageBox.question", return_value=QMessageBox.Yes):
+                with patch(
+                    "pdf_notes_reader.main.QFileDialog.getOpenFileName",
+                    return_value=(str(relocated_path), "PDF files (*.pdf)"),
+                ):
+                    window.open_history_entry(old_key)
+
+            self.assertEqual(window.pdf_key, old_key)
+            self.assertEqual(window.pdf_path, relocated_path)
+            self.assertEqual(window.page_index, 1)
+            self.assertEqual(window.history_entries[0].path, str(relocated_path.resolve(strict=False)))
             window.close()
 
     @staticmethod
