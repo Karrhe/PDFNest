@@ -109,9 +109,9 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertIn("latex-frac", html)
         self.assertIn("latex-sqrt", html)
         self.assertIn("<table>", html)
-        self.assertNotIn("<p><div class=\"math-block\"", html)
-        self.assertIn("margin: 4px 0 6px 0", html)
-        self.assertIn("padding: 4px 8px", html)
+        self.assertNotIn("<p><table class=\"math-block\"", html)
+        self.assertIn("margin: 0 0 4px 0", html)
+        self.assertIn("padding: 1px 6px", html)
 
     def test_pdf_canvas_tints_white_pages_beige(self) -> None:
         pixmap = QPixmap(40, 40)
@@ -209,6 +209,95 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertEqual(window.scroll_area.viewport().palette().color(window.scroll_area.viewport().backgroundRole()).name(), beige)
         self.assertEqual(window.pages_container.palette().color(window.pages_container.backgroundRole()).name(), beige)
         window.close()
+
+    def test_bottom_page_controls_and_reading_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=3)
+
+            window = MainWindow()
+            window.load_pdf(pdf_path)
+            self.assertEqual(window.page_label.text(), "Page 1 / 3")
+            self.assertFalse(window.prev_page_button.isEnabled())
+            self.assertTrue(window.next_page_button.isEnabled())
+
+            window.next_page_button.click()
+            self.assertEqual(window.page_index, 1)
+            self.assertEqual(window.page_label.text(), "Page 2 / 3")
+
+            window.set_reading_mode("single")
+            self.assertFalse(window.continuous_scroll)
+            self.assertEqual(len(window.page_canvases), 1)
+
+            window.set_reading_mode("continuous")
+            self.assertTrue(window.continuous_scroll)
+            self.assertEqual(len(window.page_canvases), 3)
+            window.close()
+
+    def test_fit_width_height_and_ctrl_wheel_zoom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1)
+
+            window = MainWindow()
+            window.resize(1000, 700)
+            window.load_pdf(pdf_path)
+            self.app.processEvents()
+
+            window.fit_page("width")
+            width_zoom = window.zoom
+            self.assertGreater(width_zoom, 0.3)
+
+            window.fit_page("height")
+            height_zoom = window.zoom
+            self.assertGreater(height_zoom, 0.3)
+            self.assertNotEqual(width_zoom, height_zoom)
+
+            before = window.zoom
+
+            class FakeWheel:
+                def type(self):
+                    return QEvent.Wheel
+
+                def modifiers(self):
+                    return Qt.ControlModifier
+
+                def angleDelta(self):
+                    return QPoint(0, 120)
+
+                def accept(self):
+                    self.accepted = True
+
+            event = FakeWheel()
+            handled = window.eventFilter(window.scroll_area.viewport(), event)
+            self.assertTrue(handled)
+            self.assertGreater(window.zoom, before)
+            window.close()
+
+    def test_pdf_outline_jumps_to_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "outline.pdf"
+            document = fitz.open()
+            for page_number in range(3):
+                page = document.new_page(width=300, height=200)
+                page.insert_text((40, 80), f"Outline PDF {page_number + 1}")
+            document.set_toc([[1, "Chapter 1", 1], [1, "Chapter 2", 3]])
+            document.save(pdf_path)
+            document.close()
+
+            window = MainWindow()
+            window.load_pdf(pdf_path)
+            self.assertEqual(window.outline_panel.tree.topLevelItemCount(), 2)
+            item = window.outline_panel.tree.topLevelItem(1)
+            window.outline_panel._open_item(item)
+            self.assertEqual(window.page_index, 2)
+            window.close()
 
     def test_missing_history_entry_can_be_relocated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

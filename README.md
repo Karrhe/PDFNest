@@ -5,9 +5,10 @@ A Python desktop PDF reader with external anchored Markdown notes.
 ## Features
 
 - Open and render local PDF files.
-- Read in continuous vertical scroll mode by default, or switch to single-page mode from the toolbar.
-- Navigate pages with toolbar buttons or keyboard arrow keys.
-- Zoom in or out.
+- Read in continuous vertical scroll mode by default, or switch to single-page mode from the toolbar or PDF context menu.
+- Navigate pages with the bottom `- Page n / l +` control or keyboard arrow keys.
+- Zoom in or out from the toolbar, context menu fit commands, or `Ctrl` + mouse wheel.
+- Browse PDF outlines from the left Contents panel when the PDF provides a table of contents.
 - Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
 - Apply a warm beige reading tint to the PDF page content, the reader blank area, and the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
@@ -52,11 +53,15 @@ If installed with `pip install -e .`, you can also run:
 - `Home`: returns to the recent PDFs page.
 - `Open`: opens a local PDF and records its absolute path in history.
 - `Reader`: returns to the active PDF reader.
+- `Contents`: toggles the PDF outline panel.
 - `Continuous Scroll`: toolbar toggle. Enabled by default to show all pages stacked vertically.
-- `Previous` / `Next`: toolbar page navigation.
+- Bottom page control: `- Page n / l +`, where `-` goes to the previous page and `+` goes to the next page.
 - Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
 - `PageUp` / `PageDown`: previous or next page.
 - `Zoom In` / `Zoom Out`: re-renders the visible document at the selected zoom level.
+- `Ctrl` + mouse wheel over the PDF area: zooms in or out.
+- Right-click a PDF page for `Add note`, `Fit width`, `Fit height`, `Continuous scroll`, and `Single page`.
+- Click an item in the left Contents panel to jump to that PDF outline page.
 
 Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions.
 

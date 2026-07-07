@@ -7,7 +7,7 @@ from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTextBrowser,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -102,6 +104,63 @@ LATEX_SYMBOLS = {
 }
 
 
+LATEX_SYMBOLS = {
+    "alpha": "\u03b1",
+    "beta": "\u03b2",
+    "gamma": "\u03b3",
+    "delta": "\u03b4",
+    "epsilon": "\u03b5",
+    "varepsilon": "\u03b5",
+    "zeta": "\u03b6",
+    "eta": "\u03b7",
+    "theta": "\u03b8",
+    "vartheta": "\u03b8",
+    "lambda": "\u03bb",
+    "mu": "\u03bc",
+    "nu": "\u03bd",
+    "xi": "\u03be",
+    "pi": "\u03c0",
+    "rho": "\u03c1",
+    "sigma": "\u03c3",
+    "tau": "\u03c4",
+    "phi": "\u03c6",
+    "varphi": "\u03c6",
+    "chi": "\u03c7",
+    "psi": "\u03c8",
+    "omega": "\u03c9",
+    "Gamma": "\u0393",
+    "Delta": "\u0394",
+    "Theta": "\u0398",
+    "Lambda": "\u039b",
+    "Xi": "\u039e",
+    "Pi": "\u03a0",
+    "Sigma": "\u03a3",
+    "Phi": "\u03a6",
+    "Psi": "\u03a8",
+    "Omega": "\u03a9",
+    "times": "\u00d7",
+    "cdot": "\u00b7",
+    "pm": "\u00b1",
+    "le": "\u2264",
+    "leq": "\u2264",
+    "ge": "\u2265",
+    "geq": "\u2265",
+    "neq": "\u2260",
+    "approx": "\u2248",
+    "infty": "\u221e",
+    "sum": "\u2211",
+    "prod": "\u220f",
+    "int": "\u222b",
+    "partial": "\u2202",
+    "nabla": "\u2207",
+    "rightarrow": "\u2192",
+    "to": "\u2192",
+    "leftarrow": "\u2190",
+    "Rightarrow": "\u21d2",
+    "Leftarrow": "\u21d0",
+}
+
+
 def latex_to_html(expression: str) -> str:
     compiled = html.escape(expression.strip())
     compiled = compiled.replace(r"\left", "").replace(r"\right", "")
@@ -121,6 +180,7 @@ def latex_to_html(expression: str) -> str:
     compiled = re.sub(r"_\{([^{}]+)\}", r"<sub>\1</sub>", compiled)
     compiled = re.sub(r"\^([A-Za-z0-9+\-=])", r"<sup>\1</sup>", compiled)
     compiled = re.sub(r"_([A-Za-z0-9+\-=])", r"<sub>\1</sub>", compiled)
+    compiled = compiled.replace("\u0104\u0116", "\u221a")
     compiled = compiled.replace(r"\,", " ").replace(r"\;", " ").replace(r"\ ", " ")
     return compiled
 
@@ -151,7 +211,11 @@ def render_markdown_preview(text: str) -> str:
     def replace_block(match: re.Match[str]) -> str:
         token = f"@@PDF_NOTES_MATH_BLOCK_{len(placeholders)}@@"
         formula = latex_to_html(match.group(1))
-        placeholders[token] = f'<div class="math-block">{formula}</div>'
+        placeholders[token] = (
+            '<table class="math-block" cellspacing="0" cellpadding="0">'
+            f"<tr><td>{formula}</td></tr>"
+            "</table>"
+        )
         block_tokens.add(token)
         return token
 
@@ -248,15 +312,19 @@ def render_markdown_preview(text: str) -> str:
             padding-left: 2px;
           }}
           .math-block {{
+            border-collapse: collapse;
             background: #f8f0dc;
             border: 1px solid #d6c9aa;
-            border-radius: 6px;
             color: #7a4d00;
             font-family: Cambria Math, Times New Roman, serif;
             line-height: 1.2;
-            margin: 4px 0 6px 0;
-            padding: 4px 8px;
+            margin: 0 0 4px 0;
             text-align: center;
+            width: 100%;
+          }}
+          .math-block td {{
+            border: 0;
+            padding: 1px 6px;
           }}
         </style>
       </head>
@@ -267,7 +335,10 @@ def render_markdown_preview(text: str) -> str:
 
 class PdfCanvas(QWidget):
     add_note_requested = Signal(int, float, float)
+    fit_requested = Signal(str)
+    mode_requested = Signal(str)
     note_selected = Signal(str)
+    zoom_requested = Signal(float)
 
     def __init__(self, page_index: int = 0) -> None:
         super().__init__()
@@ -324,11 +395,29 @@ class PdfCanvas(QWidget):
 
         menu = QMenu(self)
         add_action = QAction("Add note", self)
+        fit_width_action = QAction("Fit width", self)
+        fit_height_action = QAction("Fit height", self)
+        continuous_action = QAction("Continuous scroll", self)
+        single_page_action = QAction("Single page", self)
         menu.addAction(add_action)
+        menu.addSeparator()
+        menu.addAction(fit_width_action)
+        menu.addAction(fit_height_action)
+        menu.addSeparator()
+        menu.addAction(continuous_action)
+        menu.addAction(single_page_action)
         chosen = menu.exec(event.globalPos())
         if chosen == add_action:
             x_norm, y_norm = self._point_to_norm(event.pos())
             self.add_note_requested.emit(self.page_index, x_norm, y_norm)
+        elif chosen == fit_width_action:
+            self.fit_requested.emit("width")
+        elif chosen == fit_height_action:
+            self.fit_requested.emit("height")
+        elif chosen == continuous_action:
+            self.mode_requested.emit("continuous")
+        elif chosen == single_page_action:
+            self.mode_requested.emit("single")
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.button() != Qt.LeftButton or self._pixmap is None:
@@ -337,6 +426,13 @@ class PdfCanvas(QWidget):
         note = self._note_at(event.pos())
         if note is not None:
             self.note_selected.emit(note.id)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.modifiers() & Qt.ControlModifier:
+            self.zoom_requested.emit(0.1 if event.angleDelta().y() > 0 else -0.1)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def _inside_page(self, point: QPoint) -> bool:
         if self._pixmap is None:
@@ -533,6 +629,61 @@ class HistoryPanel(QWidget):
         return row
 
 
+class OutlinePanel(QWidget):
+    page_requested = Signal(int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("OutlinePanel")
+        self.setMinimumWidth(180)
+        self.setMaximumWidth(320)
+
+        title = QLabel("Contents")
+        title.setObjectName("OutlineTitle")
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.itemActivated.connect(self._open_item)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        layout.addWidget(title)
+        layout.addWidget(self.tree, 1)
+
+    def set_outline(self, toc: list[list]) -> None:
+        self.tree.clear()
+        if not toc:
+            item = QTreeWidgetItem(["No contents"])
+            item.setDisabled(True)
+            self.tree.addTopLevelItem(item)
+            return
+
+        parents: dict[int, QTreeWidgetItem] = {}
+        for raw in toc:
+            if len(raw) < 3:
+                continue
+            level = max(1, int(raw[0]))
+            title = str(raw[1])
+            page_index = max(0, int(raw[2]) - 1)
+            item = QTreeWidgetItem([title])
+            item.setData(0, Qt.UserRole, page_index)
+            parent = parents.get(level - 1)
+            if parent is None:
+                self.tree.addTopLevelItem(item)
+            else:
+                parent.addChild(item)
+            parents[level] = item
+            for stale_level in [key for key in parents if key > level]:
+                del parents[stale_level]
+        self.tree.expandToDepth(1)
+
+    def _open_item(self, item: QTreeWidgetItem) -> None:
+        page_index = item.data(0, Qt.UserRole)
+        if page_index is not None:
+            self.page_requested.emit(int(page_index))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -568,18 +719,52 @@ class MainWindow(QMainWindow):
         self.scroll_area.setBackgroundRole(self.backgroundRole())
         self.scroll_area.viewport().setObjectName("ReaderViewport")
         self.scroll_area.viewport().setAutoFillBackground(True)
+        self.scroll_area.viewport().installEventFilter(self)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
         self.note_panel.save_requested.connect(self.save_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
 
+        self.page_label = QLabel("Page 0 / 0")
+        self.page_label.setObjectName("BottomPageLabel")
+        self.prev_page_button = QPushButton("-")
+        self.prev_page_button.setObjectName("PageNavButton")
+        self.prev_page_button.clicked.connect(self.previous_page)
+        self.next_page_button = QPushButton("+")
+        self.next_page_button.setObjectName("PageNavButton")
+        self.next_page_button.clicked.connect(self.next_page)
+
+        footer = QWidget()
+        footer.setObjectName("PageFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 4, 0, 6)
+        footer_layout.setSpacing(8)
+        footer_layout.addStretch(1)
+        footer_layout.addWidget(self.prev_page_button)
+        footer_layout.addWidget(self.page_label)
+        footer_layout.addWidget(self.next_page_button)
+        footer_layout.addStretch(1)
+
+        self.reader_area = QWidget()
+        self.reader_area.setObjectName("ReaderArea")
+        reader_layout = QVBoxLayout(self.reader_area)
+        reader_layout.setContentsMargins(0, 0, 0, 0)
+        reader_layout.setSpacing(0)
+        reader_layout.addWidget(self.scroll_area, 1)
+        reader_layout.addWidget(footer, 0)
+
+        self.outline_panel = OutlinePanel()
+        self.outline_panel.page_requested.connect(self.go_to_page)
+
         self.reader_splitter = QSplitter(Qt.Horizontal)
-        self.reader_splitter.addWidget(self.scroll_area)
+        self.reader_splitter.addWidget(self.outline_panel)
+        self.reader_splitter.addWidget(self.reader_area)
         self.reader_splitter.addWidget(self.note_panel)
-        self.reader_splitter.setStretchFactor(0, 1)
-        self.reader_splitter.setStretchFactor(1, 0)
-        self.reader_splitter.setSizes([820, 320])
+        self.reader_splitter.setStretchFactor(0, 0)
+        self.reader_splitter.setStretchFactor(1, 1)
+        self.reader_splitter.setStretchFactor(2, 0)
+        self.reader_splitter.setSizes([220, 820, 320])
 
         self.history_panel = HistoryPanel()
         self.history_panel.open_requested.connect(self.open_history_entry)
@@ -591,7 +776,6 @@ class MainWindow(QMainWindow):
         self.main_stack.addWidget(self.reader_splitter)
         self.setCentralWidget(self.main_stack)
 
-        self.page_label = QLabel("No PDF")
         self.zoom_label = QLabel("125%")
         self._build_toolbar()
         self._render_empty_state()
@@ -618,15 +802,12 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self.prev_action = QAction("Previous", self)
-        self.prev_action.triggered.connect(self.previous_page)
-        toolbar.addAction(self.prev_action)
+        self.outline_action = QAction("Contents", self)
+        self.outline_action.setCheckable(True)
+        self.outline_action.setChecked(True)
+        self.outline_action.triggered.connect(self.set_outline_visible)
+        toolbar.addAction(self.outline_action)
 
-        self.next_action = QAction("Next", self)
-        self.next_action.triggered.connect(self.next_page)
-        toolbar.addAction(self.next_action)
-
-        toolbar.addWidget(self.page_label)
         toolbar.addSeparator()
 
         self.continuous_action = QAction("Continuous Scroll", self)
@@ -673,6 +854,7 @@ class MainWindow(QMainWindow):
             self.page_index = 0
         self.note_panel.set_note(None)
         self._record_current_pdf()
+        self.outline_panel.set_outline(document.get_toc())
         self.render_page()
         self.show_reader()
 
@@ -736,6 +918,9 @@ class MainWindow(QMainWindow):
             self.main_stack.setCurrentWidget(self.reader_splitter)
         self._refresh_actions()
 
+    def set_outline_visible(self, visible: bool) -> None:
+        self.outline_panel.setVisible(visible)
+
     def restore_last_session(self) -> bool:
         for entry in self.history_entries:
             path = Path(entry.path)
@@ -782,7 +967,10 @@ class MainWindow(QMainWindow):
     def _create_canvas(self, page_index: int) -> PdfCanvas:
         canvas = PdfCanvas(page_index)
         canvas.add_note_requested.connect(self.add_note)
+        canvas.fit_requested.connect(self.fit_page)
+        canvas.mode_requested.connect(self.set_reading_mode)
         canvas.note_selected.connect(self.select_note)
+        canvas.zoom_requested.connect(self.change_zoom)
         return canvas
 
     def _render_empty_state(self) -> None:
@@ -939,7 +1127,11 @@ class MainWindow(QMainWindow):
             self._refresh_actions()
 
     def set_continuous_scroll(self, checked: bool) -> None:
-        self.continuous_scroll = checked
+        self.set_reading_mode("continuous" if checked else "single")
+
+    def set_reading_mode(self, mode: str) -> None:
+        self.continuous_scroll = mode == "continuous"
+        self.continuous_action.setChecked(self.continuous_scroll)
         self.note_panel.set_note(None)
         self.render_page()
 
@@ -948,6 +1140,30 @@ class MainWindow(QMainWindow):
             return
         self.zoom = max(0.3, min(4.0, self.zoom + delta))
         self.render_page()
+
+    def fit_page(self, mode: str) -> None:
+        if self.document is None:
+            return
+        page = self.document.load_page(self.page_index)
+        rect = page.rect
+        margins = self.pages_layout.contentsMargins()
+        if mode == "width":
+            available = self.scroll_area.viewport().width() - margins.left() - margins.right() - 24
+            self.zoom = max(0.3, min(4.0, available / rect.width))
+        elif mode == "height":
+            available = self.scroll_area.viewport().height() - margins.top() - margins.bottom() - 24
+            self.zoom = max(0.3, min(4.0, available / rect.height))
+        else:
+            return
+        self.render_page()
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        if watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
+            if event.modifiers() & Qt.ControlModifier:
+                self.change_zoom(0.1 if event.angleDelta().y() > 0 else -0.1)
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
         focus = QApplication.focusWidget()
@@ -973,28 +1189,21 @@ class MainWindow(QMainWindow):
     def _refresh_actions(self) -> None:
         has_document = self.document is not None
         page_count = self.document.page_count if self.document is not None else 0
-        self.prev_action.setEnabled(has_document and self.page_index > 0)
-        self.next_action.setEnabled(has_document and self.page_index < page_count - 1)
+        self.prev_page_button.setEnabled(has_document and self.page_index > 0)
+        self.next_page_button.setEnabled(has_document and self.page_index < page_count - 1)
         self.zoom_in_action.setEnabled(has_document)
         self.zoom_out_action.setEnabled(has_document)
         self.continuous_action.setEnabled(has_document)
+        self.outline_action.setEnabled(has_document)
         self.reader_action.setEnabled(has_document)
 
         if has_document:
             self.page_label.setText(f"Page {self.page_index + 1} / {page_count}")
         else:
-            self.page_label.setText("No PDF")
+            self.page_label.setText("Page 0 / 0")
         self.zoom_label.setText(f"{round(self.zoom * 100)}%")
 
     def apply_theme(self) -> None:
-        reader_background = QColor("#f0ead8")
-        for widget in (self.scroll_area, self.scroll_area.viewport(), self.pages_container):
-            palette = widget.palette()
-            palette.setColor(QPalette.Window, reader_background)
-            palette.setColor(QPalette.Base, reader_background)
-            widget.setPalette(palette)
-            widget.setAutoFillBackground(True)
-
         self.setStyleSheet(
             """
             QMainWindow {
@@ -1032,6 +1241,36 @@ class MainWindow(QMainWindow):
             }
             #ReaderViewport, #PagesContainer {
                 background: #f0ead8;
+            }
+            #ReaderArea, #PageFooter, #OutlinePanel {
+                background: #f0ead8;
+            }
+            #BottomPageLabel {
+                font-weight: 600;
+                padding: 0 4px;
+            }
+            #PageNavButton {
+                min-width: 30px;
+                max-width: 30px;
+                min-height: 24px;
+                padding: 0;
+                font-weight: 700;
+            }
+            #OutlineTitle {
+                font-size: 15px;
+                font-weight: 700;
+            }
+            QTreeWidget {
+                background: #f5eedc;
+                border: 1px solid #cbbd95;
+                color: #2f2a1f;
+            }
+            QTreeWidget::item {
+                min-height: 22px;
+                padding: 2px 4px;
+            }
+            QTreeWidget::item:selected {
+                background: #d7bf7a;
             }
             QSplitter::handle {
                 background: #c7b98f;
@@ -1098,6 +1337,16 @@ class MainWindow(QMainWindow):
             }
             """
         )
+        self._apply_reader_palette()
+
+    def _apply_reader_palette(self) -> None:
+        reader_background = QColor("#f0ead8")
+        for widget in (self.scroll_area, self.scroll_area.viewport(), self.pages_container, self.reader_area):
+            palette = widget.palette()
+            palette.setColor(QPalette.Window, reader_background)
+            palette.setColor(QPalette.Base, reader_background)
+            widget.setPalette(palette)
+            widget.setAutoFillBackground(True)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self.close_document()
