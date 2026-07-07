@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,9 @@ class Note:
     markdown: str
     created_at: str
     updated_at: str
+    note_type: str = "point"
+    rects_norm: list[list[float]] = field(default_factory=list)
+    selected_text: str = ""
 
     @classmethod
     def create(
@@ -34,6 +37,9 @@ class Note:
         x_norm: float,
         y_norm: float,
         markdown: str = "",
+        note_type: str = "point",
+        rects_norm: list[list[float]] | None = None,
+        selected_text: str = "",
     ) -> "Note":
         now = utc_now()
         return cls(
@@ -45,6 +51,9 @@ class Note:
             markdown=markdown,
             created_at=now,
             updated_at=now,
+            note_type=note_type,
+            rects_norm=rects_norm or [],
+            selected_text=selected_text,
         )
 
     @classmethod
@@ -58,6 +67,9 @@ class Note:
             markdown=str(data.get("markdown", "")),
             created_at=str(data.get("created_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
+            note_type=str(data.get("note_type") or "point"),
+            rects_norm=normalize_rects(data.get("rects_norm", [])),
+            selected_text=str(data.get("selected_text", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,6 +86,18 @@ def utc_now() -> str:
 
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def normalize_rects(value: Any) -> list[list[float]]:
+    if not isinstance(value, list):
+        return []
+
+    rects: list[list[float]] = []
+    for item in value:
+        if not isinstance(item, list | tuple) or len(item) != 4:
+            continue
+        rects.append([clamp01(float(coord)) for coord in item])
+    return rects
 
 
 def default_data_dir() -> Path:

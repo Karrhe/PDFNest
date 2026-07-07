@@ -8,11 +8,15 @@ from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QSignalBlocker, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -43,7 +47,11 @@ from pdf_notes_reader.history import (
     save_history,
     upsert_history_entry,
 )
-from pdf_notes_reader.notes import Note, default_data_dir, find_note, load_notes, pdf_key_for_path, save_notes
+from pdf_notes_reader.notes import Note, default_data_dir, find_note, load_notes, notes_path_for_key, pdf_key_for_path, save_notes
+from pdf_notes_reader.settings import load_settings, save_settings, settings_path
+
+
+APP_TITLE = "PDFNest"
 
 
 MATH_BLOCK_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -338,6 +346,7 @@ def render_markdown_preview(text: str) -> str:
 
 class PdfCanvas(QWidget):
     add_note_requested = Signal(int, float, float)
+    annotation_requested = Signal(int, str, list, str)
     fit_requested = Signal(str)
     mode_requested = Signal(str)
     note_selected = Signal(str)
@@ -349,16 +358,36 @@ class PdfCanvas(QWidget):
         self._pixmap: QPixmap | None = None
         self._page_size = QSize(640, 480)
         self._notes: list[Note] = []
+        self._text_words: list[dict[str, object]] = []
+        self._selection_start: QPoint | None = None
+        self._selection_end: QPoint | None = None
+        self._selected_rects_norm: list[list[float]] = []
+        self._selected_text = ""
         self._marker_radius = 7
         self._continuous_scroll = True
+        self._theme_colors: dict[str, str] = {
+            "pdf_tint": "#f3ecd6",
+            "note_marker": "#e11d48",
+            "highlight": "#fde68a",
+            "underline": "#2563eb",
+            "text_selection": "#bfdbfe",
+        }
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
-    def set_page(self, pixmap: QPixmap | None, notes: list[Note], display_size: QSize | None = None) -> None:
+    def set_page(
+        self,
+        pixmap: QPixmap | None,
+        notes: list[Note],
+        display_size: QSize | None = None,
+        text_words: list[dict[str, object]] | None = None,
+    ) -> None:
         self._pixmap = pixmap
         self._notes = notes
+        self._text_words = text_words or []
+        self.clear_selection()
         if pixmap is None:
             self._page_size = QSize(640, 480)
         else:
@@ -366,8 +395,18 @@ class PdfCanvas(QWidget):
         self.setFixedSize(self._page_size)
         self.update()
 
+    def clear_selection(self) -> None:
+        self._selection_start = None
+        self._selection_end = None
+        self._selected_rects_norm = []
+        self._selected_text = ""
+
     def set_context_state(self, *, continuous_scroll: bool) -> None:
         self._continuous_scroll = continuous_scroll
+
+    def set_theme_colors(self, colors: dict[str, str]) -> None:
+        self._theme_colors.update(colors)
+        self.update()
 
     def render_device_pixel_ratio(self) -> float:
         if self._pixmap is None:
@@ -376,7 +415,7 @@ class PdfCanvas(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#f7f1df"))
+        painter.fillRect(self.rect(), QColor(self._theme_colors.get("pdf_tint", "#f3ecd6")))
 
         if self._pixmap is None:
             painter.setPen(QColor("#6f6653"))
@@ -386,13 +425,35 @@ class PdfCanvas(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawPixmap(self.rect(), self._pixmap)
         painter.setCompositionMode(QPainter.CompositionMode_Multiply)
-        painter.fillRect(self.rect(), QColor("#f3ecd6"))
+        painter.fillRect(self.rect(), QColor(self._theme_colors.get("pdf_tint", "#f3ecd6")))
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         for note in self._notes:
+            if note.note_type not in {"highlight", "underline"}:
+                continue
+            for rect in note.rects_norm:
+                page_rect = self._norm_rect_to_page(rect)
+                if note.note_type == "highlight":
+                    color = QColor(self._theme_colors.get("highlight", "#fde68a"))
+                    color.setAlpha(105)
+                    painter.fillRect(page_rect, color)
+                else:
+                    pen = QPen(QColor(self._theme_colors.get("underline", "#2563eb")), 2)
+                    painter.setPen(pen)
+                    y = page_rect.bottom() - 1
+                    painter.drawLine(page_rect.left(), y, page_rect.right(), y)
+
+        for rect in self._selection_rects():
+            color = QColor(self._theme_colors.get("text_selection", "#bfdbfe"))
+            color.setAlpha(120)
+            painter.fillRect(rect, color)
+
+        for note in self._notes:
+            if note.note_type != "point":
+                continue
             center = self._note_center(note)
-            painter.setBrush(QColor("#e11d48"))
+            painter.setBrush(QColor(self._theme_colors.get("note_marker", "#e11d48")))
             painter.setPen(QPen(QColor("#ffffff"), 2))
             painter.drawEllipse(center, self._marker_radius, self._marker_radius)
 
@@ -402,6 +463,9 @@ class PdfCanvas(QWidget):
 
         menu = QMenu(self)
         add_action = QAction("Add note", self)
+        copy_action = QAction("Copy selected text", self)
+        highlight_action = QAction("Highlight selection", self)
+        underline_action = QAction("Underline selection", self)
         fit_width_action = QAction("Fit width", self)
         fit_height_action = QAction("Fit height", self)
         continuous_action = QAction("Continuous scroll", self)
@@ -411,6 +475,10 @@ class PdfCanvas(QWidget):
         continuous_action.setChecked(self._continuous_scroll)
         single_page_action.setChecked(not self._continuous_scroll)
         menu.addAction(add_action)
+        if self._selected_text:
+            menu.addAction(copy_action)
+            menu.addAction(highlight_action)
+            menu.addAction(underline_action)
         menu.addSeparator()
         menu.addAction(fit_width_action)
         menu.addAction(fit_height_action)
@@ -421,6 +489,12 @@ class PdfCanvas(QWidget):
         if chosen == add_action:
             x_norm, y_norm = self._point_to_norm(event.pos())
             self.add_note_requested.emit(self.page_index, x_norm, y_norm)
+        elif chosen == copy_action:
+            self.copy_selected_text()
+        elif chosen == highlight_action:
+            self.annotation_requested.emit(self.page_index, "highlight", self._selected_rects_norm, self._selected_text)
+        elif chosen == underline_action:
+            self.annotation_requested.emit(self.page_index, "underline", self._selected_rects_norm, self._selected_text)
         elif chosen == fit_width_action:
             self.fit_requested.emit("width")
         elif chosen == fit_height_action:
@@ -437,6 +511,47 @@ class PdfCanvas(QWidget):
         note = self._note_at(event.pos())
         if note is not None:
             self.note_selected.emit(note.id)
+            event.accept()
+            return
+
+        if self._inside_page(event.pos()):
+            self.setFocus(Qt.MouseFocusReason)
+            self._selection_start = event.pos()
+            self._selection_end = event.pos()
+            self._selected_rects_norm = []
+            self._selected_text = ""
+            self.update()
+            event.accept()
+            return
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._selection_start is None or self._pixmap is None:
+            return
+        self._selection_end = self._clamp_point_to_page(event.pos())
+        self._update_text_selection()
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() != Qt.LeftButton or self._selection_start is None:
+            return
+        self._selection_end = self._clamp_point_to_page(event.pos())
+        self._update_text_selection()
+        if not self._selected_text:
+            self.clear_selection()
+        self.update()
+        event.accept()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.modifiers() & Qt.ControlModifier and event.key() in (Qt.Key_C, Qt.Key_V):
+            self.copy_selected_text()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selected_text(self) -> None:
+        if self._selected_text:
+            QApplication.clipboard().setText(self._selected_text)
 
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.modifiers() & Qt.ControlModifier:
@@ -455,6 +570,65 @@ class PdfCanvas(QWidget):
             return 0.0, 0.0
         return point.x() / self._page_size.width(), point.y() / self._page_size.height()
 
+    def _norm_rect_to_page(self, rect: list[float]) -> QRectF:
+        return QRectF(
+            rect[0] * self._page_size.width(),
+            rect[1] * self._page_size.height(),
+            (rect[2] - rect[0]) * self._page_size.width(),
+            (rect[3] - rect[1]) * self._page_size.height(),
+        )
+
+    def _page_rect_to_norm(self, rect: QRectF) -> list[float]:
+        if self._page_size.width() == 0 or self._page_size.height() == 0:
+            return [0.0, 0.0, 0.0, 0.0]
+        return [
+            rect.left() / self._page_size.width(),
+            rect.top() / self._page_size.height(),
+            rect.right() / self._page_size.width(),
+            rect.bottom() / self._page_size.height(),
+        ]
+
+    def _clamp_point_to_page(self, point: QPoint) -> QPoint:
+        return QPoint(
+            max(0, min(point.x(), max(0, self._page_size.width() - 1))),
+            max(0, min(point.y(), max(0, self._page_size.height() - 1))),
+        )
+
+    def _selection_rect(self) -> QRectF | None:
+        if self._selection_start is None or self._selection_end is None:
+            return None
+        return QRectF(self._selection_start, self._selection_end).normalized()
+
+    def _selection_rects(self) -> list[QRectF]:
+        return [self._norm_rect_to_page(rect) for rect in self._selected_rects_norm]
+
+    def _update_text_selection(self) -> None:
+        selection = self._selection_rect()
+        if selection is None:
+            return
+
+        selected: list[dict[str, object]] = []
+        for word in self._text_words:
+            rect = self._norm_rect_to_page(word["rect"])
+            if rect.intersects(selection):
+                selected.append(word)
+
+        self._selected_rects_norm = [word["rect"] for word in selected]
+        self._selected_text = self._join_selected_words(selected)
+
+    @staticmethod
+    def _join_selected_words(words: list[dict[str, object]]) -> str:
+        lines: dict[tuple[int, int], list[dict[str, object]]] = {}
+        for word in words:
+            key = (int(word["block"]), int(word["line"]))
+            lines.setdefault(key, []).append(word)
+
+        text_lines: list[str] = []
+        for key in sorted(lines):
+            ordered = sorted(lines[key], key=lambda item: int(item["word_no"]))
+            text_lines.append(" ".join(str(item["text"]) for item in ordered))
+        return "\n".join(text_lines)
+
     def _note_center(self, note: Note) -> QPoint:
         if self._pixmap is None:
             return QPoint()
@@ -462,10 +636,15 @@ class PdfCanvas(QWidget):
 
     def _note_at(self, point: QPoint) -> Note | None:
         for note in reversed(self._notes):
-            center = self._note_center(note)
-            delta = center - point
-            if delta.x() * delta.x() + delta.y() * delta.y() <= (self._marker_radius + 5) ** 2:
-                return note
+            if note.note_type == "point":
+                center = self._note_center(note)
+                delta = center - point
+                if delta.x() * delta.x() + delta.y() * delta.y() <= (self._marker_radius + 5) ** 2:
+                    return note
+            elif note.note_type in {"highlight", "underline"}:
+                for rect in note.rects_norm:
+                    if self._norm_rect_to_page(rect).contains(point):
+                        return note
         return None
 
 
@@ -715,12 +894,66 @@ class OutlinePanel(QWidget):
             self.page_requested.emit(int(page_index))
 
 
+class SettingsDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        settings: dict,
+        data_dir: Path,
+        note_json_path: Path | None,
+        markdown_dir: Path,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("PDFNest Settings")
+
+        self.theme_combo = QComboBox()
+        themes = settings.get("themes", {})
+        for theme_name in sorted(themes):
+            self.theme_combo.addItem(theme_name, theme_name)
+        current_theme = str(settings.get("theme") or "beige")
+        index = self.theme_combo.findData(current_theme)
+        if index >= 0:
+            self.theme_combo.setCurrentIndex(index)
+
+        data_label = QLabel(str(data_dir))
+        data_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        note_label = QLabel(str(note_json_path) if note_json_path is not None else "Open a PDF to see this path.")
+        note_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        markdown_label = QLabel(str(markdown_dir))
+        markdown_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        settings_label = QLabel(str(settings_path()))
+        settings_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        form = QFormLayout()
+        form.addRow("Theme", self.theme_combo)
+        form.addRow("Data folder", data_label)
+        form.addRow("Current note JSON", note_label)
+        form.addRow("Markdown export base", markdown_label)
+        form.addRow("Settings file", settings_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    @property
+    def selected_theme(self) -> str:
+        return str(self.theme_combo.currentData())
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("PDF Notes Reader")
+        self.setWindowTitle(APP_TITLE)
+        self._set_app_icon()
         self.resize(1180, 820)
 
+        self.settings = load_settings()
+        self.theme_name = str(self.settings.get("theme") or "beige")
         self.document: fitz.Document | None = None
         self.pdf_path: Path | None = None
         self.pdf_key: str | None = None
@@ -871,6 +1104,45 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.outline_action)
 
         toolbar.addSeparator()
+
+        settings_action = QAction("Settings", self)
+        settings_action.triggered.connect(self.open_settings)
+        toolbar.addAction(settings_action)
+
+    def _set_app_icon(self) -> None:
+        candidates = [
+            Path.cwd() / "Icon.png",
+            Path(__file__).resolve().parents[2] / "Icon.png",
+            Path(sys.executable).resolve().parent / "Icon.png",
+            Path.cwd() / "PDFNest-Icon.png",
+            Path(__file__).resolve().parents[2] / "PDFNest-Icon.png",
+        ]
+        for icon_path in candidates:
+            if icon_path.exists():
+                icon = QIcon(str(icon_path))
+                self.setWindowIcon(icon)
+                app = QApplication.instance()
+                if app is not None:
+                    app.setWindowIcon(icon)
+                return
+
+    def open_settings(self) -> None:
+        note_json_path = notes_path_for_key(self.pdf_key) if self.pdf_key is not None else None
+        dialog = SettingsDialog(
+            settings=self.settings,
+            data_dir=default_data_dir(),
+            note_json_path=note_json_path,
+            markdown_dir=self.note_export_dir,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.theme_name = dialog.selected_theme
+        self.settings["theme"] = self.theme_name
+        save_settings(self.settings)
+        self.apply_theme()
+        self.render_page(render_neighbors=False)
 
     def open_pdf(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
@@ -1029,6 +1301,36 @@ class MainWindow(QMainWindow):
         display_size = QSize(round(pix.width / self.render_scale), round(pix.height / self.render_scale))
         return pixmap, display_size
 
+    def _page_text_words(self, page_index: int) -> list[dict[str, object]]:
+        if self.document is None:
+            return []
+
+        page = self.document.load_page(page_index)
+        rect = page.rect
+        if rect.width == 0 or rect.height == 0:
+            return []
+
+        words: list[dict[str, object]] = []
+        for raw in page.get_text("words"):
+            if len(raw) < 8:
+                continue
+            x0, y0, x1, y1, text, block_no, line_no, word_no = raw[:8]
+            words.append(
+                {
+                    "rect": [
+                        max(0.0, min(1.0, float(x0) / rect.width)),
+                        max(0.0, min(1.0, float(y0) / rect.height)),
+                        max(0.0, min(1.0, float(x1) / rect.width)),
+                        max(0.0, min(1.0, float(y1) / rect.height)),
+                    ],
+                    "text": str(text),
+                    "block": int(block_no),
+                    "line": int(line_no),
+                    "word_no": int(word_no),
+                }
+            )
+        return words
+
     def _cache_page_base_sizes(self) -> None:
         self.page_base_sizes = []
         if self.document is None:
@@ -1118,7 +1420,7 @@ class MainWindow(QMainWindow):
         widget = self._create_canvas(page_index)
         pixmap, display_size = self._render_page_pixmap(page_index)
         page_notes = [note for note in self.notes if note.page_index == page_index]
-        widget.set_page(pixmap, page_notes, display_size)
+        widget.set_page(pixmap, page_notes, display_size, self._page_text_words(page_index))
         self.pages_layout.addWidget(widget, 0, Qt.AlignHCenter)
         self.page_canvases[page_index] = widget
         self.page_widgets[page_index] = widget
@@ -1126,7 +1428,9 @@ class MainWindow(QMainWindow):
     def _create_canvas(self, page_index: int) -> PdfCanvas:
         canvas = PdfCanvas(page_index)
         canvas.set_context_state(continuous_scroll=self.continuous_scroll)
+        canvas.set_theme_colors(self._theme_colors())
         canvas.add_note_requested.connect(self.add_note)
+        canvas.annotation_requested.connect(self.add_text_annotation)
         canvas.fit_requested.connect(self.fit_page)
         canvas.mode_requested.connect(self.set_reading_mode)
         canvas.note_selected.connect(self.select_note)
@@ -1193,6 +1497,35 @@ class MainWindow(QMainWindow):
             x_norm=x_norm,
             y_norm=y_norm,
             markdown="# New note\n",
+        )
+        self.page_index = page_index
+        self.notes.append(note)
+        self.persist_notes()
+        self.render_page()
+        self.note_panel.set_note(note)
+
+    def add_text_annotation(self, page_index: int, note_type: str, rects_norm: list, selected_text: str) -> None:
+        if self.document is None or self.pdf_key is None or not rects_norm:
+            return
+        cleaned_rects = []
+        for rect in rects_norm:
+            if isinstance(rect, list | tuple) and len(rect) == 4:
+                cleaned_rects.append([max(0.0, min(1.0, float(value))) for value in rect])
+        if not cleaned_rects:
+            return
+
+        first_rect = cleaned_rects[0]
+        x_norm = (first_rect[0] + first_rect[2]) / 2
+        y_norm = (first_rect[1] + first_rect[3]) / 2
+        note = Note.create(
+            pdf_key=self.pdf_key,
+            page_index=page_index,
+            x_norm=x_norm,
+            y_norm=y_norm,
+            markdown=f"> {selected_text}\n\n",
+            note_type=note_type,
+            rects_norm=cleaned_rects,
+            selected_text=selected_text,
         )
         self.page_index = page_index
         self.notes.append(note)
@@ -1569,14 +1902,14 @@ class MainWindow(QMainWindow):
             self.zoom_spin.setValue(round(self.zoom * 100))
 
     def apply_theme(self) -> None:
-        self.setStyleSheet(
-            """
+        colors = self._theme_colors()
+        style = """
             QMainWindow {
-                background: #e8dfc8;
-                color: #2f2a1f;
+                background: {colors["window"]};
+                color: {colors["text"]};
             }
             QToolBar {
-                background: #bda66a;
+                background: {colors["toolbar"]};
                 border: 0;
                 spacing: 8px;
                 padding: 4px 8px;
@@ -1584,31 +1917,31 @@ class MainWindow(QMainWindow):
             QToolButton {
                 background: transparent;
                 border: 0;
-                color: #1f1a12;
+                color: {colors["text"]};
                 padding: 7px 10px;
             }
             QToolButton:hover {
-                background: #d8c99d;
+                background: {colors["button_hover"]};
             }
             QToolButton:checked {
-                background: #f3eddc;
+                background: {colors["editor"]};
                 border-radius: 4px;
             }
             QLabel {
-                color: #2f2a1f;
+                color: {colors["text"]};
             }
             QScrollArea {
-                background: #e8dfc8;
+                background: {colors["window"]};
                 border: 0;
             }
             QScrollArea > QWidget > QWidget {
-                background: #f0ead8;
+                background: {colors["reader"]};
             }
             #ReaderViewport, #PagesContainer {
-                background: #f0ead8;
+                background: {colors["reader"]};
             }
             #ReaderArea, #PageFooter, #OutlinePanel {
-                background: #f0ead8;
+                background: {colors["reader"]};
             }
             #BottomPageLabel {
                 font-weight: 600;
@@ -1626,86 +1959,93 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
             }
             QTreeWidget {
-                background: #f5eedc;
-                border: 1px solid #cbbd95;
-                color: #2f2a1f;
+                background: {colors["panel"]};
+                border: 1px solid {colors["border"]};
+                color: {colors["text"]};
             }
             QTreeWidget::item {
                 min-height: 22px;
                 padding: 2px 4px;
             }
             QTreeWidget::item:selected {
-                background: #d7bf7a;
+                background: {colors["button"]};
             }
             QSplitter::handle {
-                background: #c7b98f;
+                background: {colors["border"]};
             }
             QTabWidget::pane {
-                border: 1px solid #cbbd95;
-                background: #f5eedc;
+                border: 1px solid {colors["border"]};
+                background: {colors["panel"]};
             }
             QTabBar::tab {
-                background: #e3d8ba;
+                background: {colors["button"]};
                 padding: 7px 12px;
             }
             QTabBar::tab:selected {
-                background: #f8f2e2;
+                background: {colors["editor"]};
             }
             QPlainTextEdit, QTextBrowser {
-                background: #fbf6e8;
-                border: 1px solid #cbbd95;
-                color: #2f2a1f;
-                selection-background-color: #c2a45d;
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+                color: {colors["text"]};
+                selection-background-color: {colors["selection"]};
             }
             QPushButton {
-                background: #d7bf7a;
-                border: 1px solid #a98e4f;
+                background: {colors["button"]};
+                border: 1px solid {colors["border"]};
                 border-radius: 4px;
-                color: #1f1a12;
+                color: {colors["text"]};
                 padding: 5px 10px;
             }
             QPushButton:hover {
-                background: #e3ce91;
+                background: {colors["button_hover"]};
             }
             QPushButton:disabled {
-                background: #ddd5bf;
-                color: #8d846f;
+                background: {colors["border"]};
+                color: {colors["muted"]};
             }
             #HistoryTitle {
                 font-size: 18px;
                 font-weight: 700;
             }
             #HistoryHint, #HistoryRowMeta {
-                color: #7a705b;
+                color: {colors["muted"]};
             }
             #HistoryRow, #HistoryRowMissing {
-                background: #f5eedc;
-                border: 1px solid #cbbd95;
+                background: {colors["panel"]};
+                border: 1px solid {colors["border"]};
                 border-radius: 6px;
             }
             #HistoryRowMissing {
-                background: #f1e5cf;
-                border-color: #b88a6a;
+                background: {colors["panel"]};
+                border-color: {colors["underline"]};
             }
             #HistoryRowTitle {
                 font-size: 15px;
                 font-weight: 600;
             }
             #HistoryRowPath {
-                color: #1f1a12;
+                color: {colors["text"]};
             }
             #HistoryEmpty {
-                background: #f5eedc;
-                border: 1px solid #cbbd95;
+                background: {colors["panel"]};
+                border: 1px solid {colors["border"]};
                 border-radius: 6px;
                 padding: 20px;
             }
             """
-        )
+        for key, value in colors.items():
+            style = style.replace(f'{{colors["{key}"]}}', value)
+        self.setStyleSheet(style)
         self._apply_reader_palette()
 
+    def _theme_colors(self) -> dict[str, str]:
+        themes = self.settings.get("themes", {})
+        colors = themes.get(self.theme_name) or themes.get("beige") or {}
+        return {str(key): str(value) for key, value in colors.items()}
+
     def _apply_reader_palette(self) -> None:
-        reader_background = QColor("#f0ead8")
+        reader_background = QColor(self._theme_colors().get("reader", "#f0ead8"))
         for widget in (self.scroll_area, self.scroll_area.viewport(), self.pages_container, self.reader_area):
             palette = widget.palette()
             palette.setColor(QPalette.Window, reader_background)

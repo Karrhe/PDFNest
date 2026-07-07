@@ -1,4 +1,4 @@
-# PDF Notes Reader
+# PDFNest
 
 A Python desktop PDF reader with external anchored Markdown notes.
 
@@ -18,9 +18,11 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
 - Apply a warm beige reading tint to the PDF page content, the reader blank area, and the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
+- Drag across digital PDF text to select text, then press `Ctrl+C` to copy it.
+- Right-click selected text to create a highlight or underline annotation with an editable Markdown note.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
 - Show note markers as colored dots on the page.
-- Click a marker to edit or preview its Markdown note in the right sidebar.
+- Click a marker, highlight, or underline to edit or preview its Markdown note in the right sidebar.
 - Preview Markdown with tables, fenced code blocks, inline code, block quotes, and `$...$` / `$$...$$` math formula styling.
 - Save note anchors/content in external JSON files without modifying the original PDF.
 - Export individual notes as Markdown files to a selectable local folder.
@@ -28,6 +30,8 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Restore the last-read page when opening a PDF again.
 - Prompt for relocation when a PDF history item points to a missing absolute path.
 - Use a beige reading theme inspired by notebook/library reading tools.
+- Switch between the beige theme and a white theme in Settings. Theme colors can be customized through `.local-data/settings.json`.
+- Use `Icon.png` as the application icon.
 
 ## Install
 
@@ -52,6 +56,12 @@ python -m pip install -r requirements.txt
 If installed with `pip install -e .`, you can also run:
 
 ```powershell
+.\.venv\Scripts\pdfnest.exe
+```
+
+The older command name is kept as an alias:
+
+```powershell
 .\.venv\Scripts\pdf-notes-reader.exe
 ```
 
@@ -61,12 +71,15 @@ If installed with `pip install -e .`, you can also run:
 - `Open`: opens a local PDF and records its absolute path in history.
 - `Reader`: returns to the active PDF reader.
 - `Contents`: toggles the PDF outline panel.
+- `Settings`: opens app settings, including theme selection and storage paths.
 - Bottom page control: `- Page n / l +`, where `-` goes to the previous page, `+` goes to the next page, and the page number field can be edited directly.
 - Bottom zoom control: edit the percentage field to set the PDF zoom directly.
 - Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
 - `PageUp` / `PageDown`: previous or next page.
 - `Ctrl` + mouse wheel over the PDF area: zooms in or out around the current reading page center.
 - Right-click a PDF page for `Add note`, `Fit width`, `Fit height`, `Continuous scroll`, and `Single page`.
+- Drag-select digital PDF text, then press `Ctrl+C` to copy the selected text. `Ctrl+V` also copies the current PDF selection for compatibility with the original shortcut request.
+- Right-click a text selection for `Copy selected text`, `Highlight selection`, and `Underline selection`.
 - Click an item in the left Contents panel to jump to that PDF outline page.
 
 Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions. In continuous mode, the reader keeps geometry for every page so the scrollbar range matches the whole PDF, but it only creates widgets for the current page window and a few merged spacer runs. It rasterizes only the current page plus nearby buffered pages, then refreshes that window as you scroll or jump. Zoom and fit commands prioritize the current reading page to reduce interaction lag.
@@ -171,7 +184,7 @@ F:\...\PDFReading\.local-data\notes\abc123....json
 
 ### JSON Contents
 
-Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded when notes were saved, the schema version, and all note anchors/content:
+Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded when notes were saved, the schema version, and all note anchors/content. Point notes use `note_type: "point"`. Text highlights and underlines use `note_type: "highlight"` or `note_type: "underline"`, plus normalized text rectangles:
 
 ```json
 {
@@ -187,7 +200,10 @@ Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded w
       "y_norm": 0.5,
       "markdown": "# Note",
       "created_at": "...",
-      "updated_at": "..."
+      "updated_at": "...",
+      "note_type": "point",
+      "rects_norm": [],
+      "selected_text": ""
     }
   ]
 }
@@ -201,6 +217,9 @@ Field meanings:
 - `notes[].page_index`: zero-based PDF page index.
 - `notes[].x_norm` and `notes[].y_norm`: normalized anchor coordinates from `0.0` to `1.0`, relative to the rendered PDF page.
 - `notes[].markdown`: raw Markdown note text.
+- `notes[].note_type`: `point`, `highlight`, or `underline`.
+- `notes[].rects_norm`: normalized text rectangles for text annotations.
+- `notes[].selected_text`: copied text captured when the text annotation was created.
 - `created_at` and `updated_at`: UTC ISO timestamps.
 
 Saves are written through a temporary sibling file named `<pdf_key>.tmp`, then atomically replaced as `<pdf_key>.json`.

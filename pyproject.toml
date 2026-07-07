@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pdf-notes-reader"
+name = "pdfnest"
 version = "0.1.0"
-description = "A PySide6 PDF reader with anchored external Markdown notes."
+description = "PDFNest: a PySide6 PDF reader with anchored external Markdown notes."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
+pdfnest = "pdf_notes_reader.main:main"
 pdf-notes-reader = "pdf_notes_reader.main:main"
 
 [tool.setuptools.packages.find]

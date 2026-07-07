@@ -135,6 +135,26 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertNotEqual(center.name().lower(), "#ffffff")
         self.assertGreater(center.red(), center.blue())
 
+    def test_pdf_canvas_selects_and_copies_text(self) -> None:
+        pixmap = QPixmap(200, 100)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas()
+        canvas.set_page(
+            pixmap,
+            [],
+            text_words=[
+                {"rect": [0.1, 0.1, 0.3, 0.3], "text": "Hello", "block": 0, "line": 0, "word_no": 0},
+                {"rect": [0.32, 0.1, 0.5, 0.3], "text": "PDF", "block": 0, "line": 0, "word_no": 1},
+            ],
+        )
+        canvas._selection_start = QPoint(0, 0)
+        canvas._selection_end = QPoint(140, 50)
+        canvas._update_text_selection()
+        canvas.copy_selected_text()
+
+        self.assertEqual(QApplication.clipboard().text(), "Hello PDF")
+        self.assertEqual(len(canvas._selected_rects_norm), 2)
+
     def test_reopens_pdf_at_last_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -218,6 +238,24 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertEqual(window.scroll_area.viewport().palette().color(window.scroll_area.viewport().backgroundRole()).name(), beige)
         self.assertEqual(window.pages_container.palette().color(window.pages_container.backgroundRole()).name(), beige)
         window.close()
+
+    def test_app_branding_and_theme_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(Path(tmp) / "data")
+            window = MainWindow()
+            try:
+                self.assertEqual(window.windowTitle(), "PDFNest")
+                self.assertFalse(window.windowIcon().isNull())
+
+                window.theme_name = "white"
+                window.settings["theme"] = "white"
+                window.apply_theme()
+                self.assertEqual(
+                    window.scroll_area.viewport().palette().color(window.scroll_area.viewport().backgroundRole()).name(),
+                    "#e5e7eb",
+                )
+            finally:
+                window.close()
 
     def test_bottom_page_controls_and_reading_modes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -462,6 +500,29 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn("Chapter One", markdown_files[0].name)
                 self.assertTrue(markdown_files[0].name.endswith("-1.md"))
                 self.assertEqual(markdown_files[0].read_text(encoding="utf-8"), "# Exported\n\nBody")
+            finally:
+                window.close()
+
+    def test_text_annotation_uses_note_panel_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "annotation.pdf"
+            self._create_sample_pdf(pdf_path)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.add_text_annotation(0, "highlight", [[0.1, 0.2, 0.4, 0.25]], "selected text")
+
+                self.assertEqual(len(window.notes), 1)
+                self.assertEqual(window.notes[0].note_type, "highlight")
+                self.assertEqual(window.notes[0].selected_text, "selected text")
+                self.assertEqual(window.note_panel.current_note_id, window.notes[0].id)
+
+                loaded = load_notes(window.pdf_key)
+                self.assertEqual(loaded[0].note_type, "highlight")
+                self.assertEqual(loaded[0].rects_norm, [[0.1, 0.2, 0.4, 0.25]])
             finally:
                 window.close()
 
