@@ -5,10 +5,15 @@ A Python desktop PDF reader with external anchored Markdown notes.
 ## Features
 
 - Open and render local PDF files.
-- Read in continuous vertical scroll mode by default, or switch to single-page mode from the toolbar or PDF context menu.
+- Read in continuous vertical scroll mode by default, or switch to single-page mode from the PDF context menu.
 - Navigate pages with the bottom `- Page n / l +` control or keyboard arrow keys.
-- Zoom in or out from the toolbar, context menu fit commands, or `Ctrl` + mouse wheel.
+- Jump by editing the bottom page number directly.
+- Zoom by editing the bottom zoom percentage, using context menu fit commands, or pressing `Ctrl` + mouse wheel.
+- `Ctrl` + mouse wheel zooms around the current reading page center instead of the mouse pointer.
+- Fit width and fit height keep adapting when the reader window changes size or when the reader/notes splitter is moved.
 - Browse PDF outlines from the left Contents panel when the PDF provides a table of contents.
+- Keep full-document page geometry in continuous mode so the scrollbar represents the whole PDF, while rasterizing only the current visible page window and nearby buffered pages.
+- Render only the current reading page during zoom and fit changes first, so zoom controls respond faster.
 - Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
 - Apply a warm beige reading tint to the PDF page content, the reader blank area, and the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
@@ -16,7 +21,8 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Show note markers as colored dots on the page.
 - Click a marker to edit or preview its Markdown note in the right sidebar.
 - Preview Markdown with tables, fenced code blocks, inline code, block quotes, and `$...$` / `$$...$$` math formula styling.
-- Save notes in external JSON files without modifying the original PDF.
+- Save note anchors/content in external JSON files without modifying the original PDF.
+- Export individual notes as Markdown files to a selectable local folder.
 - Reopen known PDFs from the Home history page.
 - Restore the last-read page when opening a PDF again.
 - Prompt for relocation when a PDF history item points to a missing absolute path.
@@ -54,16 +60,15 @@ If installed with `pip install -e .`, you can also run:
 - `Open`: opens a local PDF and records its absolute path in history.
 - `Reader`: returns to the active PDF reader.
 - `Contents`: toggles the PDF outline panel.
-- `Continuous Scroll`: toolbar toggle. Enabled by default to show all pages stacked vertically.
-- Bottom page control: `- Page n / l +`, where `-` goes to the previous page and `+` goes to the next page.
+- Bottom page control: `- Page n / l +`, where `-` goes to the previous page, `+` goes to the next page, and the page number field can be edited directly.
+- Bottom zoom control: edit the percentage field to set the PDF zoom directly.
 - Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
 - `PageUp` / `PageDown`: previous or next page.
-- `Zoom In` / `Zoom Out`: re-renders the visible document at the selected zoom level.
-- `Ctrl` + mouse wheel over the PDF area: zooms in or out.
+- `Ctrl` + mouse wheel over the PDF area: zooms in or out around the current reading page center.
 - Right-click a PDF page for `Add note`, `Fit width`, `Fit height`, `Continuous scroll`, and `Single page`.
 - Click an item in the left Contents panel to jump to that PDF outline page.
 
-Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions.
+Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions. In continuous mode, the reader keeps geometry for every page so the scrollbar range matches the whole PDF, but it only creates widgets for the current page window and a few merged spacer runs. It rasterizes only the current page plus nearby buffered pages, then refreshes that window as you scroll or jump. Zoom and fit commands prioritize the current reading page to reduce interaction lag.
 
 ## Markdown Notes
 
@@ -87,6 +92,14 @@ Formula content is parsed and rendered into styled inline or block formula eleme
 
 The local formula renderer supports common LaTeX-style commands used in notes, including Greek symbols such as `\beta`, superscripts/subscripts such as `$x_i^2$`, fractions such as `$\frac{1}{2}$`, roots such as `$\sqrt{x}$`, and common math operators such as `\times`, `\leq`, `\sum`, and arrows.
 
+The right note sidebar has a `Notes folder` button and an `Export MD` button. `Notes folder` selects where standalone `.md` files are written. `Save` updates the JSON anchor store. `Export MD` first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
+
+```text
+YYYYMMDD-HHMMSS-<pdf-name>-<chapter-name-or-page-number>-<number>.md
+```
+
+`<number>` is the note's order on that PDF page. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`.
+
 ## Data Storage
 
 Notes and PDF-related metadata are saved outside the original PDF. The app never writes notes back into the PDF file.
@@ -96,6 +109,12 @@ Default storage locations:
 - Windows: `%APPDATA%\PDFNotesReader\notes\`
 - Linux: `$XDG_DATA_HOME/PDFNotesReader/notes/` or `~/.local/share/PDFNotesReader/notes/`
 - Other systems: `~/.PDFNotesReader\notes\`
+
+The default Markdown export folder is:
+
+- Windows: `%APPDATA%\PDFNotesReader\markdown_notes\`
+- Linux: `$XDG_DATA_HOME/PDFNotesReader/markdown_notes/` or `~/.local/share/PDFNotesReader/markdown_notes/`
+- Other systems: `~/.PDFNotesReader\markdown_notes\`
 
 To store note files inside this project while developing, set `PDF_NOTES_READER_DATA_DIR` before launching the app:
 
@@ -108,6 +127,12 @@ With that setting, note files are written under:
 
 ```text
 .\.local-data\notes\<pdf_key>.json
+```
+
+Markdown exports are written under this folder unless changed from the right sidebar:
+
+```text
+.\.local-data\markdown_notes\
 ```
 
 The PDF history file is written under:

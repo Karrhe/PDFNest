@@ -3,11 +3,12 @@ from __future__ import annotations
 import html
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QSignalBlocker, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,9 +19,11 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QDoubleSpinBox,
     QPlainTextEdit,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStackedWidget,
     QTabWidget,
@@ -40,7 +43,7 @@ from pdf_notes_reader.history import (
     save_history,
     upsert_history_entry,
 )
-from pdf_notes_reader.notes import Note, find_note, load_notes, pdf_key_for_path, save_notes
+from pdf_notes_reader.notes import Note, default_data_dir, find_note, load_notes, pdf_key_for_path, save_notes
 
 
 MATH_BLOCK_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -347,6 +350,7 @@ class PdfCanvas(QWidget):
         self._page_size = QSize(640, 480)
         self._notes: list[Note] = []
         self._marker_radius = 7
+        self._continuous_scroll = True
         self.setContextMenuPolicy(Qt.DefaultContextMenu)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -361,6 +365,9 @@ class PdfCanvas(QWidget):
             self._page_size = display_size or pixmap.deviceIndependentSize().toSize()
         self.setFixedSize(self._page_size)
         self.update()
+
+    def set_context_state(self, *, continuous_scroll: bool) -> None:
+        self._continuous_scroll = continuous_scroll
 
     def render_device_pixel_ratio(self) -> float:
         if self._pixmap is None:
@@ -399,6 +406,10 @@ class PdfCanvas(QWidget):
         fit_height_action = QAction("Fit height", self)
         continuous_action = QAction("Continuous scroll", self)
         single_page_action = QAction("Single page", self)
+        continuous_action.setCheckable(True)
+        single_page_action.setCheckable(True)
+        continuous_action.setChecked(self._continuous_scroll)
+        single_page_action.setChecked(not self._continuous_scroll)
         menu.addAction(add_action)
         menu.addSeparator()
         menu.addAction(fit_width_action)
@@ -459,7 +470,9 @@ class PdfCanvas(QWidget):
 
 
 class NotePanel(QWidget):
+    choose_folder_requested = Signal()
     save_requested = Signal(str)
+    export_requested = Signal(str)
     delete_requested = Signal()
 
     def __init__(self) -> None:
@@ -481,16 +494,26 @@ class NotePanel(QWidget):
         tabs.addTab(self.preview, "Preview")
 
         self.save_button = QPushButton("Save")
+        self.export_button = QPushButton("Export MD")
         self.delete_button = QPushButton("Delete")
+        self.folder_button = QPushButton("Notes folder")
+        self.folder_label = QLabel("")
+        self.folder_label.setObjectName("NoteFolderLabel")
+        self.folder_label.setWordWrap(True)
         self.save_button.clicked.connect(self._emit_save)
+        self.export_button.clicked.connect(self._emit_export)
         self.delete_button.clicked.connect(self.delete_requested.emit)
+        self.folder_button.clicked.connect(self.choose_folder_requested.emit)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.save_button)
+        buttons.addWidget(self.export_button)
         buttons.addWidget(self.delete_button)
+        buttons.addWidget(self.folder_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.title)
+        layout.addWidget(self.folder_label)
         layout.addWidget(tabs, 1)
         layout.addLayout(buttons)
 
@@ -522,11 +545,19 @@ class NotePanel(QWidget):
         self.editor.setEnabled(enabled)
         self.preview.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
+        self.export_button.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
+
+    def set_folder_path(self, path: Path) -> None:
+        self.folder_label.setText(f"Markdown folder: {path}")
 
     def _emit_save(self) -> None:
         if self._current_note_id is not None:
             self.save_requested.emit(self.editor.toPlainText())
+
+    def _emit_export(self) -> None:
+        if self._current_note_id is not None:
+            self.export_requested.emit(self.editor.toPlainText())
 
     def _update_preview(self) -> None:
         text = self.editor.toPlainText()
@@ -697,9 +728,19 @@ class MainWindow(QMainWindow):
         self.history_entries = load_history()
         self.page_index = 0
         self.zoom = 1.25
+        self.fit_mode: str | None = None
         self.render_scale = 2.0
+        self.render_page_buffer = 1
         self.continuous_scroll = True
+        self.note_export_dir = default_data_dir() / "markdown_notes"
+        self.page_widgets: dict[int, QWidget] = {}
+        self.page_base_sizes: list[tuple[float, float]] = []
+        self.page_tops: list[int] = []
+        self.page_heights: list[int] = []
+        self.page_widths: list[int] = []
+        self.document_content_size = QSize(1, 1)
         self._suppress_scroll_sync = False
+        self._pending_scroll_id = 0
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.canvas = PdfCanvas()
@@ -714,7 +755,7 @@ class MainWindow(QMainWindow):
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidget(self.pages_container)
-        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidgetResizable(False)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         self.scroll_area.setBackgroundRole(self.backgroundRole())
         self.scroll_area.viewport().setObjectName("ReaderViewport")
@@ -723,17 +764,33 @@ class MainWindow(QMainWindow):
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
+        self.note_panel.choose_folder_requested.connect(self.choose_note_export_dir)
         self.note_panel.save_requested.connect(self.save_current_note)
+        self.note_panel.export_requested.connect(self.export_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
+        self.note_panel.set_folder_path(self.note_export_dir)
 
-        self.page_label = QLabel("Page 0 / 0")
-        self.page_label.setObjectName("BottomPageLabel")
         self.prev_page_button = QPushButton("-")
         self.prev_page_button.setObjectName("PageNavButton")
         self.prev_page_button.clicked.connect(self.previous_page)
         self.next_page_button = QPushButton("+")
         self.next_page_button.setObjectName("PageNavButton")
         self.next_page_button.clicked.connect(self.next_page)
+        self.page_spin = QSpinBox()
+        self.page_spin.setObjectName("PageSpin")
+        self.page_spin.setRange(0, 0)
+        self.page_spin.setPrefix("Page ")
+        self.page_spin.valueChanged.connect(self.go_to_page_number)
+        self.page_count_label = QLabel("/ 0")
+        self.page_count_label.setObjectName("BottomPageLabel")
+        self.zoom_spin = QDoubleSpinBox()
+        self.zoom_spin.setObjectName("ZoomSpin")
+        self.zoom_spin.setRange(30.0, 400.0)
+        self.zoom_spin.setDecimals(0)
+        self.zoom_spin.setSuffix("%")
+        self.zoom_spin.setSingleStep(10.0)
+        self.zoom_spin.setValue(self.zoom * 100)
+        self.zoom_spin.valueChanged.connect(self.set_zoom_percent)
 
         footer = QWidget()
         footer.setObjectName("PageFooter")
@@ -742,8 +799,12 @@ class MainWindow(QMainWindow):
         footer_layout.setSpacing(8)
         footer_layout.addStretch(1)
         footer_layout.addWidget(self.prev_page_button)
-        footer_layout.addWidget(self.page_label)
+        footer_layout.addWidget(self.page_spin)
+        footer_layout.addWidget(self.page_count_label)
         footer_layout.addWidget(self.next_page_button)
+        footer_layout.addSpacing(18)
+        footer_layout.addWidget(QLabel("Zoom"))
+        footer_layout.addWidget(self.zoom_spin)
         footer_layout.addStretch(1)
 
         self.reader_area = QWidget()
@@ -765,6 +826,7 @@ class MainWindow(QMainWindow):
         self.reader_splitter.setStretchFactor(1, 1)
         self.reader_splitter.setStretchFactor(2, 0)
         self.reader_splitter.setSizes([220, 820, 320])
+        self.reader_splitter.splitterMoved.connect(self._handle_reader_splitter_moved)
 
         self.history_panel = HistoryPanel()
         self.history_panel.open_requested.connect(self.open_history_entry)
@@ -776,7 +838,6 @@ class MainWindow(QMainWindow):
         self.main_stack.addWidget(self.reader_splitter)
         self.setCentralWidget(self.main_stack)
 
-        self.zoom_label = QLabel("125%")
         self._build_toolbar()
         self._render_empty_state()
         self.apply_theme()
@@ -810,24 +871,6 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        self.continuous_action = QAction("Continuous Scroll", self)
-        self.continuous_action.setCheckable(True)
-        self.continuous_action.setChecked(self.continuous_scroll)
-        self.continuous_action.triggered.connect(self.set_continuous_scroll)
-        toolbar.addAction(self.continuous_action)
-
-        toolbar.addSeparator()
-
-        self.zoom_out_action = QAction("Zoom Out", self)
-        self.zoom_out_action.triggered.connect(lambda: self.change_zoom(-0.15))
-        toolbar.addAction(self.zoom_out_action)
-
-        self.zoom_in_action = QAction("Zoom In", self)
-        self.zoom_in_action.triggered.connect(lambda: self.change_zoom(0.15))
-        toolbar.addAction(self.zoom_in_action)
-
-        toolbar.addWidget(self.zoom_label)
-
     def open_pdf(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
         if not filename:
@@ -848,6 +891,7 @@ class MainWindow(QMainWindow):
         self.pdf_path = path
         self.pdf_key = key
         self.notes = load_notes(self.pdf_key)
+        self._cache_page_base_sizes()
         if restore_last_page and entry is not None:
             self.page_index = min(entry.last_page_index, max(document.page_count - 1, 0))
         else:
@@ -863,6 +907,11 @@ class MainWindow(QMainWindow):
         if self.document is not None:
             self.document.close()
         self.document = None
+        self.page_base_sizes = []
+        self.page_tops = []
+        self.page_heights = []
+        self.page_widths = []
+        self.document_content_size = QSize(1, 1)
 
     def _record_current_pdf(self) -> None:
         if self.document is None or self.pdf_path is None or self.pdf_key is None:
@@ -930,26 +979,39 @@ class MainWindow(QMainWindow):
         self.show_home()
         return False
 
-    def render_page(self) -> None:
+    def render_page(self, *, center_current: bool = True, render_neighbors: bool = True) -> None:
         if self.document is None:
             self._render_empty_state()
             self._refresh_actions()
             return
 
-        self._clear_page_widgets()
-        page_indexes = range(self.document.page_count) if self.continuous_scroll else [self.page_index]
-        for page_index in page_indexes:
-            canvas = self._create_canvas(page_index)
-            pixmap, display_size = self._render_page_pixmap(page_index)
-            page_notes = [note for note in self.notes if note.page_index == page_index]
-            canvas.set_page(pixmap, page_notes, display_size)
-            self.pages_layout.addWidget(canvas, 0, Qt.AlignHCenter)
-            self.page_canvases[page_index] = canvas
+        was_suppressed = self._suppress_scroll_sync
+        self._suppress_scroll_sync = True
+        try:
+            self._clear_page_widgets()
+            rendered_pages = set(self._page_indexes_to_render(render_neighbors=render_neighbors))
+            self._recalculate_page_metrics()
+            if self.continuous_scroll:
+                self._populate_continuous_pages(rendered_pages)
+            else:
+                self._add_rendered_page(self.page_index)
 
-        self.canvas = self.page_canvases.get(self.page_index) or next(iter(self.page_canvases.values()))
-        self._refresh_actions()
-        if self.continuous_scroll:
-            self._scroll_to_page(self.page_index)
+            self._lock_pages_container_to_layout()
+            self.canvas = self.page_canvases.get(self.page_index) or next(iter(self.page_canvases.values()))
+            self._refresh_actions()
+        finally:
+            self._suppress_scroll_sync = was_suppressed
+        if self.continuous_scroll and center_current:
+            self._scroll_to_page(self.page_index, center=True)
+
+    def _page_indexes_to_render(self, *, render_neighbors: bool = True) -> range:
+        if self.document is None:
+            return range(0)
+        if not self.continuous_scroll or not render_neighbors:
+            return range(self.page_index, self.page_index + 1)
+        start = max(0, self.page_index - self.render_page_buffer)
+        end = min(self.document.page_count, self.page_index + self.render_page_buffer + 1)
+        return range(start, end)
 
     def _render_page_pixmap(self, page_index: int) -> tuple[QPixmap, QSize]:
         if self.document is None:
@@ -964,8 +1026,103 @@ class MainWindow(QMainWindow):
         display_size = QSize(round(pix.width / self.render_scale), round(pix.height / self.render_scale))
         return pixmap, display_size
 
+    def _cache_page_base_sizes(self) -> None:
+        self.page_base_sizes = []
+        if self.document is None:
+            return
+
+        for page_index in range(self.document.page_count):
+            rect = self.document.load_page(page_index).rect
+            self.page_base_sizes.append((float(rect.width), float(rect.height)))
+
+    def _recalculate_page_metrics(self) -> None:
+        self.page_tops = []
+        self.page_heights = []
+        self.page_widths = []
+        if self.document is None:
+            self.document_content_size = QSize(1, 1)
+            return
+        if len(self.page_base_sizes) != self.document.page_count:
+            self._cache_page_base_sizes()
+
+        margins = self.pages_layout.contentsMargins()
+        spacing = self.pages_layout.spacing()
+        cursor = margins.top()
+        max_width = 1
+        for page_index in range(self.document.page_count):
+            size = self._page_display_size(page_index)
+            self.page_tops.append(cursor)
+            self.page_widths.append(size.width())
+            self.page_heights.append(size.height())
+            max_width = max(max_width, size.width())
+            cursor += size.height() + spacing
+
+        if self.document.page_count:
+            cursor -= spacing
+        total_height = cursor + margins.bottom()
+        total_width = margins.left() + margins.right() + max_width
+        self.document_content_size = QSize(max(1, total_width), max(1, total_height))
+
+    def _page_display_size(self, page_index: int) -> QSize:
+        if self.document is None:
+            return QSize(640, 480)
+        if 0 <= page_index < len(self.page_base_sizes):
+            width, height = self.page_base_sizes[page_index]
+        else:
+            rect = self.document.load_page(page_index).rect
+            width, height = float(rect.width), float(rect.height)
+        return QSize(max(1, round(width * self.zoom)), max(1, round(height * self.zoom)))
+
+    def _create_placeholder(self, page_index: int) -> QWidget:
+        placeholder = QWidget()
+        placeholder.setObjectName("PagePlaceholder")
+        placeholder.setFixedSize(self._page_display_size(page_index))
+        placeholder.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return placeholder
+
+    def _create_page_spacer(self, start_page: int, end_page: int) -> QWidget:
+        spacer = QWidget()
+        spacer.setObjectName("PagePlaceholderRun")
+        if end_page < start_page:
+            spacer.setFixedSize(1, 1)
+            return spacer
+
+        spacing = self.pages_layout.spacing()
+        width = max(self.page_widths[start_page : end_page + 1], default=1)
+        height = sum(self.page_heights[start_page : end_page + 1])
+        height += max(0, end_page - start_page) * spacing
+        spacer.setFixedSize(QSize(max(1, width), max(1, height)))
+        spacer.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return spacer
+
+    def _populate_continuous_pages(self, rendered_pages: set[int]) -> None:
+        if self.document is None:
+            return
+
+        next_page = 0
+        for page_index in sorted(page for page in rendered_pages if 0 <= page < self.document.page_count):
+            if page_index > next_page:
+                spacer = self._create_page_spacer(next_page, page_index - 1)
+                self.pages_layout.addWidget(spacer, 0, Qt.AlignHCenter)
+            self._add_rendered_page(page_index)
+            next_page = page_index + 1
+
+        if next_page < self.document.page_count:
+            spacer = self._create_page_spacer(next_page, self.document.page_count - 1)
+            self.pages_layout.addWidget(spacer, 0, Qt.AlignHCenter)
+
+    def _add_rendered_page(self, page_index: int) -> None:
+        widget = self._create_canvas(page_index)
+        pixmap, display_size = self._render_page_pixmap(page_index)
+        page_notes = [note for note in self.notes if note.page_index == page_index]
+        widget.set_page(pixmap, page_notes, display_size)
+        self.pages_layout.addWidget(widget, 0, Qt.AlignHCenter)
+        self.page_canvases[page_index] = widget
+        self.page_widgets[page_index] = widget
+
     def _create_canvas(self, page_index: int) -> PdfCanvas:
         canvas = PdfCanvas(page_index)
+        canvas.set_context_state(continuous_scroll=self.continuous_scroll)
         canvas.add_note_requested.connect(self.add_note)
         canvas.fit_requested.connect(self.fit_page)
         canvas.mode_requested.connect(self.set_reading_mode)
@@ -979,6 +1136,8 @@ class MainWindow(QMainWindow):
         self.canvas.set_page(None, [])
         self.pages_layout.addWidget(self.canvas, 0, Qt.AlignHCenter)
         self.page_canvases[0] = self.canvas
+        self.page_widgets[0] = self.canvas
+        self._lock_pages_container_to_layout()
 
     def _clear_page_widgets(self) -> None:
         while self.pages_layout.count():
@@ -987,6 +1146,25 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setParent(None)
         self.page_canvases = {}
+        self.page_widgets = {}
+
+    def _lock_pages_container_to_layout(self) -> None:
+        self.pages_layout.activate()
+        if self.continuous_scroll and self.document is not None:
+            self.pages_container.setFixedSize(self.document_content_size)
+            return
+
+        margins = self.pages_layout.contentsMargins()
+        widgets = list(self.page_widgets.values())
+        if not widgets:
+            self.pages_container.setFixedSize(48, 48)
+            return
+
+        spacing = self.pages_layout.spacing()
+        width = margins.left() + margins.right() + max(widget.width() for widget in widgets)
+        height = margins.top() + margins.bottom() + sum(widget.height() for widget in widgets)
+        height += max(0, len(widgets) - 1) * spacing
+        self.pages_container.setFixedSize(QSize(max(1, width), max(1, height)))
 
     def add_note(self, *args: float) -> None:
         if self.document is None or self.pdf_key is None:
@@ -1030,6 +1208,23 @@ class MainWindow(QMainWindow):
         self.persist_notes()
         self.note_panel.set_note(note)
 
+    def export_current_note(self, markdown_text: str) -> None:
+        note_id = self.note_panel.current_note_id
+        if note_id is None:
+            return
+
+        note = find_note(self.notes, note_id)
+        if note is None:
+            self.note_panel.set_note(None)
+            return
+
+        note.update_markdown(markdown_text)
+        self.persist_notes()
+        path = self.export_markdown_note(note)
+        self.note_panel.set_note(note)
+        if path is not None:
+            self.statusBar().showMessage(f"Exported Markdown note: {path}", 5000)
+
     def delete_current_note(self) -> None:
         note_id = self.note_panel.current_note_id
         if note_id is None:
@@ -1055,6 +1250,66 @@ class MainWindow(QMainWindow):
             return
         save_notes(pdf_key=self.pdf_key, pdf_path=self.pdf_path, notes=self.notes)
 
+    def choose_note_export_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose Markdown notes folder", str(self.note_export_dir))
+        if not path:
+            return
+        self.note_export_dir = Path(path)
+        self.note_panel.set_folder_path(self.note_export_dir)
+
+    def export_markdown_note(self, note: Note) -> Path | None:
+        if self.pdf_path is None:
+            return None
+
+        self.note_export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        pdf_name = self._safe_filename(self.pdf_path.stem)
+        location = self._safe_filename(self._chapter_name_for_page(note.page_index) or f"page-{note.page_index + 1}")
+        note_number = self._note_number(note)
+        path = self.note_export_dir / f"{timestamp}-{pdf_name}-{location}-{note_number}.md"
+        path = self._unique_markdown_path(path)
+        path.write_text(note.markdown, encoding="utf-8")
+        return path
+
+    def _note_number(self, note: Note) -> int:
+        page_notes = [item for item in self.notes if item.page_index == note.page_index]
+        page_notes.sort(key=lambda item: item.created_at)
+        for index, item in enumerate(page_notes, start=1):
+            if item.id == note.id:
+                return index
+        return len(page_notes) + 1
+
+    def _chapter_name_for_page(self, page_index: int) -> str | None:
+        if self.document is None:
+            return None
+
+        best_title: str | None = None
+        for raw in self.document.get_toc():
+            if len(raw) < 3:
+                continue
+            toc_page_index = max(0, int(raw[2]) - 1)
+            if toc_page_index <= page_index:
+                best_title = str(raw[1])
+            else:
+                break
+        return best_title
+
+    @staticmethod
+    def _safe_filename(value: str) -> str:
+        cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" ._")
+        return cleaned[:80] or "untitled"
+
+    @staticmethod
+    def _unique_markdown_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+
+        for index in range(2, 1000):
+            candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+        return path.with_name(f"{path.stem}-{datetime.now().strftime('%f')}{path.suffix}")
+
     def previous_page(self) -> None:
         if self.document is None or self.page_index <= 0:
             return
@@ -1072,93 +1327,160 @@ class MainWindow(QMainWindow):
         self.note_panel.set_note(None)
         self._record_current_pdf()
         if self.continuous_scroll:
-            self.canvas = self.page_canvases.get(self.page_index, self.canvas)
-            self._refresh_actions()
-            self._scroll_to_page(self.page_index)
+            self.render_page()
         else:
             self.render_page()
 
-    def _scroll_to_page(self, page_index: int) -> None:
-        canvas = self.page_canvases.get(page_index)
-        if canvas is not None:
-            self._suppress_scroll_sync = True
-            self.pages_layout.activate()
-            self.pages_container.adjustSize()
-            self.scroll_area.ensureWidgetVisible(canvas, 0, 0)
-            self.scroll_area.verticalScrollBar().setValue(max(0, canvas.y() - self.pages_layout.spacing()))
-            self.page_index = page_index
-            self.canvas = canvas
-            self._refresh_actions()
-            self._suppress_scroll_sync = False
-            QTimer.singleShot(0, lambda page=page_index: self._finish_programmatic_scroll(page))
+    def go_to_page_number(self, page_number: int) -> None:
+        if self.document is None or page_number < 1:
+            return
+        self.go_to_page(page_number - 1)
 
-    def _finish_programmatic_scroll(self, page_index: int) -> None:
-        canvas = self.page_canvases.get(page_index)
-        if canvas is not None:
-            self._suppress_scroll_sync = True
-            self.scroll_area.ensureWidgetVisible(canvas, 0, 0)
-            self.scroll_area.verticalScrollBar().setValue(max(0, canvas.y() - self.pages_layout.spacing()))
-            self.page_index = page_index
-            self.canvas = canvas
-            self._refresh_actions()
-        self._suppress_scroll_sync = False
-
-    def _sync_current_page_from_scroll(self) -> None:
-        if self._suppress_scroll_sync or self.document is None or not self.continuous_scroll or not self.page_canvases:
+    def _scroll_to_page(self, page_index: int, *, center: bool = False) -> None:
+        if not self._has_page_geometry(page_index):
             return
 
-        visible_y = self.scroll_area.verticalScrollBar().value() + 12
+        self._suppress_scroll_sync = True
+        self.pages_layout.activate()
+        self._set_scroll_value_for_page(page_index, center=center)
+        self.page_index = page_index
+        if page_index in self.page_canvases:
+            self.canvas = self.page_canvases[page_index]
+        self._refresh_actions()
+        self._suppress_scroll_sync = False
+        self._pending_scroll_id += 1
+        scroll_id = self._pending_scroll_id
+        QTimer.singleShot(0, lambda page=page_index, keep_center=center, token=scroll_id: self._finish_programmatic_scroll(page, center=keep_center, token=token))
+
+    def _finish_programmatic_scroll(self, page_index: int, *, center: bool = False, token: int | None = None) -> None:
+        if token is not None and token != self._pending_scroll_id:
+            return
+        if not self._has_page_geometry(page_index):
+            return
+
+        self._suppress_scroll_sync = True
+        self._set_scroll_value_for_page(page_index, center=center)
+        self.page_index = page_index
+        if page_index in self.page_canvases:
+            self.canvas = self.page_canvases[page_index]
+        self._refresh_actions()
+        if token is not None:
+            self._pending_scroll_id += 1
+        self._suppress_scroll_sync = False
+
+    def _has_page_geometry(self, page_index: int) -> bool:
+        return 0 <= page_index < len(self.page_tops) and page_index < len(self.page_heights)
+
+    def _set_scroll_value_for_page(self, page_index: int, *, center: bool) -> None:
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        scroll_bar.setValue(self._scroll_target_for_page(page_index, center=center))
+
+    def _scroll_target_for_page(self, page_index: int, *, center: bool) -> int:
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        page_top = self.page_tops[page_index]
+        page_height = self.page_heights[page_index]
+        if center:
+            target = page_top + page_height // 2 - self.scroll_area.viewport().height() // 2
+        else:
+            target = page_top - self.pages_layout.spacing()
+        return max(0, min(scroll_bar.maximum(), target))
+
+    def _sync_current_page_from_scroll(self) -> None:
+        if self._suppress_scroll_sync or self.document is None or not self.continuous_scroll or not self.page_tops:
+            return
+
+        self._pending_scroll_id += 1
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        if self._has_page_geometry(self.page_index):
+            current_center = self._scroll_target_for_page(self.page_index, center=True)
+            if abs(scroll_bar.value() - current_center) <= 2:
+                return
+
+        visible_y = scroll_bar.value() + min(80, max(1, self.scroll_area.viewport().height() // 4))
         closest_page = self.page_index
         closest_distance = float("inf")
-        for page_index, canvas in self.page_canvases.items():
-            canvas_top = canvas.y()
-            canvas_bottom = canvas_top + canvas.height()
-            if canvas_top <= visible_y <= canvas_bottom:
+        for page_index, widget_top in enumerate(self.page_tops):
+            widget_bottom = widget_top + self.page_heights[page_index]
+            if widget_top <= visible_y <= widget_bottom:
                 closest_page = page_index
                 break
-            distance = abs(canvas_top - visible_y)
+            distance = abs((widget_top + widget_bottom) / 2 - visible_y)
             if distance < closest_distance:
                 closest_distance = distance
                 closest_page = page_index
 
         if closest_page != self.page_index:
             self.page_index = closest_page
-            self.canvas = self.page_canvases.get(self.page_index, self.canvas)
+            if closest_page in self.page_canvases:
+                self.canvas = self.page_canvases[closest_page]
             self._refresh_actions()
+            self._record_current_pdf()
+            rendered_pages = sorted(self.page_canvases)
+            needs_render = closest_page not in self.page_canvases
+            if rendered_pages:
+                needs_render = needs_render or closest_page in (rendered_pages[0], rendered_pages[-1])
+            if needs_render:
+                self.render_page(center_current=False)
 
     def set_continuous_scroll(self, checked: bool) -> None:
         self.set_reading_mode("continuous" if checked else "single")
 
     def set_reading_mode(self, mode: str) -> None:
-        self.continuous_scroll = mode == "continuous"
-        self.continuous_action.setChecked(self.continuous_scroll)
+        next_continuous = mode == "continuous"
+        if self.continuous_scroll == next_continuous:
+            return
+        self.continuous_scroll = next_continuous
         self.note_panel.set_note(None)
         self.render_page()
 
-    def change_zoom(self, delta: float) -> None:
+    def change_zoom(self, delta: float, *, clear_fit: bool = True) -> None:
         if self.document is None:
             return
+        if clear_fit:
+            self.fit_mode = None
         self.zoom = max(0.3, min(4.0, self.zoom + delta))
-        self.render_page()
+        self.render_page(render_neighbors=False)
+
+    def set_zoom_percent(self, percent: float) -> None:
+        if self.document is None:
+            return
+        self.fit_mode = None
+        self.zoom = max(0.3, min(4.0, percent / 100.0))
+        self.render_page(render_neighbors=False)
 
     def fit_page(self, mode: str) -> None:
         if self.document is None:
             return
+        self.fit_mode = mode
+        self._apply_fit_mode()
+
+    def _apply_fit_mode(self) -> None:
+        if self.document is None or self.fit_mode is None:
+            return
         page = self.document.load_page(self.page_index)
         rect = page.rect
         margins = self.pages_layout.contentsMargins()
-        if mode == "width":
+        if self.fit_mode == "width":
             available = self.scroll_area.viewport().width() - margins.left() - margins.right() - 24
             self.zoom = max(0.3, min(4.0, available / rect.width))
-        elif mode == "height":
+        elif self.fit_mode == "height":
             available = self.scroll_area.viewport().height() - margins.top() - margins.bottom() - 24
             self.zoom = max(0.3, min(4.0, available / rect.height))
         else:
             return
-        self.render_page()
+        self.render_page(render_neighbors=False)
+
+    def _handle_reader_splitter_moved(self, _pos: int, _index: int) -> None:
+        if self.fit_mode is not None and self.document is not None:
+            QTimer.singleShot(0, self._apply_fit_mode)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        if self.fit_mode is not None and self.document is not None:
+            QTimer.singleShot(0, self._apply_fit_mode)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
-        if watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
+        if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
             if event.modifiers() & Qt.ControlModifier:
                 self.change_zoom(0.1 if event.angleDelta().y() > 0 else -0.1)
                 event.accept()
@@ -1191,17 +1513,23 @@ class MainWindow(QMainWindow):
         page_count = self.document.page_count if self.document is not None else 0
         self.prev_page_button.setEnabled(has_document and self.page_index > 0)
         self.next_page_button.setEnabled(has_document and self.page_index < page_count - 1)
-        self.zoom_in_action.setEnabled(has_document)
-        self.zoom_out_action.setEnabled(has_document)
-        self.continuous_action.setEnabled(has_document)
         self.outline_action.setEnabled(has_document)
         self.reader_action.setEnabled(has_document)
+        self.page_spin.setEnabled(has_document)
+        self.zoom_spin.setEnabled(has_document)
 
         if has_document:
-            self.page_label.setText(f"Page {self.page_index + 1} / {page_count}")
+            with QSignalBlocker(self.page_spin):
+                self.page_spin.setRange(1, page_count)
+                self.page_spin.setValue(self.page_index + 1)
+            self.page_count_label.setText(f"/ {page_count}")
         else:
-            self.page_label.setText("Page 0 / 0")
-        self.zoom_label.setText(f"{round(self.zoom * 100)}%")
+            with QSignalBlocker(self.page_spin):
+                self.page_spin.setRange(0, 0)
+                self.page_spin.setValue(0)
+            self.page_count_label.setText("/ 0")
+        with QSignalBlocker(self.zoom_spin):
+            self.zoom_spin.setValue(round(self.zoom * 100))
 
     def apply_theme(self) -> None:
         self.setStyleSheet(

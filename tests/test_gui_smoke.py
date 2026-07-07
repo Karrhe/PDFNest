@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import QAction, QColor, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication
 from PySide6.QtWidgets import QMessageBox
 
@@ -64,28 +64,32 @@ class GuiSmokeTest(unittest.TestCase):
             self._create_sample_pdf(pdf_path, page_count=3)
 
             window = MainWindow()
-            window.load_pdf(pdf_path)
+            try:
+                window.load_pdf(pdf_path)
 
-            self.assertTrue(window.continuous_scroll)
-            self.assertEqual(len(window.page_canvases), 3)
-            self.assertEqual(window.page_index, 0)
+                self.assertTrue(window.continuous_scroll)
+                self.assertEqual(sorted(window.page_canvases), [0, 1])
+                self.assertEqual(window.page_index, 0)
 
-            self._press_key(window, Qt.Key_Down)
-            self.assertEqual(window.page_index, 1)
+                self._press_key(window, Qt.Key_Down)
+                self.assertEqual(window.page_index, 1)
+                self.assertEqual(sorted(window.page_canvases), [0, 1, 2])
 
-            self._press_key(window, Qt.Key_Right)
-            self.assertEqual(window.page_index, 2)
+                self._press_key(window, Qt.Key_Right)
+                self.assertEqual(window.page_index, 2)
+                self.assertEqual(sorted(window.page_canvases), [1, 2])
 
-            self._press_key(window, Qt.Key_Up)
-            self.assertEqual(window.page_index, 1)
+                self._press_key(window, Qt.Key_Up)
+                self.assertEqual(window.page_index, 1)
 
-            window.add_note(1, 0.25, 0.75)
-            notes = load_notes(window.pdf_key)
-            self.assertEqual(len(notes), 1)
-            self.assertEqual(notes[0].page_index, 1)
-            self.assertEqual(notes[0].x_norm, 0.25)
-            self.assertEqual(notes[0].y_norm, 0.75)
-            window.close()
+                window.add_note(1, 0.25, 0.75)
+                notes = load_notes(window.pdf_key)
+                self.assertEqual(len(notes), 1)
+                self.assertEqual(notes[0].page_index, 1)
+                self.assertEqual(notes[0].x_norm, 0.25)
+                self.assertEqual(notes[0].y_norm, 0.75)
+            finally:
+                window.close()
 
     def test_markdown_preview_supports_math_code_and_quotes(self) -> None:
         html = render_markdown_preview(
@@ -160,9 +164,12 @@ class GuiSmokeTest(unittest.TestCase):
                 self.app.processEvents()
                 first_window.load_pdf(pdf_path)
                 self.app.processEvents()
+                first_window.go_to_page(2)
+                self.app.processEvents()
 
                 target_canvas = first_window.page_canvases[3]
                 first_window.scroll_area.verticalScrollBar().setValue(target_canvas.y())
+                self.app.processEvents()
                 first_window._sync_current_page_from_scroll()
                 self.assertEqual(first_window.page_index, 3)
             finally:
@@ -218,65 +225,174 @@ class GuiSmokeTest(unittest.TestCase):
             self._create_sample_pdf(pdf_path, page_count=3)
 
             window = MainWindow()
-            window.load_pdf(pdf_path)
-            self.assertEqual(window.page_label.text(), "Page 1 / 3")
-            self.assertFalse(window.prev_page_button.isEnabled())
-            self.assertTrue(window.next_page_button.isEnabled())
+            try:
+                window.load_pdf(pdf_path)
+                self.assertEqual(window.page_spin.value(), 1)
+                self.assertEqual(window.page_count_label.text(), "/ 3")
+                self.assertFalse(window.prev_page_button.isEnabled())
+                self.assertTrue(window.next_page_button.isEnabled())
 
-            window.next_page_button.click()
-            self.assertEqual(window.page_index, 1)
-            self.assertEqual(window.page_label.text(), "Page 2 / 3")
+                window.next_page_button.click()
+                self.assertEqual(window.page_index, 1)
+                self.assertEqual(window.page_spin.value(), 2)
 
-            window.set_reading_mode("single")
-            self.assertFalse(window.continuous_scroll)
-            self.assertEqual(len(window.page_canvases), 1)
+                window.page_spin.setValue(3)
+                self.assertEqual(window.page_index, 2)
 
-            window.set_reading_mode("continuous")
-            self.assertTrue(window.continuous_scroll)
-            self.assertEqual(len(window.page_canvases), 3)
-            window.close()
+                window.set_reading_mode("single")
+                self.assertFalse(window.continuous_scroll)
+                self.assertEqual(len(window.page_canvases), 1)
+
+                window.set_reading_mode("continuous")
+                self.assertTrue(window.continuous_scroll)
+                self.assertEqual(sorted(window.page_canvases), [1, 2])
+            finally:
+                window.close()
 
     def test_fit_width_height_and_ctrl_wheel_zoom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
             pdf_path = tmp_path / "sample.pdf"
-            self._create_sample_pdf(pdf_path, page_count=1)
+            self._create_sample_pdf(pdf_path, page_count=4)
 
             window = MainWindow()
-            window.resize(1000, 700)
-            window.load_pdf(pdf_path)
-            self.app.processEvents()
+            try:
+                window.resize(1000, 700)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.go_to_page(2)
+                self.app.processEvents()
 
-            window.fit_page("width")
-            width_zoom = window.zoom
-            self.assertGreater(width_zoom, 0.3)
+                window.fit_page("width")
+                width_zoom = window.zoom
+                self.assertEqual(window.fit_mode, "width")
+                self.assertEqual(window.page_index, 2)
+                self.assertGreater(width_zoom, 0.3)
+                window._sync_current_page_from_scroll()
+                self.assertEqual(window.page_index, 2)
 
-            window.fit_page("height")
-            height_zoom = window.zoom
-            self.assertGreater(height_zoom, 0.3)
-            self.assertNotEqual(width_zoom, height_zoom)
+                window.reader_splitter.setSizes([0, 630, 774])
+                window._handle_reader_splitter_moved(0, 1)
+                self.app.processEvents()
+                window._apply_fit_mode()
+                self.assertNotEqual(window.zoom, width_zoom)
+                self.assertEqual(window.page_index, 2)
 
-            before = window.zoom
+                window.fit_page("height")
+                height_zoom = window.zoom
+                self.assertEqual(window.fit_mode, "height")
+                self.assertGreater(height_zoom, 0.3)
+                window._sync_current_page_from_scroll()
+                self.assertEqual(window.page_index, 2)
 
-            class FakeWheel:
-                def type(self):
-                    return QEvent.Wheel
+                window.zoom_spin.setValue(175)
+                self.assertAlmostEqual(window.zoom, 1.75)
+                self.assertIsNone(window.fit_mode)
+                self.assertEqual(window.page_index, 2)
+                window._sync_current_page_from_scroll()
+                self.assertEqual(window.page_index, 2)
 
-                def modifiers(self):
-                    return Qt.ControlModifier
+                before = window.zoom
 
-                def angleDelta(self):
-                    return QPoint(0, 120)
+                class FakeWheel:
+                    def type(self):
+                        return QEvent.Wheel
 
-                def accept(self):
-                    self.accepted = True
+                    def modifiers(self):
+                        return Qt.ControlModifier
 
-            event = FakeWheel()
-            handled = window.eventFilter(window.scroll_area.viewport(), event)
-            self.assertTrue(handled)
-            self.assertGreater(window.zoom, before)
-            window.close()
+                    def angleDelta(self):
+                        return QPoint(0, 120)
+
+                    def accept(self):
+                        self.accepted = True
+
+                event = FakeWheel()
+                handled = window.eventFilter(window.scroll_area.viewport(), event)
+                self.assertTrue(handled)
+                self.assertGreater(window.zoom, before)
+                self.assertEqual(window.page_index, 2)
+                self.assertIn(2, window.page_canvases)
+                expected_scroll = window.page_tops[2] + window.page_heights[2] // 2 - window.scroll_area.viewport().height() // 2
+                scroll_bar = window.scroll_area.verticalScrollBar()
+                expected_scroll = max(0, min(scroll_bar.maximum(), expected_scroll))
+                self.assertLessEqual(abs(scroll_bar.value() - expected_scroll), 2)
+            finally:
+                window.close()
+
+    def test_continuous_scroll_uses_full_document_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=8)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+
+                self.assertEqual(len(window.page_tops), 8)
+                self.assertEqual(len(window.page_heights), 8)
+                self.assertEqual(sorted(window.page_canvases), [0, 1])
+                self.assertLessEqual(window.pages_layout.count(), 4)
+                self.assertIn(0, window.page_widgets)
+                self.assertNotIn(5, window.page_canvases)
+
+                window.scroll_area.verticalScrollBar().setValue(window.page_tops[5])
+                self.app.processEvents()
+                window._sync_current_page_from_scroll()
+                self.assertEqual(window.page_index, 5)
+                self.assertIn(5, window.page_canvases)
+                self.assertLessEqual(window.pages_layout.count(), 5)
+            finally:
+                window.close()
+
+    def test_note_export_button_writes_markdown_file_with_pdf_and_location_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=2, toc=[[1, "Chapter One", 1]])
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                with patch(
+                    "pdf_notes_reader.main.QFileDialog.getExistingDirectory",
+                    return_value=str(tmp_path / "markdown"),
+                ):
+                    window.choose_note_export_dir()
+                self.assertEqual(window.note_export_dir, tmp_path / "markdown")
+                self.assertIn(str(tmp_path / "markdown"), window.note_panel.folder_label.text())
+
+                window.add_note(0, 0.25, 0.75)
+                window.note_panel.editor.setPlainText("# Exported\n\nBody")
+                window.save_current_note(window.note_panel.editor.toPlainText())
+                self.assertEqual(list(window.note_export_dir.glob("*.md")), [])
+
+                window.export_current_note(window.note_panel.editor.toPlainText())
+
+                markdown_files = list(window.note_export_dir.glob("*.md"))
+                self.assertEqual(len(markdown_files), 1)
+                self.assertIn("sample", markdown_files[0].name)
+                self.assertIn("Chapter One", markdown_files[0].name)
+                self.assertTrue(markdown_files[0].name.endswith("-1.md"))
+                self.assertEqual(markdown_files[0].read_text(encoding="utf-8"), "# Exported\n\nBody")
+            finally:
+                window.close()
+
+    def test_toolbar_no_longer_exposes_mode_or_zoom_controls(self) -> None:
+        window = MainWindow()
+        action_texts = [action.text() for action in window.findChildren(QAction)]
+        self.assertNotIn("Continuous Scroll", action_texts)
+        self.assertNotIn("Zoom In", action_texts)
+        self.assertNotIn("Zoom Out", action_texts)
+        window.close()
 
     def test_pdf_outline_jumps_to_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -337,11 +453,13 @@ class GuiSmokeTest(unittest.TestCase):
             window.close()
 
     @staticmethod
-    def _create_sample_pdf(path: Path, page_count: int = 1) -> None:
+    def _create_sample_pdf(path: Path, page_count: int = 1, toc: list[list] | None = None) -> None:
         document = fitz.open()
         for page_number in range(page_count):
             page = document.new_page(width=300, height=200)
             page.insert_text((40, 80), f"PDF smoke test {page_number + 1}")
+        if toc:
+            document.set_toc(toc)
         document.save(path)
         document.close()
 
