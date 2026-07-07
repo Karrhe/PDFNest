@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-notes-reader"
+version = "0.1.0"
+description = "A PySide6 PDF reader with anchored external Markdown notes."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.7",
+    "PyMuPDF>=1.24",
+    "Markdown>=3.6",
+]
+
+[project.scripts]
+pdf-notes-reader = "pdf_notes_reader.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
