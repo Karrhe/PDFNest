@@ -411,9 +411,44 @@ class GuiSmokeTest(unittest.TestCase):
             window.load_pdf(pdf_path)
             self.assertEqual(window.outline_panel.tree.topLevelItemCount(), 2)
             item = window.outline_panel.tree.topLevelItem(1)
-            window.outline_panel._open_item(item)
+            window.outline_panel.tree.itemClicked.emit(item, 0)
             self.assertEqual(window.page_index, 2)
             window.close()
+
+    def test_fit_updates_when_outline_panel_is_toggled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "outline-fit.pdf"
+            self._create_sample_pdf(pdf_path, page_count=4, toc=[[1, "Chapter 1", 1]])
+
+            window = MainWindow()
+            try:
+                window.resize(1000, 700)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.go_to_page(2)
+                self.app.processEvents()
+
+                window.fit_page("width")
+                zoom_with_outline = window.zoom
+                self.assertEqual(window.page_index, 2)
+
+                window.set_outline_visible(False)
+                self.app.processEvents()
+                window._apply_fit_mode()
+                zoom_without_outline = window.zoom
+                self.assertGreater(zoom_without_outline, zoom_with_outline)
+                self.assertEqual(window.page_index, 2)
+
+                window.set_outline_visible(True)
+                self.app.processEvents()
+                window._apply_fit_mode()
+                self.assertLess(window.zoom, zoom_without_outline)
+                self.assertEqual(window.page_index, 2)
+            finally:
+                window.close()
 
     def test_missing_history_entry_can_be_relocated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

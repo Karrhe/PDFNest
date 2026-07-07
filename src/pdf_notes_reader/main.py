@@ -674,7 +674,7 @@ class OutlinePanel(QWidget):
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.itemActivated.connect(self._open_item)
+        self.tree.itemClicked.connect(self._open_item)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
@@ -969,6 +969,7 @@ class MainWindow(QMainWindow):
 
     def set_outline_visible(self, visible: bool) -> None:
         self.outline_panel.setVisible(visible)
+        self._schedule_fit_refresh()
 
     def restore_last_session(self) -> bool:
         for entry in self.history_entries:
@@ -1471,13 +1472,16 @@ class MainWindow(QMainWindow):
         self.render_page(render_neighbors=False)
 
     def _handle_reader_splitter_moved(self, _pos: int, _index: int) -> None:
+        self._schedule_fit_refresh()
+
+    def _schedule_fit_refresh(self) -> None:
         if self.fit_mode is not None and self.document is not None:
             QTimer.singleShot(0, self._apply_fit_mode)
+            QTimer.singleShot(50, self._apply_fit_mode)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
-        if self.fit_mode is not None and self.document is not None:
-            QTimer.singleShot(0, self._apply_fit_mode)
+        self._schedule_fit_refresh()
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
         if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport() and event.type() == QEvent.Wheel:
