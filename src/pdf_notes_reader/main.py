@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import sys
@@ -195,7 +196,9 @@ def latex_to_html(expression: str) -> str:
             break
         compiled = next_compiled
 
-    symbol_pattern = re.compile(r"\\(" + "|".join(re.escape(key) for key in sorted(LATEX_SYMBOLS, key=len, reverse=True)) + r")\b")
+    symbol_pattern = re.compile(
+        r"\\(" + "|".join(re.escape(key) for key in sorted(LATEX_SYMBOLS, key=len, reverse=True)) + r")(?=$|[^A-Za-z])"
+    )
     compiled = symbol_pattern.sub(lambda match: LATEX_SYMBOLS[match.group(1)], compiled)
     compiled = re.sub(r"\^\{([^{}]+)\}", r"<sup>\1</sup>", compiled)
     compiled = re.sub(r"_\{([^{}]+)\}", r"<sub>\1</sub>", compiled)
@@ -249,7 +252,7 @@ def render_markdown_preview(text: str) -> str:
     prepared = MATH_BLOCK_RE.sub(replace_block, prepared)
     prepared = MATH_INLINE_RE.sub(replace_inline, prepared)
     standalone_symbol_re = re.compile(
-        r"\\(" + "|".join(re.escape(key) for key in sorted(LATEX_SYMBOLS, key=len, reverse=True)) + r")\b"
+        r"\\(" + "|".join(re.escape(key) for key in sorted(LATEX_SYMBOLS, key=len, reverse=True)) + r")(?=$|[^A-Za-z])"
     )
     prepared = standalone_symbol_re.sub(lambda match: LATEX_SYMBOLS[match.group(1)], prepared)
     prepared = restore_placeholders(prepared, protected_code)
@@ -746,13 +749,18 @@ class NotePanel(QWidget):
     save_requested = Signal(str)
     export_requested = Signal(str)
     delete_requested = Signal()
+    note_selected_requested = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self._current_note_id: str | None = None
+        self._notes: list[Note] = []
 
         self.title = QLabel("No note selected")
         self.title.setStyleSheet("font-weight: 600;")
+        self.note_selector = QComboBox()
+        self.note_selector.setMinimumWidth(150)
+        self.note_selector.activated.connect(self._emit_selected_note)
 
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText("Write Markdown notes here...")
@@ -783,8 +791,12 @@ class NotePanel(QWidget):
         buttons.addWidget(self.delete_button)
         buttons.addWidget(self.folder_button)
 
+        header = QHBoxLayout()
+        header.addWidget(self.title)
+        header.addWidget(self.note_selector, 1)
+
         layout = QVBoxLayout(self)
-        layout.addWidget(self.title)
+        layout.addLayout(header)
         layout.addWidget(self.folder_label)
         layout.addWidget(tabs, 1)
         layout.addLayout(buttons)
@@ -798,6 +810,7 @@ class NotePanel(QWidget):
     def set_note(self, note: Note | None) -> None:
         self._current_note_id = note.id if note else None
         self.set_enabled(note is not None)
+        self._sync_selector_current()
 
         if note is None:
             self.title.setText("No note selected")
@@ -813,12 +826,34 @@ class NotePanel(QWidget):
         self.editor.blockSignals(False)
         self._update_preview()
 
+    def set_notes(self, notes: list[Note], current_note_id: str | None = None) -> None:
+        self._notes = sorted(notes, key=lambda item: (item.page_index, item.created_at))
+        if current_note_id is not None:
+            self._current_note_id = current_note_id
+
+        with QSignalBlocker(self.note_selector):
+            self.note_selector.clear()
+            if self._current_note_id is None:
+                self.note_selector.addItem("Select note...", "")
+            for note in self._notes:
+                self.note_selector.addItem(self.note_label(note), note.id)
+        self._sync_selector_current()
+
+    @staticmethod
+    def note_label(note: Note) -> str:
+        for line in note.markdown.splitlines():
+            label = line.strip()
+            if label:
+                return label[:120]
+        return f"Page {note.page_index + 1} note"
+
     def set_enabled(self, enabled: bool) -> None:
         self.editor.setEnabled(enabled)
         self.preview.setEnabled(enabled)
         self.save_button.setEnabled(enabled)
         self.export_button.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
+        self.note_selector.setEnabled(bool(self._notes))
 
     def set_folder_path(self, path: Path) -> None:
         self.folder_label.setText(f"Markdown folder: {path}")
@@ -830,6 +865,25 @@ class NotePanel(QWidget):
     def _emit_export(self) -> None:
         if self._current_note_id is not None:
             self.export_requested.emit(self.editor.toPlainText())
+
+    def _emit_selected_note(self, _index: int) -> None:
+        note_id = str(self.note_selector.currentData() or "")
+        if note_id:
+            self.note_selected_requested.emit(note_id)
+
+    def _sync_selector_current(self) -> None:
+        self.note_selector.setEnabled(bool(self._notes))
+        if self._current_note_id is None:
+            with QSignalBlocker(self.note_selector):
+                if self.note_selector.count() == 0:
+                    self.note_selector.addItem("Select note...", "")
+                self.note_selector.setCurrentIndex(0)
+            return
+
+        index = self.note_selector.findData(self._current_note_id)
+        if index >= 0:
+            with QSignalBlocker(self.note_selector):
+                self.note_selector.setCurrentIndex(index)
 
     def _update_preview(self) -> None:
         text = self.editor.toPlainText()
@@ -1122,6 +1176,7 @@ class MainWindow(QMainWindow):
         self.note_panel.save_requested.connect(self.save_current_note)
         self.note_panel.export_requested.connect(self.export_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
+        self.note_panel.note_selected_requested.connect(self.select_note)
         self.note_panel.set_folder_path(self.note_export_dir)
 
         self.prev_page_button = QPushButton("-")
@@ -1298,6 +1353,7 @@ class MainWindow(QMainWindow):
         else:
             self.page_index = 0
         self.note_panel.set_note(None)
+        self._refresh_note_selector()
         self._record_current_pdf()
         self.outline_panel.set_outline(document.get_toc())
         self.render_page()
@@ -1421,6 +1477,33 @@ class MainWindow(QMainWindow):
             self._suppress_scroll_sync = was_suppressed
         if self.continuous_scroll and center_current:
             self._scroll_to_page(self.page_index, center=True)
+
+    def render_page_preserving_view(self, *, render_neighbors: bool = True) -> None:
+        if self.document is None or not self.continuous_scroll:
+            self.render_page(render_neighbors=render_neighbors)
+            return
+
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        scroll_value = scroll_bar.value()
+        page_index = self.page_index
+        self.render_page(center_current=False, render_neighbors=render_neighbors)
+        self._restore_scroll_position(scroll_value, page_index)
+        QTimer.singleShot(0, lambda value=scroll_value, page=page_index: self._restore_scroll_position(value, page))
+
+    def _restore_scroll_position(self, scroll_value: int, page_index: int) -> None:
+        if self.document is None:
+            return
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        was_suppressed = self._suppress_scroll_sync
+        self._suppress_scroll_sync = True
+        try:
+            scroll_bar.setValue(max(0, min(scroll_value, scroll_bar.maximum())))
+            self.page_index = max(0, min(page_index, self.document.page_count - 1))
+            if self.page_index in self.page_canvases:
+                self.canvas = self.page_canvases[self.page_index]
+            self._refresh_actions()
+        finally:
+            self._suppress_scroll_sync = was_suppressed
 
     def _page_indexes_to_render(self, *, render_neighbors: bool = True) -> range:
         if self.document is None:
@@ -1643,13 +1726,14 @@ class MainWindow(QMainWindow):
             page_index=page_index,
             x_norm=x_norm,
             y_norm=y_norm,
-            markdown="# New note\n",
+            markdown=f"# {self._default_note_title(page_index)}\n",
         )
         self.page_index = page_index
         self.notes.append(note)
         self.persist_notes()
-        self.render_page()
+        self.render_page_preserving_view()
         self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
 
     def add_text_annotation(self, page_index: int, note_type: str, rects_norm: list, selected_text: str, color: str = "") -> None:
         if self.document is None or self.pdf_key is None or not rects_norm:
@@ -1678,11 +1762,14 @@ class MainWindow(QMainWindow):
         self.page_index = page_index
         self.notes.append(note)
         self.persist_notes()
-        self.render_page()
+        self.render_page_preserving_view()
         self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
 
     def select_note(self, note_id: str) -> None:
-        self.note_panel.set_note(find_note(self.notes, note_id))
+        note = find_note(self.notes, note_id)
+        self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id if note else None)
 
     def set_note_color(self, note_id: str, color: str) -> None:
         note = find_note(self.notes, note_id)
@@ -1694,8 +1781,9 @@ class MainWindow(QMainWindow):
         note.color = QColor(color).name()
         note.update_markdown(note.markdown)
         self.persist_notes()
-        self.render_page(render_neighbors=False)
+        self.render_page_preserving_view(render_neighbors=False)
         self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
 
     def save_current_note(self, markdown_text: str) -> None:
         note_id = self.note_panel.current_note_id
@@ -1710,6 +1798,7 @@ class MainWindow(QMainWindow):
         note.update_markdown(markdown_text)
         self.persist_notes()
         self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
 
     def export_current_note(self, markdown_text: str) -> None:
         note_id = self.note_panel.current_note_id
@@ -1725,6 +1814,7 @@ class MainWindow(QMainWindow):
         self.persist_notes()
         path = self.export_markdown_note(note)
         self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
         if path is not None:
             self.statusBar().showMessage(f"Exported Markdown note: {path}", 5000)
 
@@ -1757,7 +1847,12 @@ class MainWindow(QMainWindow):
         self.notes = [item for item in self.notes if item.id != note_id]
         self.persist_notes()
         self.note_panel.set_note(None)
-        self.render_page()
+        self._refresh_note_selector()
+        self.render_page_preserving_view()
+
+    def _refresh_note_selector(self, current_note_id: str | None = None) -> None:
+        current = current_note_id if current_note_id is not None else self.note_panel.current_note_id
+        self.note_panel.set_notes(self.notes, current)
 
     def persist_notes(self) -> None:
         if self.pdf_path is None or self.pdf_key is None:
@@ -1776,15 +1871,25 @@ class MainWindow(QMainWindow):
             return None
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        pdf_name = self._safe_filename(self.pdf_path.stem)
+        pdf_name = self._safe_filename(self.pdf_path.stem, max_length=48)
         export_dir = self.note_export_dir / pdf_name
         export_dir.mkdir(parents=True, exist_ok=True)
-        location = self._safe_filename(self._chapter_name_for_page(note.page_index) or f"page-{note.page_index + 1}")
+        location = self._safe_filename(self._note_location_label(note.page_index), max_length=48)
         note_number = self._note_number(note)
-        path = export_dir / f"{timestamp}-{pdf_name}-{location}-{note_number}.md"
+        filename_stem = self._safe_filename(f"{timestamp}-{pdf_name}-{location}-{note_number}", max_length=150)
+        path = export_dir / f"{filename_stem}.md"
         path = self._unique_markdown_path(path)
         path.write_text(note.markdown, encoding="utf-8")
         return path
+
+    def _default_note_title(self, page_index: int) -> str:
+        return f"{self._note_location_label(page_index)}-{self._next_note_number(page_index)}"
+
+    def _note_location_label(self, page_index: int) -> str:
+        return self._chapter_name_for_page(page_index) or f"page-{page_index + 1}"
+
+    def _next_note_number(self, page_index: int) -> int:
+        return len([item for item in self.notes if item.page_index == page_index]) + 1
 
     def _note_number(self, note: Note) -> int:
         page_notes = [item for item in self.notes if item.page_index == note.page_index]
@@ -1810,9 +1915,15 @@ class MainWindow(QMainWindow):
         return best_title
 
     @staticmethod
-    def _safe_filename(value: str) -> str:
+    def _safe_filename(value: str, *, max_length: int = 80) -> str:
         cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" ._")
-        return cleaned[:80] or "untitled"
+        cleaned = cleaned or "untitled"
+        if len(cleaned) <= max_length:
+            return cleaned
+        digest = hashlib.sha1(cleaned.encode("utf-8")).hexdigest()[:8]
+        prefix_length = max(1, max_length - len(digest) - 1)
+        prefix = cleaned[:prefix_length].rstrip(" ._-") or "untitled"
+        return f"{prefix}-{digest}"
 
     @staticmethod
     def _unique_markdown_path(path: Path) -> Path:

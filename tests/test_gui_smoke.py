@@ -112,6 +112,8 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertNotIn("\\beta plus", html)
         self.assertIn("math-inline", html)
         self.assertIn("math-block", html)
+        int_html = render_markdown_preview("$\\int_K f(x) dx$")
+        self.assertIn("∫<sub>K</sub>", int_html)
         self.assertIn("<sup>2</sup>", html)
         self.assertIn("latex-frac", html)
         self.assertIn("latex-sqrt", html)
@@ -515,6 +517,7 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn(str(tmp_path / "markdown"), window.note_panel.folder_label.text())
 
                 window.add_note(0, 0.25, 0.75)
+                self.assertEqual(window.notes[0].markdown, "# Chapter One-1\n")
                 window.note_panel.editor.setPlainText("# Exported\n\nBody")
                 window.save_current_note(window.note_panel.editor.toPlainText())
                 self.assertEqual(list(window.note_export_dir.glob("*.md")), [])
@@ -529,6 +532,73 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn("Chapter One", markdown_files[0].name)
                 self.assertTrue(markdown_files[0].name.endswith("-1.md"))
                 self.assertEqual(markdown_files[0].read_text(encoding="utf-8"), "# Exported\n\nBody")
+            finally:
+                window.close()
+
+    def test_markdown_export_limits_long_pdf_name_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            long_stem = "very-long-pdf-name-" * 7
+            pdf_path = tmp_path / f"{long_stem}.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.note_export_dir = tmp_path / "markdown"
+                window.note_panel.set_folder_path(window.note_export_dir)
+                window.add_note(0, 0.25, 0.75)
+                path = window.export_markdown_note(window.notes[0])
+
+                self.assertIsNotNone(path)
+                assert path is not None
+                self.assertLessEqual(len(path.parent.name), 48)
+                self.assertLessEqual(len(path.name), 153)
+                self.assertTrue(path.exists())
+            finally:
+                window.close()
+
+    def test_add_note_preserves_scroll_position_and_note_selector_switches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "scroll-note.pdf"
+            self._create_sample_pdf(pdf_path, page_count=6)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.scroll_area.verticalScrollBar().setValue(window.page_tops[3])
+                self.app.processEvents()
+                window._sync_current_page_from_scroll()
+                before_scroll = window.scroll_area.verticalScrollBar().value()
+
+                window.add_note(3, 0.25, 0.30)
+                self.app.processEvents()
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - before_scroll), 2)
+                self.assertEqual(window.page_index, 3)
+                first_id = window.notes[0].id
+                self.assertEqual(window.notes[0].markdown, "# page-4-1\n")
+
+                window.note_panel.editor.setPlainText("# First note title\nBody")
+                window.save_current_note(window.note_panel.editor.toPlainText())
+                self.assertIn("# First note title", [window.note_panel.note_selector.itemText(i) for i in range(window.note_panel.note_selector.count())])
+
+                window.add_note(3, 0.50, 0.30)
+                self.assertEqual(window.notes[1].markdown, "# page-4-2\n")
+                second_id = window.notes[1].id
+                self.assertEqual(window.note_panel.current_note_id, second_id)
+
+                index = window.note_panel.note_selector.findData(first_id)
+                self.assertGreaterEqual(index, 0)
+                window.note_panel.note_selector.setCurrentIndex(index)
+                window.note_panel._emit_selected_note(index)
+                self.assertEqual(window.note_panel.current_note_id, first_id)
+                self.assertEqual(window.note_panel.editor.toPlainText(), "# First note title\nBody")
             finally:
                 window.close()
 

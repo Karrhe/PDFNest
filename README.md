@@ -20,10 +20,12 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Right-click anywhere on a PDF page to add an anchored note.
 - Drag across digital PDF text to select continuous line-by-line text, then press `Ctrl+C` to copy it.
 - Right-click selected text to create a colored highlight or underline annotation with an editable Markdown note.
+- New point notes start with a Markdown title based on the current PDF outline entry, or `page-<number>` when no outline entry is available, plus the note number on that page.
 - Store note anchors as `page_index + x_norm + y_norm`, so markers stay aligned across zoom changes.
 - Show note markers as colored dots on the page, with configurable marker size in Settings.
 - Click a marker, highlight, or underline to edit or preview its Markdown note in the right sidebar.
 - Right-click a marker, highlight, or underline to change its color or delete it.
+- Use the note selector at the top of the right sidebar to switch between notes. Entries use each note's first non-empty line.
 - Preview Markdown with tables, fenced code blocks, inline code, block quotes, and `$...$` / `$$...$$` math formula styling.
 - Save note anchors/content in external JSON files without modifying the original PDF.
 - Export individual notes as Markdown files to a selectable local folder.
@@ -130,7 +132,7 @@ The right note sidebar has a `Notes folder` button and an `Export MD` button. `N
 YYYYMMDD-HHMMSS-<pdf-name>-<chapter-name-or-page-number>-<number>.md
 ```
 
-`<number>` is the note's order on that PDF page. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`.
+`<number>` is the note's order on that PDF page. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`. Long PDF names and location names are truncated with a stable hash suffix before folder or file creation to avoid Windows path component limits.
 
 ## Data Storage
 
