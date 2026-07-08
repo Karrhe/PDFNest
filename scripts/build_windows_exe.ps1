@@ -22,13 +22,14 @@ $WorkOnedir = Join-Path $Root "build\pyinstaller"
 $WorkOnefile = Join-Path $Root "build\pyinstaller-onefile"
 $IconPng = Join-Path $Root "Icon.png"
 $IconIco = Join-Path $ReleaseAssets "PDFNest.ico"
+$IconBuilder = Join-Path $Root "scripts\make_windows_icon.py"
 $Main = Join-Path $Root "src\pdf_notes_reader\main.py"
 $Asset = Join-Path $Root "src\pdf_notes_reader\assets\Icon.png"
 
 New-Item -ItemType Directory -Force -Path $ReleaseAssets | Out-Null
 New-Item -ItemType Directory -Force -Path $Release | Out-Null
 
-& $Python -c "from PySide6.QtGui import QImage; import sys; img=QImage(sys.argv[1]); sys.exit(0 if img.save(sys.argv[2], 'ICO') else 1)" $IconPng $IconIco
+& $Python $IconBuilder $IconPng $IconIco
 
 & $PyInstaller --noconfirm --clean --windowed --name PDFNest --paths (Join-Path $Root "src") --distpath $Release --workpath $WorkOnedir --specpath $WorkOnedir --icon $IconIco --add-data "$Asset;pdf_notes_reader\assets" $Main
 

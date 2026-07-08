@@ -1032,9 +1032,6 @@ class SettingsDialog(QDialog):
         settings_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         theme_dir_label = QLabel(str(theme_dir))
         theme_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        theme_files_label = QLabel("\n".join(str(theme_dir / f"{name}.json") for name in sorted(themes)) or "No theme files found.")
-        theme_files_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        theme_files_label.setWordWrap(True)
 
         form = QFormLayout()
         form.addRow("Theme", self.theme_combo)
@@ -1044,7 +1041,6 @@ class SettingsDialog(QDialog):
         form.addRow("Markdown export base", markdown_label)
         form.addRow("Settings file", settings_label)
         form.addRow("Theme folder", theme_dir_label)
-        form.addRow("Theme files", theme_files_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -1229,7 +1225,9 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.outline_action)
 
     def _set_app_icon(self) -> None:
+        frozen_base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         candidates = [
+            frozen_base / "pdf_notes_reader" / "assets" / "Icon.png",
             Path(__file__).resolve().parent / "assets" / "Icon.png",
             Path.cwd() / "Icon.png",
             Path(__file__).resolve().parents[2] / "Icon.png",
@@ -1261,6 +1259,7 @@ class MainWindow(QMainWindow):
             theme_dir=themes_dir(default_data_dir()),
             parent=self,
         )
+        dialog.setStyleSheet(self.styleSheet())
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -2095,6 +2094,10 @@ class MainWindow(QMainWindow):
                 background: {colors["window"]};
                 color: {colors["text"]};
             }
+            QDialog {
+                background: {colors["panel"]};
+                color: {colors["text"]};
+            }
             QToolBar {
                 background: {colors["toolbar"]};
                 border: 0;
@@ -2190,6 +2193,18 @@ class MainWindow(QMainWindow):
             QPushButton:disabled {
                 background: {colors["border"]};
                 color: {colors["muted"]};
+            }
+            QComboBox, QSpinBox, QDoubleSpinBox {
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 4px;
+                color: {colors["text"]};
+                min-height: 24px;
+                padding: 2px 6px;
+            }
+            QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                background: {colors["button"]};
+                border-left: 1px solid {colors["border"]};
             }
             #HistoryTitle {
                 font-size: 18px;

@@ -12,11 +12,11 @@ import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolBar
+from PySide6.QtWidgets import QApplication, QLabel, QToolBar
 from PySide6.QtWidgets import QMessageBox
 
 from pdf_notes_reader.history import PdfHistoryEntry, save_history
-from pdf_notes_reader.main import MainWindow, PdfCanvas
+from pdf_notes_reader.main import MainWindow, PdfCanvas, SettingsDialog
 from pdf_notes_reader.main import render_markdown_preview
 from pdf_notes_reader.notes import default_data_dir
 from pdf_notes_reader.notes import load_notes
@@ -588,6 +588,30 @@ class GuiSmokeTest(unittest.TestCase):
                 custom_theme.write_text('{"reader": "#ffffff", "window": "#ffffff"}\n', encoding="utf-8")
                 self.assertIn("ocean", load_theme_files())
             finally:
+                window.close()
+
+    def test_settings_dialog_uses_theme_and_hides_theme_file_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(data_dir)
+            window = MainWindow()
+            dialog = SettingsDialog(
+                settings=window.settings,
+                themes=window.themes,
+                data_dir=data_dir,
+                note_json_path=None,
+                markdown_dir=data_dir / "markdown_notes",
+                theme_dir=themes_dir(data_dir),
+                parent=window,
+            )
+            try:
+                dialog.setStyleSheet(window.styleSheet())
+                labels = [label.text() for label in dialog.findChildren(QLabel)]
+                self.assertIn("QDialog", window.styleSheet())
+                self.assertNotIn("Theme files", labels)
+                self.assertIn("Theme folder", labels)
+            finally:
+                dialog.close()
                 window.close()
 
     def test_default_data_dir_is_project_local(self) -> None:
