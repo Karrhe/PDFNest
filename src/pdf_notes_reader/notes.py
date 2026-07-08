@@ -28,6 +28,7 @@ class Note:
     rects_norm: list[list[float]] = field(default_factory=list)
     selected_text: str = ""
     color: str = ""
+    note_number: int = 0
 
     @classmethod
     def create(
@@ -42,6 +43,7 @@ class Note:
         rects_norm: list[list[float]] | None = None,
         selected_text: str = "",
         color: str = "",
+        note_number: int = 0,
     ) -> "Note":
         now = utc_now()
         return cls(
@@ -57,6 +59,7 @@ class Note:
             rects_norm=rects_norm or [],
             selected_text=selected_text,
             color=str(color),
+            note_number=max(0, int(note_number)),
         )
 
     @classmethod
@@ -74,6 +77,7 @@ class Note:
             rects_norm=normalize_rects(data.get("rects_norm", [])),
             selected_text=str(data.get("selected_text", "")),
             color=str(data.get("color", "")),
+            note_number=normalize_nonnegative_int(data.get("note_number"), default=0),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -136,22 +140,46 @@ def notes_path_for_key(pdf_key: str, data_dir: Path | None = None) -> Path:
 
 
 def load_notes(pdf_key: str, data_dir: Path | None = None) -> list[Note]:
+    notes, _counters = load_notes_with_counters(pdf_key, data_dir)
+    return notes
+
+
+def load_notes_with_counters(pdf_key: str, data_dir: Path | None = None) -> tuple[list[Note], dict[str, int]]:
     path = notes_path_for_key(pdf_key, data_dir)
     if not path.exists():
-        return []
+        return [], {}
 
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     raw_notes = payload.get("notes", [])
     if not isinstance(raw_notes, list):
-        return []
+        return [], {}
 
     notes: list[Note] = []
     for item in raw_notes:
         if isinstance(item, dict):
             notes.append(Note.from_dict(item))
-    return notes
+    return notes, normalize_note_counters(payload.get("note_counters", {}))
+
+
+def normalize_note_counters(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    counters: dict[str, int] = {}
+    for key, counter in value.items():
+        try:
+            counters[str(key)] = max(1, int(counter))
+        except (TypeError, ValueError):
+            continue
+    return counters
+
+
+def normalize_nonnegative_int(value: Any, *, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 def save_notes(
@@ -159,6 +187,7 @@ def save_notes(
     pdf_key: str,
     pdf_path: str | Path,
     notes: list[Note],
+    note_counters: dict[str, int] | None = None,
     data_dir: Path | None = None,
 ) -> Path:
     path = notes_path_for_key(pdf_key, data_dir)
@@ -168,6 +197,7 @@ def save_notes(
         "pdf_key": pdf_key,
         "pdf_path": str(Path(pdf_path).expanduser()),
         "schema_version": 1,
+        "note_counters": normalize_note_counters(note_counters or {}),
         "notes": [note.to_dict() for note in notes],
     }
     tmp_path = path.with_suffix(".tmp")

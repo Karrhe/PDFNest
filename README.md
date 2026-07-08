@@ -129,10 +129,10 @@ The local formula renderer supports common LaTeX-style commands used in notes, i
 The right note sidebar has a `Notes folder` button and an `Export MD` button. `Notes folder` selects the base folder for standalone `.md` files. `Export MD` creates a subfolder named after the current PDF inside that base folder, first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
 
 ```text
-YYYYMMDD-HHMMSS-<pdf-name>-<chapter-name-or-page-number>-<number>.md
+YYYYMMDD-HHMMSS-<chapter-name-or-page-number>-<number>.md
 ```
 
-`<number>` is the note's order on that PDF page. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`. Long PDF names and location names are truncated with a stable hash suffix before folder or file creation to avoid Windows path component limits.
+`<number>` is a monotonic note number for that PDF page and is not reused after deleting earlier notes. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`. Long PDF names and location names are truncated with a stable hash suffix before folder or file creation to avoid Windows path component limits.
 
 ## Data Storage
 
@@ -234,6 +234,9 @@ Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded w
   "pdf_key": "24-character-path-hash",
   "pdf_path": "F:\\path\\to\\example.pdf",
   "schema_version": 1,
+  "note_counters": {
+    "0": 2
+  },
   "notes": [
     {
       "id": "note-uuid",
@@ -247,7 +250,8 @@ Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded w
       "note_type": "point",
       "rects_norm": [],
       "selected_text": "",
-      "color": "#e11d48"
+      "color": "#e11d48",
+      "note_number": 1
     }
   ]
 }
@@ -258,6 +262,7 @@ Field meanings:
 - `pdf_key`: stable path-derived identifier for the PDF.
 - `pdf_path`: PDF path stored for reference; the app uses `pdf_key` to load the matching note file.
 - `schema_version`: note file format version.
+- `note_counters`: next note number per zero-based page index. Counters are monotonic and do not decrease when notes are deleted.
 - `notes[].page_index`: zero-based PDF page index.
 - `notes[].x_norm` and `notes[].y_norm`: normalized anchor coordinates from `0.0` to `1.0`, relative to the rendered PDF page.
 - `notes[].markdown`: raw Markdown note text.
@@ -265,6 +270,7 @@ Field meanings:
 - `notes[].rects_norm`: normalized text rectangles for text annotations.
 - `notes[].selected_text`: copied text captured when the text annotation was created.
 - `notes[].color`: optional per-note marker, highlight, or underline color.
+- `notes[].note_number`: note number assigned when the note was created.
 - `created_at` and `updated_at`: UTC ISO timestamps.
 
 Saves are written through a temporary sibling file named `<pdf_key>.tmp`, then atomically replaced as `<pdf_key>.json`.

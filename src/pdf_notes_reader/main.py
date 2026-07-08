@@ -49,7 +49,15 @@ from pdf_notes_reader.history import (
     save_history,
     upsert_history_entry,
 )
-from pdf_notes_reader.notes import Note, default_data_dir, find_note, load_notes, notes_path_for_key, pdf_key_for_path, save_notes
+from pdf_notes_reader.notes import (
+    Note,
+    default_data_dir,
+    find_note,
+    load_notes_with_counters,
+    notes_path_for_key,
+    pdf_key_for_path,
+    save_notes,
+)
 from pdf_notes_reader.settings import clamp_marker_radius, load_settings, load_theme_files, save_settings, settings_path, themes_dir
 
 
@@ -1131,6 +1139,7 @@ class MainWindow(QMainWindow):
         self.pdf_path: Path | None = None
         self.pdf_key: str | None = None
         self.notes: list[Note] = []
+        self.note_counters: dict[str, int] = {}
         self.history_entries = load_history()
         self.page_index = 0
         self.zoom = 1.25
@@ -1346,7 +1355,8 @@ class MainWindow(QMainWindow):
         self.document = document
         self.pdf_path = path
         self.pdf_key = key
-        self.notes = load_notes(self.pdf_key)
+        self.notes, self.note_counters = load_notes_with_counters(self.pdf_key)
+        self._ensure_note_counters()
         self._cache_page_base_sizes()
         if restore_last_page and entry is not None:
             self.page_index = min(entry.last_page_index, max(document.page_count - 1, 0))
@@ -1369,6 +1379,7 @@ class MainWindow(QMainWindow):
         self.page_heights = []
         self.page_widths = []
         self.document_content_size = QSize(1, 1)
+        self.note_counters = {}
 
     def _record_current_pdf(self) -> None:
         if self.document is None or self.pdf_path is None or self.pdf_key is None:
@@ -1721,12 +1732,14 @@ class MainWindow(QMainWindow):
         else:
             raise TypeError("add_note expects x/y or page_index/x/y")
 
+        note_number = self._allocate_note_number(page_index)
         note = Note.create(
             pdf_key=self.pdf_key,
             page_index=page_index,
             x_norm=x_norm,
             y_norm=y_norm,
-            markdown=f"# {self._default_note_title(page_index)}\n",
+            markdown=f"# {self._default_note_title(page_index, note_number)}\n",
+            note_number=note_number,
         )
         self.page_index = page_index
         self.notes.append(note)
@@ -1748,16 +1761,18 @@ class MainWindow(QMainWindow):
         first_rect = cleaned_rects[0]
         x_norm = (first_rect[0] + first_rect[2]) / 2
         y_norm = (first_rect[1] + first_rect[3]) / 2
+        note_number = self._allocate_note_number(page_index)
         note = Note.create(
             pdf_key=self.pdf_key,
             page_index=page_index,
             x_norm=x_norm,
             y_norm=y_norm,
-            markdown=f"> {selected_text}\n\n",
+            markdown=f"# {self._default_note_title(page_index, note_number)}\n\n> {selected_text}\n\n",
             note_type=note_type,
             rects_norm=cleaned_rects,
             selected_text=selected_text,
             color=color,
+            note_number=note_number,
         )
         self.page_index = page_index
         self.notes.append(note)
@@ -1857,7 +1872,7 @@ class MainWindow(QMainWindow):
     def persist_notes(self) -> None:
         if self.pdf_path is None or self.pdf_key is None:
             return
-        save_notes(pdf_key=self.pdf_key, pdf_path=self.pdf_path, notes=self.notes)
+        save_notes(pdf_key=self.pdf_key, pdf_path=self.pdf_path, notes=self.notes, note_counters=self.note_counters)
 
     def choose_note_export_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose Markdown notes folder", str(self.note_export_dir))
@@ -1876,22 +1891,48 @@ class MainWindow(QMainWindow):
         export_dir.mkdir(parents=True, exist_ok=True)
         location = self._safe_filename(self._note_location_label(note.page_index), max_length=48)
         note_number = self._note_number(note)
-        filename_stem = self._safe_filename(f"{timestamp}-{pdf_name}-{location}-{note_number}", max_length=150)
+        filename_stem = self._safe_filename(f"{timestamp}-{location}-{note_number}", max_length=150)
         path = export_dir / f"{filename_stem}.md"
         path = self._unique_markdown_path(path)
         path.write_text(note.markdown, encoding="utf-8")
         return path
 
-    def _default_note_title(self, page_index: int) -> str:
-        return f"{self._note_location_label(page_index)}-{self._next_note_number(page_index)}"
+    def _default_note_title(self, page_index: int, note_number: int) -> str:
+        return f"{self._note_location_label(page_index)}-{note_number}"
 
     def _note_location_label(self, page_index: int) -> str:
         return self._chapter_name_for_page(page_index) or f"page-{page_index + 1}"
 
-    def _next_note_number(self, page_index: int) -> int:
-        return len([item for item in self.notes if item.page_index == page_index]) + 1
+    def _counter_key(self, page_index: int) -> str:
+        return str(max(0, int(page_index)))
+
+    def _allocate_note_number(self, page_index: int) -> int:
+        key = self._counter_key(page_index)
+        next_number = max(1, int(self.note_counters.get(key, 1)))
+        self.note_counters[key] = next_number + 1
+        return next_number
+
+    def _ensure_note_counters(self) -> None:
+        if self.note_counters:
+            return
+        max_by_page: dict[str, int] = {}
+        for note in self.notes:
+            key = self._counter_key(note.page_index)
+            if note.note_number > 0:
+                max_by_page[key] = max(max_by_page.get(key, 0), note.note_number)
+            else:
+                max_by_page[key] = max(max_by_page.get(key, 0), self._legacy_note_number_from_title(note))
+        self.note_counters = {key: value + 1 for key, value in max_by_page.items() if value > 0}
+
+    def _legacy_note_number_from_title(self, note: Note) -> int:
+        location = self._note_location_label(note.page_index)
+        first_line = next((line.strip() for line in note.markdown.splitlines() if line.strip()), "")
+        match = re.match(r"^#*\s*" + re.escape(location) + r"-(\d+)\s*$", first_line)
+        return int(match.group(1)) if match else 0
 
     def _note_number(self, note: Note) -> int:
+        if note.note_number > 0:
+            return note.note_number
         page_notes = [item for item in self.notes if item.page_index == note.page_index]
         page_notes.sort(key=lambda item: item.created_at)
         for index, item in enumerate(page_notes, start=1):

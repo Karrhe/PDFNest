@@ -498,7 +498,7 @@ class GuiSmokeTest(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_note_export_button_writes_markdown_file_with_pdf_and_location_name(self) -> None:
+    def test_note_export_button_writes_markdown_file_inside_pdf_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
@@ -528,7 +528,7 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(markdown_files, [])
                 markdown_files = list((window.note_export_dir / "sample").glob("*.md"))
                 self.assertEqual(len(markdown_files), 1)
-                self.assertIn("sample", markdown_files[0].name)
+                self.assertNotIn("sample", markdown_files[0].name)
                 self.assertIn("Chapter One", markdown_files[0].name)
                 self.assertTrue(markdown_files[0].name.endswith("-1.md"))
                 self.assertEqual(markdown_files[0].read_text(encoding="utf-8"), "# Exported\n\nBody")
@@ -555,6 +555,7 @@ class GuiSmokeTest(unittest.TestCase):
                 assert path is not None
                 self.assertLessEqual(len(path.parent.name), 48)
                 self.assertLessEqual(len(path.name), 153)
+                self.assertNotIn(path.parent.name, path.name)
                 self.assertTrue(path.exists())
             finally:
                 window.close()
@@ -593,14 +594,29 @@ class GuiSmokeTest(unittest.TestCase):
                 second_id = window.notes[1].id
                 self.assertEqual(window.note_panel.current_note_id, second_id)
 
+                window.delete_note_by_id(first_id)
+                self.assertEqual(window.note_counters.get("3"), 3)
+
                 index = window.note_panel.note_selector.findData(first_id)
+                self.assertEqual(index, -1)
+                index = window.note_panel.note_selector.findData(second_id)
                 self.assertGreaterEqual(index, 0)
                 window.note_panel.note_selector.setCurrentIndex(index)
                 window.note_panel._emit_selected_note(index)
-                self.assertEqual(window.note_panel.current_note_id, first_id)
-                self.assertEqual(window.note_panel.editor.toPlainText(), "# First note title\nBody")
+                self.assertEqual(window.note_panel.current_note_id, second_id)
             finally:
                 window.close()
+
+            reloaded_window = MainWindow()
+            try:
+                reloaded_window.load_pdf(pdf_path)
+                reloaded_window.go_to_page(3)
+                reloaded_window.add_note(3, 0.75, 0.30)
+                self.assertEqual(reloaded_window.notes[-1].markdown, "# page-4-3\n")
+                self.assertEqual(reloaded_window.notes[-1].note_number, 3)
+                self.assertEqual(reloaded_window.note_counters.get("3"), 4)
+            finally:
+                reloaded_window.close()
 
     def test_text_annotation_uses_note_panel_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -617,6 +633,7 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(len(window.notes), 1)
                 self.assertEqual(window.notes[0].note_type, "highlight")
                 self.assertEqual(window.notes[0].selected_text, "selected text")
+                self.assertTrue(window.notes[0].markdown.startswith("# page-1-1\n\n> selected text"))
                 self.assertEqual(window.notes[0].color, "#86efac")
                 self.assertEqual(window.note_panel.current_note_id, window.notes[0].id)
                 note_id = window.notes[0].id

@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pdf_notes_reader.notes import Note, load_notes, pdf_key_for_path, save_notes
+from pdf_notes_reader.notes import Note, load_notes, load_notes_with_counters, pdf_key_for_path, save_notes
 
 
 class NotesStorageTest(unittest.TestCase):
@@ -21,10 +21,11 @@ class NotesStorageTest(unittest.TestCase):
                 y_norm=0.75,
                 markdown="**hello**",
                 color="#93c5fd",
+                note_number=4,
             )
 
-            saved_path = save_notes(pdf_key=pdf_key, pdf_path=pdf_path, notes=[note], data_dir=data_dir)
-            loaded = load_notes(pdf_key, data_dir=data_dir)
+            saved_path = save_notes(pdf_key=pdf_key, pdf_path=pdf_path, notes=[note], note_counters={"2": 5}, data_dir=data_dir)
+            loaded, counters = load_notes_with_counters(pdf_key, data_dir=data_dir)
 
             self.assertTrue(saved_path.exists())
             self.assertEqual(len(loaded), 1)
@@ -34,6 +35,9 @@ class NotesStorageTest(unittest.TestCase):
             self.assertEqual(loaded[0].y_norm, 0.75)
             self.assertEqual(loaded[0].markdown, "**hello**")
             self.assertEqual(loaded[0].color, "#93c5fd")
+            self.assertEqual(loaded[0].note_number, 4)
+            self.assertEqual(counters, {"2": 5})
+            self.assertEqual(load_notes(pdf_key, data_dir=data_dir)[0].note_number, 4)
 
     def test_normalized_coordinates_are_clamped(self) -> None:
         note = Note.create(pdf_key="abc", page_index=0, x_norm=-1, y_norm=2)
