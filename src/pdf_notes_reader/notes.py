@@ -29,6 +29,7 @@ class Note:
     selected_text: str = ""
     color: str = ""
     note_number: int = 0
+    exported_markdown_path: str = ""
 
     @classmethod
     def create(
@@ -44,6 +45,7 @@ class Note:
         selected_text: str = "",
         color: str = "",
         note_number: int = 0,
+        exported_markdown_path: str = "",
     ) -> "Note":
         now = utc_now()
         return cls(
@@ -60,6 +62,7 @@ class Note:
             selected_text=selected_text,
             color=str(color),
             note_number=max(0, int(note_number)),
+            exported_markdown_path=str(exported_markdown_path),
         )
 
     @classmethod
@@ -78,6 +81,7 @@ class Note:
             selected_text=str(data.get("selected_text", "")),
             color=str(data.get("color", "")),
             note_number=normalize_nonnegative_int(data.get("note_number"), default=0),
+            exported_markdown_path=str(data.get("exported_markdown_path", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:

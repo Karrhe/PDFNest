@@ -373,6 +373,7 @@ class PdfCanvas(QWidget):
     note_selected = Signal(str)
     note_color_requested = Signal(str, str)
     note_delete_requested = Signal(str)
+    reset_note_counters_requested = Signal()
     settings_requested = Signal()
     zoom_requested = Signal(float)
 
@@ -492,6 +493,7 @@ class PdfCanvas(QWidget):
         target_note = self._note_at(event.pos())
         menu = QMenu(self)
         add_action = QAction("Add note", self)
+        reset_note_numbers_action = QAction("Reset note numbering", self)
         copy_action = QAction("Copy selected text", self)
         open_note_action = QAction("Open note", self)
         delete_note_action = QAction("Delete annotation" if target_note and target_note.note_type != "point" else "Delete note", self)
@@ -523,6 +525,7 @@ class PdfCanvas(QWidget):
             menu.addSeparator()
 
         menu.addAction(add_action)
+        menu.addAction(reset_note_numbers_action)
         if self._selected_text:
             menu.addAction(copy_action)
             highlight_menu = menu.addMenu("Highlight selection")
@@ -560,6 +563,8 @@ class PdfCanvas(QWidget):
         elif chosen == add_action:
             x_norm, y_norm = self._point_to_norm(event.pos())
             self.add_note_requested.emit(self.page_index, x_norm, y_norm)
+        elif chosen == reset_note_numbers_action:
+            self.reset_note_counters_requested.emit()
         elif chosen == copy_action:
             self.copy_selected_text()
         elif chosen in highlight_actions:
@@ -1674,6 +1679,7 @@ class MainWindow(QMainWindow):
         canvas.note_selected.connect(self.select_note)
         canvas.note_color_requested.connect(self.set_note_color)
         canvas.note_delete_requested.connect(self.delete_note_by_id)
+        canvas.reset_note_counters_requested.connect(self.reset_note_counters_to_current_notes)
         canvas.settings_requested.connect(self.open_settings)
         canvas.zoom_requested.connect(self.change_zoom)
         return canvas
@@ -1827,7 +1833,12 @@ class MainWindow(QMainWindow):
 
         note.update_markdown(markdown_text)
         self.persist_notes()
-        path = self.export_markdown_note(note)
+        export_mode = self._choose_export_mode(note)
+        if export_mode is None:
+            self.note_panel.set_note(note)
+            self._refresh_note_selector(note.id)
+            return
+        path = self.export_markdown_note(note, replace_existing=export_mode == "replace")
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id)
         if path is not None:
@@ -1865,6 +1876,16 @@ class MainWindow(QMainWindow):
         self._refresh_note_selector()
         self.render_page_preserving_view()
 
+    def reset_note_counters_to_current_notes(self) -> None:
+        counts_by_page: dict[str, int] = {}
+        for note in self.notes:
+            key = self._counter_key(note.page_index)
+            counts_by_page[key] = counts_by_page.get(key, 0) + 1
+
+        self.note_counters = {key: count + 1 for key, count in counts_by_page.items() if count > 0}
+        self.persist_notes()
+        self.statusBar().showMessage("Reset note numbering to current note counts.", 5000)
+
     def _refresh_note_selector(self, current_note_id: str | None = None) -> None:
         current = current_note_id if current_note_id is not None else self.note_panel.current_note_id
         self.note_panel.set_notes(self.notes, current)
@@ -1881,9 +1902,40 @@ class MainWindow(QMainWindow):
         self.note_export_dir = Path(path)
         self.note_panel.set_folder_path(self.note_export_dir)
 
-    def export_markdown_note(self, note: Note) -> Path | None:
+    def _choose_export_mode(self, note: Note) -> str | None:
+        if not note.exported_markdown_path:
+            return "new"
+
+        existing_path = Path(note.exported_markdown_path)
+        if not existing_path.exists():
+            return "new"
+
+        message = QMessageBox(self)
+        message.setWindowTitle("Export Markdown note")
+        message.setText("This note has already been exported. Replace the previous Markdown file or create a new one?")
+        replace_button = message.addButton("Replace previous", QMessageBox.AcceptRole)
+        new_button = message.addButton("Create new file", QMessageBox.ActionRole)
+        message.addButton(QMessageBox.Cancel)
+        message.setDefaultButton(replace_button)
+        message.exec()
+        chosen = message.clickedButton()
+        if chosen == replace_button:
+            return "replace"
+        if chosen == new_button:
+            return "new"
+        return None
+
+    def export_markdown_note(self, note: Note, *, replace_existing: bool = False) -> Path | None:
         if self.pdf_path is None:
             return None
+
+        if replace_existing and note.exported_markdown_path:
+            path = Path(note.exported_markdown_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(note.markdown, encoding="utf-8")
+            note.exported_markdown_path = str(path)
+            self.persist_notes()
+            return path
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         pdf_name = self._safe_filename(self.pdf_path.stem, max_length=48)
@@ -1895,6 +1947,8 @@ class MainWindow(QMainWindow):
         path = export_dir / f"{filename_stem}.md"
         path = self._unique_markdown_path(path)
         path.write_text(note.markdown, encoding="utf-8")
+        note.exported_markdown_path = str(path)
+        self.persist_notes()
         return path
 
     def _default_note_title(self, page_index: int, note_number: int) -> str:
@@ -1950,10 +2004,16 @@ class MainWindow(QMainWindow):
                 continue
             toc_page_index = max(0, int(raw[2]) - 1)
             if toc_page_index <= page_index:
-                best_title = str(raw[1])
+                title = self._single_line_title(str(raw[1]))
+                if title:
+                    best_title = title
             else:
                 break
         return best_title
+
+    @staticmethod
+    def _single_line_title(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip()
 
     @staticmethod
     def _safe_filename(value: str, *, max_length: int = 80) -> str:

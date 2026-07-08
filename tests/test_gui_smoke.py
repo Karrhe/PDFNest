@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QColor, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QKeyEvent, QPainter, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QToolBar
 from PySide6.QtWidgets import QMessageBox
@@ -137,6 +138,42 @@ class GuiSmokeTest(unittest.TestCase):
         center = image.pixelColor(20, 20)
         self.assertNotEqual(center.name().lower(), "#ffffff")
         self.assertGreater(center.red(), center.blue())
+
+    def test_pdf_canvas_context_menu_can_request_note_number_reset(self) -> None:
+        pixmap = QPixmap(80, 80)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas()
+        canvas.set_page(pixmap, [])
+        emitted: list[bool] = []
+        canvas.reset_note_counters_requested.connect(lambda: emitted.append(True))
+        saw_reset_action: list[bool] = []
+
+        class FakeMenu:
+            def __init__(self, *_args):
+                self._actions = []
+
+            def addAction(self, action):
+                self._actions.append(action)
+
+            def addMenu(self, _label: str):
+                return FakeMenu()
+
+            def addSeparator(self) -> None:
+                pass
+
+            def exec(self, _pos: QPoint):
+                for action in self._actions:
+                    if action.text() == "Reset note numbering":
+                        saw_reset_action.append(True)
+                        return action
+                return None
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10), QPoint(10, 10))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(saw_reset_action, [True])
+        self.assertEqual(emitted, [True])
 
     def test_pdf_canvas_selects_and_copies_text(self) -> None:
         pixmap = QPixmap(200, 100)
@@ -557,6 +594,86 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertLessEqual(len(path.name), 153)
                 self.assertNotIn(path.parent.name, path.name)
                 self.assertTrue(path.exists())
+            finally:
+                window.close()
+
+    def test_markdown_export_can_replace_or_create_new_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.note_export_dir = tmp_path / "markdown"
+                window.add_note(0, 0.25, 0.75)
+                note = window.notes[0]
+
+                note.update_markdown("# page-1-1\nfirst")
+                first_path = window.export_markdown_note(note)
+                self.assertIsNotNone(first_path)
+                assert first_path is not None
+                self.assertEqual(Path(note.exported_markdown_path), first_path)
+                self.assertEqual(first_path.read_text(encoding="utf-8"), "# page-1-1\nfirst")
+                self.assertEqual(load_notes(window.pdf_key)[0].exported_markdown_path, str(first_path))
+
+                note.update_markdown("# page-1-1\nreplacement")
+                replaced_path = window.export_markdown_note(note, replace_existing=True)
+                self.assertEqual(replaced_path, first_path)
+                self.assertEqual(first_path.read_text(encoding="utf-8"), "# page-1-1\nreplacement")
+                self.assertEqual(load_notes(window.pdf_key)[0].exported_markdown_path, str(first_path))
+
+                note.update_markdown("# page-1-1\nnew file")
+                new_path = window.export_markdown_note(note, replace_existing=False)
+                self.assertIsNotNone(new_path)
+                assert new_path is not None
+                self.assertNotEqual(new_path, first_path)
+                self.assertEqual(first_path.read_text(encoding="utf-8"), "# page-1-1\nreplacement")
+                self.assertEqual(new_path.read_text(encoding="utf-8"), "# page-1-1\nnew file")
+                self.assertEqual(Path(load_notes(window.pdf_key)[0].exported_markdown_path), new_path)
+            finally:
+                window.close()
+
+    def test_new_note_number_stays_on_first_line_when_outline_title_wraps(self) -> None:
+        window = MainWindow()
+        try:
+            window.document = SimpleNamespace(get_toc=lambda: [[1, "1 Introduction\n", 15]], close=lambda: None, page_count=20)
+            self.assertEqual(window._default_note_title(14, 10), "1 Introduction-10")
+        finally:
+            window.close()
+
+    def test_reset_note_counters_to_current_note_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "reset-counters.pdf"
+            self._create_sample_pdf(pdf_path, page_count=2)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.add_note(0, 0.20, 0.20)
+                window.add_note(0, 0.40, 0.20)
+                window.note_counters["0"] = 25
+
+                window.reset_note_counters_to_current_notes()
+                self.assertEqual(window.note_counters, {"0": 3})
+                persisted = load_notes(window.pdf_key)
+                self.assertEqual(len(persisted), 2)
+
+                window.add_note(0, 0.60, 0.20)
+                self.assertEqual(window.notes[-1].markdown, "# page-1-3\n")
+
+                for note in list(window.notes):
+                    window.delete_note_by_id(note.id)
+                self.assertEqual(window.note_counters.get("0"), 4)
+
+                window.reset_note_counters_to_current_notes()
+                self.assertEqual(window.note_counters, {})
+                window.add_note(0, 0.80, 0.20)
+                self.assertEqual(window.notes[-1].markdown, "# page-1-1\n")
             finally:
                 window.close()
 

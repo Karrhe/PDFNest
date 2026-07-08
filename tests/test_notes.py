@@ -22,6 +22,7 @@ class NotesStorageTest(unittest.TestCase):
                 markdown="**hello**",
                 color="#93c5fd",
                 note_number=4,
+                exported_markdown_path=str(data_dir / "markdown_notes" / "sample" / "note.md"),
             )
 
             saved_path = save_notes(pdf_key=pdf_key, pdf_path=pdf_path, notes=[note], note_counters={"2": 5}, data_dir=data_dir)
@@ -36,6 +37,7 @@ class NotesStorageTest(unittest.TestCase):
             self.assertEqual(loaded[0].markdown, "**hello**")
             self.assertEqual(loaded[0].color, "#93c5fd")
             self.assertEqual(loaded[0].note_number, 4)
+            self.assertEqual(loaded[0].exported_markdown_path, str(data_dir / "markdown_notes" / "sample" / "note.md"))
             self.assertEqual(counters, {"2": 5})
             self.assertEqual(load_notes(pdf_key, data_dir=data_dir)[0].note_number, 4)
 

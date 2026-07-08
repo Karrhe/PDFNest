@@ -80,8 +80,8 @@ For end-user distribution on Windows, build the executable package with PyInstal
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.1.0-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.1.0-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.1.1-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.1.1-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
 
@@ -133,6 +133,8 @@ YYYYMMDD-HHMMSS-<chapter-name-or-page-number>-<number>.md
 ```
 
 `<number>` is a monotonic note number for that PDF page and is not reused after deleting earlier notes. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`. Long PDF names and location names are truncated with a stable hash suffix before folder or file creation to avoid Windows path component limits.
+
+After a note has been exported once, its Markdown file path is stored in the note JSON. Exporting that same note again asks whether to replace the previous `.md` file or create a new timestamped `.md` file.
 
 ## Data Storage
 
@@ -251,7 +253,8 @@ Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded w
       "rects_norm": [],
       "selected_text": "",
       "color": "#e11d48",
-      "note_number": 1
+      "note_number": 1,
+      "exported_markdown_path": "F:\\path\\to\\markdown_notes\\example\\20260708-120000-page-1-1.md"
     }
   ]
 }
@@ -271,6 +274,7 @@ Field meanings:
 - `notes[].selected_text`: copied text captured when the text annotation was created.
 - `notes[].color`: optional per-note marker, highlight, or underline color.
 - `notes[].note_number`: note number assigned when the note was created.
+- `notes[].exported_markdown_path`: last exported Markdown file path for the note. It is used to offer replacement on later exports.
 - `created_at` and `updated_at`: UTC ISO timestamps.
 
 Saves are written through a temporary sibling file named `<pdf_key>.tmp`, then atomically replaced as `<pdf_key>.json`.
