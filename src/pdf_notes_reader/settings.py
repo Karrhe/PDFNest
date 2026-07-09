@@ -49,6 +49,7 @@ DEFAULT_THEMES: dict[str, dict[str, str]] = {
 DEFAULT_SETTINGS: dict[str, Any] = {
     "theme": "beige",
     "note_marker_radius": 7,
+    "append_selection_shortcut": "Ctrl+Shift+C",
 }
 
 

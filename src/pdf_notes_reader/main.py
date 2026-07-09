@@ -10,7 +10,7 @@ from pathlib import Path
 import fitz
 import markdown
 from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
+    QKeySequenceEdit,
     QLabel,
     QMainWindow,
     QMenu,
@@ -50,10 +52,11 @@ from pdf_notes_reader.history import (
     upsert_history_entry,
 )
 from pdf_notes_reader.notes import (
+    Bookmark,
     Note,
     default_data_dir,
     find_note,
-    load_notes_with_counters,
+    load_notes_data,
     notes_path_for_key,
     pdf_key_for_path,
     save_notes,
@@ -367,6 +370,7 @@ def render_markdown_preview(text: str) -> str:
 
 class PdfCanvas(QWidget):
     add_note_requested = Signal(int, float, float)
+    append_selection_requested = Signal(str)
     annotation_requested = Signal(int, str, list, str, str)
     fit_requested = Signal(str)
     mode_requested = Signal(str)
@@ -495,6 +499,7 @@ class PdfCanvas(QWidget):
         add_action = QAction("Add note", self)
         reset_note_numbers_action = QAction("Reset note numbering", self)
         copy_action = QAction("Copy selected text", self)
+        append_selection_action = QAction("Add selected text to current note", self)
         open_note_action = QAction("Open note", self)
         delete_note_action = QAction("Delete annotation" if target_note and target_note.note_type != "point" else "Delete note", self)
         fit_width_action = QAction("Fit width", self)
@@ -528,6 +533,7 @@ class PdfCanvas(QWidget):
         menu.addAction(reset_note_numbers_action)
         if self._selected_text:
             menu.addAction(copy_action)
+            menu.addAction(append_selection_action)
             highlight_menu = menu.addMenu("Highlight selection")
             underline_menu = menu.addMenu("Underline selection")
             for label, color in ANNOTATION_COLORS:
@@ -567,6 +573,8 @@ class PdfCanvas(QWidget):
             self.reset_note_counters_requested.emit()
         elif chosen == copy_action:
             self.copy_selected_text()
+        elif chosen == append_selection_action:
+            self.append_selection_requested.emit(self._selected_text)
         elif chosen in highlight_actions:
             self.annotation_requested.emit(self.page_index, "highlight", self._selected_rects_norm, self._selected_text, highlight_actions[chosen])
         elif chosen in underline_actions:
@@ -630,6 +638,9 @@ class PdfCanvas(QWidget):
     def copy_selected_text(self) -> None:
         if self._selected_text:
             QApplication.clipboard().setText(self._selected_text)
+
+    def selected_text(self) -> str:
+        return self._selected_text
 
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.modifiers() & Qt.ControlModifier:
@@ -1008,6 +1019,13 @@ class HistoryPanel(QWidget):
 
 class OutlinePanel(QWidget):
     page_requested = Signal(int)
+    bookmark_add_requested = Signal()
+    bookmark_delete_requested = Signal(str)
+    outline_new_requested = Signal()
+    outline_new_child_requested = Signal()
+    outline_delete_requested = Signal()
+    outline_save_requested = Signal()
+    export_all_notes_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1020,14 +1038,61 @@ class OutlinePanel(QWidget):
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.itemPressed.connect(self._open_item)
-        self.tree.itemActivated.connect(self._open_item)
+        self.tree.itemPressed.connect(self._open_outline_item)
+        self.tree.itemActivated.connect(self._open_outline_item)
+
+        self.bookmark_tree = QTreeWidget()
+        self.bookmark_tree.setHeaderHidden(True)
+        self.bookmark_tree.itemPressed.connect(self._open_bookmark_item)
+        self.bookmark_tree.itemActivated.connect(self._open_bookmark_item)
+
+        tabs = QTabWidget()
+        tabs.addTab(self.tree, "Contents")
+        tabs.addTab(self.bookmark_tree, "Bookmarks")
+
+        menu_button = QPushButton("Menu")
+        menu = QMenu(menu_button)
+        export_action = QAction("Export all notes", self)
+        expand_action = QAction("Expand all", self)
+        collapse_action = QAction("Collapse all", self)
+        export_action.triggered.connect(self.export_all_notes_requested.emit)
+        expand_action.triggered.connect(self.tree.expandAll)
+        collapse_action.triggered.connect(self.tree.collapseAll)
+        menu.addAction(expand_action)
+        menu.addAction(collapse_action)
+        menu.addSeparator()
+        menu.addAction(export_action)
+        menu_button.setMenu(menu)
+
+        add_outline_button = QPushButton("New")
+        add_child_button = QPushButton("Sub")
+        delete_outline_button = QPushButton("Delete")
+        save_outline_button = QPushButton("Save PDF")
+        add_bookmark_button = QPushButton("Bookmark")
+        delete_bookmark_button = QPushButton("Remove")
+        add_outline_button.clicked.connect(self.outline_new_requested.emit)
+        add_child_button.clicked.connect(self.outline_new_child_requested.emit)
+        delete_outline_button.clicked.connect(self.outline_delete_requested.emit)
+        save_outline_button.clicked.connect(self.outline_save_requested.emit)
+        add_bookmark_button.clicked.connect(self.bookmark_add_requested.emit)
+        delete_bookmark_button.clicked.connect(self._emit_delete_bookmark)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(4)
+        controls.addWidget(menu_button)
+        controls.addWidget(add_outline_button)
+        controls.addWidget(add_child_button)
+        controls.addWidget(delete_outline_button)
+        controls.addWidget(save_outline_button)
+        controls.addWidget(add_bookmark_button)
+        controls.addWidget(delete_bookmark_button)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
         layout.addWidget(title)
-        layout.addWidget(self.tree, 1)
+        layout.addLayout(controls)
+        layout.addWidget(tabs, 1)
 
     def set_outline(self, toc: list[list]) -> None:
         self.tree.clear()
@@ -1056,10 +1121,98 @@ class OutlinePanel(QWidget):
                 del parents[stale_level]
         self.tree.expandToDepth(1)
 
-    def _open_item(self, item: QTreeWidgetItem) -> None:
+    def set_bookmarks(self, bookmarks: list[Bookmark]) -> None:
+        self.bookmark_tree.clear()
+        if not bookmarks:
+            item = QTreeWidgetItem(["No bookmarks"])
+            item.setDisabled(True)
+            self.bookmark_tree.addTopLevelItem(item)
+            return
+
+        for bookmark in sorted(bookmarks, key=lambda item: (item.page_index, item.created_at)):
+            item = QTreeWidgetItem([f"{bookmark.title}  (p. {bookmark.page_index + 1})"])
+            item.setData(0, Qt.UserRole, bookmark.page_index)
+            item.setData(0, Qt.UserRole + 1, bookmark.id)
+            self.bookmark_tree.addTopLevelItem(item)
+
+    def add_outline_item(self, *, title: str, page_index: int, as_child: bool = False) -> None:
+        if self.tree.topLevelItemCount() == 1 and self.tree.topLevelItem(0).isDisabled():
+            self.tree.clear()
+
+        item = QTreeWidgetItem([title])
+        item.setData(0, Qt.UserRole, max(0, int(page_index)))
+        selected = self.tree.currentItem()
+        if as_child and selected is not None and not selected.isDisabled():
+            selected.addChild(item)
+            selected.setExpanded(True)
+            self.tree.setCurrentItem(item)
+            return
+
+        if selected is not None and not selected.isDisabled():
+            parent = selected.parent()
+            if parent is None:
+                index = self.tree.indexOfTopLevelItem(selected) + 1
+                self.tree.insertTopLevelItem(index, item)
+            else:
+                parent.insertChild(parent.indexOfChild(selected) + 1, item)
+        else:
+            self.tree.addTopLevelItem(item)
+        self.tree.setCurrentItem(item)
+
+    def delete_selected_outline_item(self) -> bool:
+        item = self.tree.currentItem()
+        if item is None or item.isDisabled():
+            return False
+        parent = item.parent()
+        if parent is None:
+            index = self.tree.indexOfTopLevelItem(item)
+            self.tree.takeTopLevelItem(index)
+        else:
+            parent.takeChild(parent.indexOfChild(item))
+        if self.tree.topLevelItemCount() == 0:
+            self.set_outline([])
+        return True
+
+    def outline_toc(self) -> list[list]:
+        toc: list[list] = []
+
+        def collect(item: QTreeWidgetItem, level: int) -> None:
+            if item.isDisabled():
+                return
+            page_index = item.data(0, Qt.UserRole)
+            if page_index is not None:
+                toc.append([level, item.text(0), int(page_index) + 1])
+            for child_index in range(item.childCount()):
+                collect(item.child(child_index), level + 1)
+
+        for index in range(self.tree.topLevelItemCount()):
+            collect(self.tree.topLevelItem(index), 1)
+        return toc
+
+    def selected_outline_page_index(self) -> int | None:
+        item = self.tree.currentItem()
+        if item is None or item.isDisabled():
+            return None
+        page_index = item.data(0, Qt.UserRole)
+        return int(page_index) if page_index is not None else None
+
+    def _open_outline_item(self, item: QTreeWidgetItem) -> None:
         page_index = item.data(0, Qt.UserRole)
         if page_index is not None:
             self.page_requested.emit(int(page_index))
+
+    def _open_bookmark_item(self, item: QTreeWidgetItem) -> None:
+        page_index = item.data(0, Qt.UserRole)
+        if page_index is not None:
+            self.page_requested.emit(int(page_index))
+
+    def _emit_delete_bookmark(self) -> None:
+        item = self.bookmark_tree.currentItem()
+        if item is None or item.isDisabled():
+            return
+        bookmark_id = str(item.data(0, Qt.UserRole + 1) or "")
+        if bookmark_id:
+            self.bookmark_delete_requested.emit(bookmark_id)
 
 
 class SettingsDialog(QDialog):
@@ -1089,6 +1242,10 @@ class SettingsDialog(QDialog):
         self.marker_size_spin.setRange(3, 24)
         self.marker_size_spin.setValue(clamp_marker_radius(settings.get("note_marker_radius")))
 
+        self.append_selection_shortcut_edit = QKeySequenceEdit()
+        shortcut_text = str(settings.get("append_selection_shortcut") or "Ctrl+Shift+C")
+        self.append_selection_shortcut_edit.setKeySequence(QKeySequence(shortcut_text))
+
         data_label = QLabel(str(data_dir))
         data_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         note_label = QLabel(str(note_json_path) if note_json_path is not None else "Open a PDF to see this path.")
@@ -1103,6 +1260,7 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.addRow("Theme", self.theme_combo)
         form.addRow("Note dot size", self.marker_size_spin)
+        form.addRow("Add selection shortcut", self.append_selection_shortcut_edit)
         form.addRow("Data folder", data_label)
         form.addRow("Current note JSON", note_label)
         form.addRow("Markdown export base", markdown_label)
@@ -1125,6 +1283,11 @@ class SettingsDialog(QDialog):
     def marker_radius(self) -> int:
         return int(self.marker_size_spin.value())
 
+    @property
+    def append_selection_shortcut(self) -> str:
+        sequence = self.append_selection_shortcut_edit.keySequence().toString(QKeySequence.PortableText)
+        return sequence or "Ctrl+Shift+C"
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -1145,6 +1308,7 @@ class MainWindow(QMainWindow):
         self.pdf_key: str | None = None
         self.notes: list[Note] = []
         self.note_counters: dict[str, int] = {}
+        self.bookmarks: list[Bookmark] = []
         self.history_entries = load_history()
         self.page_index = 0
         self.zoom = 1.25
@@ -1240,6 +1404,13 @@ class MainWindow(QMainWindow):
 
         self.outline_panel = OutlinePanel()
         self.outline_panel.page_requested.connect(self.go_to_page)
+        self.outline_panel.bookmark_add_requested.connect(self.add_bookmark)
+        self.outline_panel.bookmark_delete_requested.connect(self.delete_bookmark)
+        self.outline_panel.outline_new_requested.connect(self.add_outline_item)
+        self.outline_panel.outline_new_child_requested.connect(self.add_outline_child_item)
+        self.outline_panel.outline_delete_requested.connect(self.delete_outline_item)
+        self.outline_panel.outline_save_requested.connect(self.save_outline_to_pdf)
+        self.outline_panel.export_all_notes_requested.connect(self.export_all_notes)
 
         self.reader_splitter = QSplitter(Qt.Horizontal)
         self.reader_splitter.addWidget(self.outline_panel)
@@ -1263,6 +1434,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.main_stack)
 
         self._build_toolbar()
+        self._build_shortcuts()
         self._render_empty_state()
         self.apply_theme()
         self.restore_last_session()
@@ -1292,6 +1464,29 @@ class MainWindow(QMainWindow):
         self.outline_action.setChecked(True)
         self.outline_action.triggered.connect(self.set_outline_visible)
         toolbar.addAction(self.outline_action)
+
+    def _build_shortcuts(self) -> None:
+        self.save_note_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.save_note_shortcut.setContext(Qt.ApplicationShortcut)
+        self.save_note_shortcut.activated.connect(self.save_current_note_from_panel)
+
+        self.export_note_shortcut = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        self.export_note_shortcut.setContext(Qt.ApplicationShortcut)
+        self.export_note_shortcut.activated.connect(self.export_current_note_from_panel)
+
+        self.append_selection_shortcut = QShortcut(self._append_selection_key_sequence(), self)
+        self.append_selection_shortcut.setContext(Qt.ApplicationShortcut)
+        self.append_selection_shortcut.activated.connect(self.append_selected_text_to_current_note_from_shortcut)
+
+    def _append_selection_key_sequence(self) -> QKeySequence:
+        shortcut_text = str(self.settings.get("append_selection_shortcut") or "Ctrl+Shift+C")
+        sequence = QKeySequence(shortcut_text)
+        if sequence.isEmpty():
+            sequence = QKeySequence("Ctrl+Shift+C")
+        return sequence
+
+    def _refresh_append_selection_shortcut(self) -> None:
+        self.append_selection_shortcut.setKey(self._append_selection_key_sequence())
 
     def _set_app_icon(self) -> None:
         frozen_base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -1336,7 +1531,9 @@ class MainWindow(QMainWindow):
         self.settings["theme"] = self.theme_name
         self.note_marker_radius = dialog.marker_radius
         self.settings["note_marker_radius"] = self.note_marker_radius
+        self.settings["append_selection_shortcut"] = dialog.append_selection_shortcut
         save_settings(self.settings)
+        self._refresh_append_selection_shortcut()
         self.themes = load_theme_files()
         self.apply_theme()
         self.render_page(render_neighbors=False)
@@ -1360,7 +1557,7 @@ class MainWindow(QMainWindow):
         self.document = document
         self.pdf_path = path
         self.pdf_key = key
-        self.notes, self.note_counters = load_notes_with_counters(self.pdf_key)
+        self.notes, self.note_counters, self.bookmarks = load_notes_data(self.pdf_key)
         self._ensure_note_counters()
         self._cache_page_base_sizes()
         if restore_last_page and entry is not None:
@@ -1371,6 +1568,7 @@ class MainWindow(QMainWindow):
         self._refresh_note_selector()
         self._record_current_pdf()
         self.outline_panel.set_outline(document.get_toc())
+        self.outline_panel.set_bookmarks(self.bookmarks)
         self.render_page()
         self.show_reader()
 
@@ -1385,6 +1583,7 @@ class MainWindow(QMainWindow):
         self.page_widths = []
         self.document_content_size = QSize(1, 1)
         self.note_counters = {}
+        self.bookmarks = []
 
     def _record_current_pdf(self) -> None:
         if self.document is None or self.pdf_path is None or self.pdf_key is None:
@@ -1673,6 +1872,7 @@ class MainWindow(QMainWindow):
         canvas.set_theme_colors(self._theme_colors())
         canvas.set_marker_radius(self.note_marker_radius)
         canvas.add_note_requested.connect(self.add_note)
+        canvas.append_selection_requested.connect(self.append_selected_text_to_current_note)
         canvas.annotation_requested.connect(self.add_text_annotation)
         canvas.fit_requested.connect(self.fit_page)
         canvas.mode_requested.connect(self.set_reading_mode)
@@ -1821,6 +2021,10 @@ class MainWindow(QMainWindow):
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id)
 
+    def save_current_note_from_panel(self) -> None:
+        if self.note_panel.current_note_id is not None:
+            self.save_current_note(self.note_panel.editor.toPlainText())
+
     def export_current_note(self, markdown_text: str) -> None:
         note_id = self.note_panel.current_note_id
         if note_id is None:
@@ -1843,6 +2047,36 @@ class MainWindow(QMainWindow):
         self._refresh_note_selector(note.id)
         if path is not None:
             self.statusBar().showMessage(f"Exported Markdown note: {path}", 5000)
+
+    def export_current_note_from_panel(self) -> None:
+        if self.note_panel.current_note_id is not None:
+            self.export_current_note(self.note_panel.editor.toPlainText())
+
+    def append_selected_text_to_current_note_from_shortcut(self) -> None:
+        text = ""
+        if self.canvas is not None:
+            text = self.canvas.selected_text()
+        if not text:
+            for canvas in self.page_canvases.values():
+                text = canvas.selected_text()
+                if text:
+                    break
+        self.append_selected_text_to_current_note(text)
+
+    def append_selected_text_to_current_note(self, selected_text: str) -> None:
+        cleaned = selected_text.strip()
+        if not cleaned:
+            return
+        if self.note_panel.current_note_id is None:
+            self.statusBar().showMessage("Select or create a note before appending selected text.", 5000)
+            return
+
+        current = self.note_panel.editor.toPlainText().rstrip()
+        quote = "\n".join(f"> {line}" if line else ">" for line in cleaned.splitlines())
+        updated = f"{current}\n\n{quote}\n" if current else f"{quote}\n"
+        self.note_panel.editor.setPlainText(updated)
+        self.save_current_note(updated)
+        self.statusBar().showMessage("Added selected text to current note.", 3000)
 
     def delete_current_note(self) -> None:
         note_id = self.note_panel.current_note_id
@@ -1877,12 +2111,8 @@ class MainWindow(QMainWindow):
         self.render_page_preserving_view()
 
     def reset_note_counters_to_current_notes(self) -> None:
-        counts_by_page: dict[str, int] = {}
-        for note in self.notes:
-            key = self._counter_key(note.page_index)
-            counts_by_page[key] = counts_by_page.get(key, 0) + 1
-
-        self.note_counters = {key: count + 1 for key, count in counts_by_page.items() if count > 0}
+        self.note_counters = {}
+        self._ensure_note_counters(force=True)
         self.persist_notes()
         self.statusBar().showMessage("Reset note numbering to current note counts.", 5000)
 
@@ -1893,7 +2123,13 @@ class MainWindow(QMainWindow):
     def persist_notes(self) -> None:
         if self.pdf_path is None or self.pdf_key is None:
             return
-        save_notes(pdf_key=self.pdf_key, pdf_path=self.pdf_path, notes=self.notes, note_counters=self.note_counters)
+        save_notes(
+            pdf_key=self.pdf_key,
+            pdf_path=self.pdf_path,
+            notes=self.notes,
+            note_counters=self.note_counters,
+            bookmarks=self.bookmarks,
+        )
 
     def choose_note_export_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose Markdown notes folder", str(self.note_export_dir))
@@ -1901,6 +2137,83 @@ class MainWindow(QMainWindow):
             return
         self.note_export_dir = Path(path)
         self.note_panel.set_folder_path(self.note_export_dir)
+
+    def add_bookmark(self) -> None:
+        if self.document is None or self.pdf_key is None:
+            return
+        default_title = self._note_location_label(self.page_index) or f"Page {self.page_index + 1}"
+        title, accepted = QInputDialog.getText(self, "Add bookmark", "Bookmark title:", text=default_title)
+        if not accepted:
+            return
+        bookmark = Bookmark.create(pdf_key=self.pdf_key, page_index=self.page_index, title=title)
+        self.bookmarks.append(bookmark)
+        self.persist_notes()
+        self.outline_panel.set_bookmarks(self.bookmarks)
+
+    def delete_bookmark(self, bookmark_id: str) -> None:
+        before = len(self.bookmarks)
+        self.bookmarks = [bookmark for bookmark in self.bookmarks if bookmark.id != bookmark_id]
+        if len(self.bookmarks) == before:
+            return
+        self.persist_notes()
+        self.outline_panel.set_bookmarks(self.bookmarks)
+
+    def add_outline_item(self) -> None:
+        self._add_outline_item(as_child=False)
+
+    def add_outline_child_item(self) -> None:
+        self._add_outline_item(as_child=True)
+
+    def _add_outline_item(self, *, as_child: bool) -> None:
+        if self.document is None:
+            return
+        page_index = self.outline_panel.selected_outline_page_index()
+        if page_index is None or not as_child:
+            page_index = self.page_index
+        default_title = f"Page {page_index + 1}"
+        title, accepted = QInputDialog.getText(self, "New contents item", "Title:", text=default_title)
+        if not accepted:
+            return
+        title = self._single_line_title(title)
+        if not title:
+            return
+        self.outline_panel.add_outline_item(title=title, page_index=page_index, as_child=as_child)
+        self.statusBar().showMessage("Contents changed. Save contents to PDF to make note numbering follow it.", 5000)
+
+    def delete_outline_item(self) -> None:
+        if self.outline_panel.delete_selected_outline_item():
+            self.statusBar().showMessage("Contents changed. Save contents to PDF to make note numbering follow it.", 5000)
+
+    def save_outline_to_pdf(self) -> None:
+        if self.document is None or self.pdf_path is None:
+            return
+        toc = self.outline_panel.outline_toc()
+        try:
+            self.document.set_toc(toc)
+            self.document.saveIncr()
+        except Exception as exc:  # PyMuPDF has version-specific save failures.
+            QMessageBox.critical(self, "Save contents failed", f"Could not save contents to PDF:\n{exc}")
+            return
+
+        self.outline_panel.set_outline(self.document.get_toc())
+        self._ensure_note_counters(force=True)
+        self.persist_notes()
+        self.statusBar().showMessage("Saved contents to PDF and refreshed note numbering counters.", 5000)
+
+    def export_all_notes(self) -> None:
+        if not self.notes:
+            self.statusBar().showMessage("No notes to export.", 3000)
+            return
+        if self.note_panel.current_note_id is not None:
+            self.save_current_note_from_panel()
+
+        exported = 0
+        for note in sorted(self.notes, key=lambda item: (item.page_index, self._note_number(item), item.created_at)):
+            path = self.export_markdown_note(note, replace_existing=bool(note.exported_markdown_path))
+            if path is not None:
+                exported += 1
+        self._refresh_note_selector()
+        self.statusBar().showMessage(f"Exported {exported} Markdown notes.", 5000)
 
     def _choose_export_mode(self, note: Note) -> str | None:
         if not note.exported_markdown_path:
@@ -1958,7 +2271,11 @@ class MainWindow(QMainWindow):
         return self._chapter_name_for_page(page_index) or f"page-{page_index + 1}"
 
     def _counter_key(self, page_index: int) -> str:
-        return str(max(0, int(page_index)))
+        chapter = self._chapter_for_page(page_index)
+        if chapter is None:
+            return f"page:{max(0, int(page_index))}"
+        title, start_page_index = chapter
+        return f"toc:{start_page_index}:{title}"
 
     def _allocate_note_number(self, page_index: int) -> int:
         key = self._counter_key(page_index)
@@ -1966,17 +2283,25 @@ class MainWindow(QMainWindow):
         self.note_counters[key] = next_number + 1
         return next_number
 
-    def _ensure_note_counters(self) -> None:
-        if self.note_counters:
+    def _ensure_note_counters(self, *, force: bool = False) -> None:
+        if self.note_counters and not force and not self._note_counters_need_migration():
             return
-        max_by_page: dict[str, int] = {}
+        max_by_key: dict[str, int] = {}
         for note in self.notes:
             key = self._counter_key(note.page_index)
+            old_page_key = str(max(0, int(note.page_index)))
+            for existing_key in (key, old_page_key):
+                existing_next = self.note_counters.get(existing_key)
+                if existing_next is not None:
+                    max_by_key[key] = max(max_by_key.get(key, 0), max(0, int(existing_next) - 1))
             if note.note_number > 0:
-                max_by_page[key] = max(max_by_page.get(key, 0), note.note_number)
+                max_by_key[key] = max(max_by_key.get(key, 0), note.note_number)
             else:
-                max_by_page[key] = max(max_by_page.get(key, 0), self._legacy_note_number_from_title(note))
-        self.note_counters = {key: value + 1 for key, value in max_by_page.items() if value > 0}
+                max_by_key[key] = max(max_by_key.get(key, 0), self._legacy_note_number_from_title(note))
+        self.note_counters = {key: value + 1 for key, value in max_by_key.items() if value > 0}
+
+    def _note_counters_need_migration(self) -> bool:
+        return any(key.isdecimal() for key in self.note_counters)
 
     def _legacy_note_number_from_title(self, note: Note) -> int:
         location = self._note_location_label(note.page_index)
@@ -1987,7 +2312,8 @@ class MainWindow(QMainWindow):
     def _note_number(self, note: Note) -> int:
         if note.note_number > 0:
             return note.note_number
-        page_notes = [item for item in self.notes if item.page_index == note.page_index]
+        key = self._counter_key(note.page_index)
+        page_notes = [item for item in self.notes if self._counter_key(item.page_index) == key]
         page_notes.sort(key=lambda item: item.created_at)
         for index, item in enumerate(page_notes, start=1):
             if item.id == note.id:
@@ -1995,10 +2321,14 @@ class MainWindow(QMainWindow):
         return len(page_notes) + 1
 
     def _chapter_name_for_page(self, page_index: int) -> str | None:
+        chapter = self._chapter_for_page(page_index)
+        return chapter[0] if chapter is not None else None
+
+    def _chapter_for_page(self, page_index: int) -> tuple[str, int] | None:
         if self.document is None:
             return None
 
-        best_title: str | None = None
+        best: tuple[str, int] | None = None
         for raw in self.document.get_toc():
             if len(raw) < 3:
                 continue
@@ -2006,10 +2336,10 @@ class MainWindow(QMainWindow):
             if toc_page_index <= page_index:
                 title = self._single_line_title(str(raw[1]))
                 if title:
-                    best_title = title
+                    best = (title, toc_page_index)
             else:
                 break
-        return best_title
+        return best
 
     @staticmethod
     def _single_line_title(value: str) -> str:

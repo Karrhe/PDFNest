@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pdf_notes_reader.notes import Note, load_notes, load_notes_with_counters, pdf_key_for_path, save_notes
+from pdf_notes_reader.notes import Bookmark, Note, load_notes, load_notes_data, load_notes_with_counters, pdf_key_for_path, save_notes
 
 
 class NotesStorageTest(unittest.TestCase):
@@ -25,8 +25,16 @@ class NotesStorageTest(unittest.TestCase):
                 exported_markdown_path=str(data_dir / "markdown_notes" / "sample" / "note.md"),
             )
 
-            saved_path = save_notes(pdf_key=pdf_key, pdf_path=pdf_path, notes=[note], note_counters={"2": 5}, data_dir=data_dir)
-            loaded, counters = load_notes_with_counters(pdf_key, data_dir=data_dir)
+            bookmark = Bookmark.create(pdf_key=pdf_key, page_index=2, title="Important")
+            saved_path = save_notes(
+                pdf_key=pdf_key,
+                pdf_path=pdf_path,
+                notes=[note],
+                note_counters={"2": 5},
+                bookmarks=[bookmark],
+                data_dir=data_dir,
+            )
+            loaded, counters, bookmarks = load_notes_data(pdf_key, data_dir=data_dir)
 
             self.assertTrue(saved_path.exists())
             self.assertEqual(len(loaded), 1)
@@ -39,6 +47,9 @@ class NotesStorageTest(unittest.TestCase):
             self.assertEqual(loaded[0].note_number, 4)
             self.assertEqual(loaded[0].exported_markdown_path, str(data_dir / "markdown_notes" / "sample" / "note.md"))
             self.assertEqual(counters, {"2": 5})
+            self.assertEqual(bookmarks[0].title, "Important")
+            self.assertEqual(bookmarks[0].page_index, 2)
+            self.assertEqual(load_notes_with_counters(pdf_key, data_dir=data_dir)[1], {"2": 5})
             self.assertEqual(load_notes(pdf_key, data_dir=data_dir)[0].note_number, 4)
 
     def test_normalized_coordinates_are_clamped(self) -> None:

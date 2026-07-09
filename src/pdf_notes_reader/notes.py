@@ -92,6 +92,38 @@ class Note:
         self.updated_at = utc_now()
 
 
+@dataclass
+class Bookmark:
+    id: str
+    pdf_key: str
+    page_index: int
+    title: str
+    created_at: str
+
+    @classmethod
+    def create(cls, *, pdf_key: str, page_index: int, title: str) -> "Bookmark":
+        return cls(
+            id=str(uuid.uuid4()),
+            pdf_key=pdf_key,
+            page_index=max(0, int(page_index)),
+            title=str(title).strip() or f"Page {page_index + 1}",
+            created_at=utc_now(),
+        )
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Bookmark":
+        return cls(
+            id=str(data["id"]),
+            pdf_key=str(data["pdf_key"]),
+            page_index=max(0, int(data["page_index"])),
+            title=str(data.get("title") or f"Page {int(data['page_index']) + 1}"),
+            created_at=str(data.get("created_at") or utc_now()),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -144,27 +176,48 @@ def notes_path_for_key(pdf_key: str, data_dir: Path | None = None) -> Path:
 
 
 def load_notes(pdf_key: str, data_dir: Path | None = None) -> list[Note]:
-    notes, _counters = load_notes_with_counters(pdf_key, data_dir)
+    notes, _counters, _bookmarks = load_notes_data(pdf_key, data_dir)
     return notes
 
 
 def load_notes_with_counters(pdf_key: str, data_dir: Path | None = None) -> tuple[list[Note], dict[str, int]]:
-    path = notes_path_for_key(pdf_key, data_dir)
-    if not path.exists():
-        return [], {}
+    notes, counters, _bookmarks = load_notes_data(pdf_key, data_dir)
+    return notes, counters
 
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
 
+def load_notes_data(pdf_key: str, data_dir: Path | None = None) -> tuple[list[Note], dict[str, int], list[Bookmark]]:
+    payload = load_notes_payload(pdf_key, data_dir)
     raw_notes = payload.get("notes", [])
     if not isinstance(raw_notes, list):
-        return [], {}
+        raw_notes = []
 
     notes: list[Note] = []
     for item in raw_notes:
         if isinstance(item, dict):
             notes.append(Note.from_dict(item))
-    return notes, normalize_note_counters(payload.get("note_counters", {}))
+
+    raw_bookmarks = payload.get("bookmarks", [])
+    if not isinstance(raw_bookmarks, list):
+        raw_bookmarks = []
+
+    bookmarks: list[Bookmark] = []
+    for item in raw_bookmarks:
+        if isinstance(item, dict):
+            try:
+                bookmarks.append(Bookmark.from_dict(item))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return notes, normalize_note_counters(payload.get("note_counters", {})), bookmarks
+
+
+def load_notes_payload(pdf_key: str, data_dir: Path | None = None) -> dict[str, Any]:
+    path = notes_path_for_key(pdf_key, data_dir)
+    if not path.exists():
+        return {}
+
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else {}
 
 
 def normalize_note_counters(value: Any) -> dict[str, int]:
@@ -192,6 +245,7 @@ def save_notes(
     pdf_path: str | Path,
     notes: list[Note],
     note_counters: dict[str, int] | None = None,
+    bookmarks: list[Bookmark] | None = None,
     data_dir: Path | None = None,
 ) -> Path:
     path = notes_path_for_key(pdf_key, data_dir)
@@ -202,6 +256,7 @@ def save_notes(
         "pdf_path": str(Path(pdf_path).expanduser()),
         "schema_version": 1,
         "note_counters": normalize_note_counters(note_counters or {}),
+        "bookmarks": [bookmark.to_dict() for bookmark in bookmarks or []],
         "notes": [note.to_dict() for note in notes],
     }
     tmp_path = path.with_suffix(".tmp")

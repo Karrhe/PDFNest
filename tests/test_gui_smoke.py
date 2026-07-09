@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QKeyEvent, QPainter, QPixmap
+from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QToolBar
 from PySide6.QtWidgets import QMessageBox
@@ -20,7 +20,7 @@ from pdf_notes_reader.history import PdfHistoryEntry, save_history
 from pdf_notes_reader.main import MainWindow, PdfCanvas, SettingsDialog
 from pdf_notes_reader.main import render_markdown_preview
 from pdf_notes_reader.notes import default_data_dir
-from pdf_notes_reader.notes import load_notes
+from pdf_notes_reader.notes import load_notes, load_notes_data
 from pdf_notes_reader.notes import pdf_key_for_path
 from pdf_notes_reader.settings import load_settings, load_theme_files, save_settings, themes_dir
 
@@ -174,6 +174,43 @@ class GuiSmokeTest(unittest.TestCase):
 
         self.assertEqual(saw_reset_action, [True])
         self.assertEqual(emitted, [True])
+
+    def test_pdf_canvas_context_menu_can_append_selected_text_to_current_note(self) -> None:
+        pixmap = QPixmap(80, 80)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas()
+        canvas.set_page(pixmap, [])
+        canvas._selected_text = "selected excerpt"
+        emitted: list[str] = []
+        canvas.append_selection_requested.connect(emitted.append)
+        saw_append_action: list[bool] = []
+
+        class FakeMenu:
+            def __init__(self, *_args):
+                self._actions = []
+
+            def addAction(self, action):
+                self._actions.append(action)
+
+            def addMenu(self, _label: str):
+                return FakeMenu()
+
+            def addSeparator(self) -> None:
+                pass
+
+            def exec(self, _pos: QPoint):
+                for action in self._actions:
+                    if action.text() == "Add selected text to current note":
+                        saw_append_action.append(True)
+                        return action
+                return None
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10), QPoint(10, 10))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(saw_append_action, [True])
+        self.assertEqual(emitted, ["selected excerpt"])
 
     def test_pdf_canvas_selects_and_copies_text(self) -> None:
         pixmap = QPixmap(200, 100)
@@ -636,6 +673,39 @@ class GuiSmokeTest(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_note_save_export_shortcuts_and_append_selection_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "shortcuts.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.note_export_dir = tmp_path / "markdown"
+                window.add_note(0, 0.25, 0.75)
+                note = window.notes[0]
+
+                self.assertEqual(window.save_note_shortcut.key().toString(QKeySequence.PortableText), "Ctrl+S")
+                self.assertEqual(window.export_note_shortcut.key().toString(QKeySequence.PortableText), "Ctrl+Shift+S")
+                self.assertEqual(window.append_selection_shortcut.key().toString(QKeySequence.PortableText), "Ctrl+Shift+C")
+
+                window.note_panel.editor.setPlainText("# Saved by shortcut\nBody")
+                window.save_note_shortcut.activated.emit()
+                self.assertEqual(load_notes(window.pdf_key)[0].markdown, "# Saved by shortcut\nBody")
+
+                window.append_selected_text_to_current_note("chosen text\nsecond line")
+                self.assertIn("> chosen text\n> second line", note.markdown)
+                self.assertIn("> chosen text\n> second line", load_notes(window.pdf_key)[0].markdown)
+
+                window.export_note_shortcut.activated.emit()
+                exported_path = Path(note.exported_markdown_path)
+                self.assertTrue(exported_path.exists())
+                self.assertIn("> chosen text", exported_path.read_text(encoding="utf-8"))
+            finally:
+                window.close()
+
     def test_new_note_number_stays_on_first_line_when_outline_title_wraps(self) -> None:
         window = MainWindow()
         try:
@@ -659,7 +729,8 @@ class GuiSmokeTest(unittest.TestCase):
                 window.note_counters["0"] = 25
 
                 window.reset_note_counters_to_current_notes()
-                self.assertEqual(window.note_counters, {"0": 3})
+                key = window._counter_key(0)
+                self.assertEqual(window.note_counters, {key: 3})
                 persisted = load_notes(window.pdf_key)
                 self.assertEqual(len(persisted), 2)
 
@@ -668,12 +739,40 @@ class GuiSmokeTest(unittest.TestCase):
 
                 for note in list(window.notes):
                     window.delete_note_by_id(note.id)
-                self.assertEqual(window.note_counters.get("0"), 4)
+                self.assertEqual(window.note_counters.get(key), 4)
 
                 window.reset_note_counters_to_current_notes()
                 self.assertEqual(window.note_counters, {})
                 window.add_note(0, 0.80, 0.20)
                 self.assertEqual(window.notes[-1].markdown, "# page-1-1\n")
+            finally:
+                window.close()
+
+    def test_reset_note_counters_uses_saved_outline_across_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "chapter-counters.pdf"
+            self._create_sample_pdf(pdf_path, page_count=3, toc=[[1, "Introduction", 1], [1, "Next", 3]])
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.add_note(0, 0.20, 0.20)
+                window.add_note(1, 0.40, 0.20)
+                self.assertEqual(window.notes[0].markdown, "# Introduction-1\n")
+                self.assertEqual(window.notes[1].markdown, "# Introduction-2\n")
+                key = window._counter_key(1)
+
+                deleted_note_id = window.notes[1].id
+                window.delete_note_by_id(deleted_note_id)
+                window.reset_note_counters_to_current_notes()
+                self.assertEqual(window.note_counters, {key: 2})
+
+                window.add_note(1, 0.60, 0.20)
+                self.assertEqual(window.notes[-1].markdown, "# Introduction-2\n")
+                self.assertEqual(window.notes[-1].note_number, 2)
+                self.assertEqual(window.note_counters.get(key), 3)
             finally:
                 window.close()
 
@@ -712,7 +811,8 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.note_panel.current_note_id, second_id)
 
                 window.delete_note_by_id(first_id)
-                self.assertEqual(window.note_counters.get("3"), 3)
+                key = window._counter_key(3)
+                self.assertEqual(window.note_counters.get(key), 3)
 
                 index = window.note_panel.note_selector.findData(first_id)
                 self.assertEqual(index, -1)
@@ -731,7 +831,8 @@ class GuiSmokeTest(unittest.TestCase):
                 reloaded_window.add_note(3, 0.75, 0.30)
                 self.assertEqual(reloaded_window.notes[-1].markdown, "# page-4-3\n")
                 self.assertEqual(reloaded_window.notes[-1].note_number, 3)
-                self.assertEqual(reloaded_window.note_counters.get("3"), 4)
+                key = reloaded_window._counter_key(3)
+                self.assertEqual(reloaded_window.note_counters.get(key), 4)
             finally:
                 reloaded_window.close()
 
@@ -810,10 +911,12 @@ class GuiSmokeTest(unittest.TestCase):
             )
             try:
                 dialog.setStyleSheet(window.styleSheet())
+                dialog.append_selection_shortcut_edit.setKeySequence(QKeySequence("Alt+C"))
                 labels = [label.text() for label in dialog.findChildren(QLabel)]
                 self.assertIn("QDialog", window.styleSheet())
                 self.assertNotIn("Theme files", labels)
                 self.assertIn("Theme folder", labels)
+                self.assertEqual(dialog.append_selection_shortcut, "Alt+C")
             finally:
                 dialog.close()
                 window.close()
@@ -857,6 +960,93 @@ class GuiSmokeTest(unittest.TestCase):
             window.outline_panel.tree.itemPressed.emit(item, 0)
             self.assertEqual(window.page_index, 2)
             window.close()
+
+    def test_bookmarks_are_shown_navigable_and_persisted_with_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "bookmarks.pdf"
+            self._create_sample_pdf(pdf_path, page_count=3)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.go_to_page(1)
+                with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("Bookmark title", True)):
+                    window.add_bookmark()
+
+                self.assertEqual(len(window.bookmarks), 1)
+                _notes, _counters, bookmarks = load_notes_data(window.pdf_key)
+                self.assertEqual(bookmarks[0].title, "Bookmark title")
+                self.assertEqual(bookmarks[0].page_index, 1)
+
+                item = window.outline_panel.bookmark_tree.topLevelItem(0)
+                window.go_to_page(0)
+                window.outline_panel.bookmark_tree.itemPressed.emit(item, 0)
+                self.assertEqual(window.page_index, 1)
+
+                window.delete_bookmark(bookmarks[0].id)
+                self.assertEqual(window.bookmarks, [])
+                self.assertEqual(load_notes_data(window.pdf_key)[2], [])
+            finally:
+                window.close()
+
+    def test_outline_edit_save_writes_pdf_and_refreshes_counter_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "outline-edit.pdf"
+            self._create_sample_pdf(pdf_path, page_count=3, toc=[[1, "Intro", 1]])
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                original_key = window._counter_key(1)
+                self.assertEqual(original_key, "toc:0:Intro")
+
+                window.outline_panel.set_outline([[1, "Intro", 1], [1, "Methods", 2]])
+                self.assertEqual(window._counter_key(1), original_key)
+
+                window.save_outline_to_pdf()
+                self.assertEqual(window.document.get_toc(), [[1, "Intro", 1], [1, "Methods", 2]])
+                self.assertEqual(window._counter_key(1), "toc:1:Methods")
+            finally:
+                window.close()
+
+            reopened = fitz.open(pdf_path)
+            try:
+                self.assertEqual(reopened.get_toc(), [[1, "Intro", 1], [1, "Methods", 2]])
+            finally:
+                reopened.close()
+
+    def test_outline_items_can_be_created_nested_and_deleted_before_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "outline-actions.pdf"
+            self._create_sample_pdf(pdf_path, page_count=2, toc=[])
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.go_to_page(1)
+                with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("Parent", True)):
+                    window.add_outline_item()
+                parent = window.outline_panel.tree.topLevelItem(0)
+                self.assertEqual(window.outline_panel.outline_toc(), [[1, "Parent", 2]])
+
+                window.outline_panel.tree.setCurrentItem(parent)
+                with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("Child", True)):
+                    window.add_outline_child_item()
+                self.assertEqual(window.outline_panel.outline_toc(), [[1, "Parent", 2], [2, "Child", 2]])
+
+                child = parent.child(0)
+                window.outline_panel.tree.setCurrentItem(child)
+                window.delete_outline_item()
+                self.assertEqual(window.outline_panel.outline_toc(), [[1, "Parent", 2]])
+                self.assertEqual(window.document.get_toc(), [])
+            finally:
+                window.close()
 
     def test_fit_updates_when_outline_panel_is_toggled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
