@@ -13,7 +13,7 @@ import fitz
 from PySide6.QtCore import QEvent, QPoint, Qt
 from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QToolBar
+from PySide6.QtWidgets import QApplication, QLabel, QToolBar, QToolButton, QWidget
 from PySide6.QtWidgets import QMessageBox
 
 from pdf_notes_reader.history import PdfHistoryEntry, save_history
@@ -181,6 +181,7 @@ class GuiSmokeTest(unittest.TestCase):
         canvas = PdfCanvas()
         canvas.set_page(pixmap, [])
         canvas._selected_text = "selected excerpt"
+        canvas._selected_rects_norm = [[0.1, 0.1, 0.2, 0.2]]
         emitted: list[str] = []
         canvas.append_selection_requested.connect(emitted.append)
         saw_append_action: list[bool] = []
@@ -211,6 +212,81 @@ class GuiSmokeTest(unittest.TestCase):
 
         self.assertEqual(saw_append_action, [True])
         self.assertEqual(emitted, ["selected excerpt"])
+        self.assertEqual(canvas._selected_text, "")
+        self.assertEqual(canvas._selected_rects_norm, [])
+
+    def test_pdf_canvas_context_menu_can_request_bookmark(self) -> None:
+        pixmap = QPixmap(80, 80)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas(page_index=2)
+        canvas.set_page(pixmap, [])
+        emitted: list[int] = []
+        canvas.bookmark_requested.connect(emitted.append)
+        saw_bookmark_action: list[bool] = []
+
+        class FakeMenu:
+            def __init__(self, *_args):
+                self._actions = []
+
+            def addAction(self, action):
+                self._actions.append(action)
+
+            def addMenu(self, _label: str):
+                return FakeMenu()
+
+            def addSeparator(self) -> None:
+                pass
+
+            def exec(self, _pos: QPoint):
+                for action in self._actions:
+                    if action.text() == "Add bookmark":
+                        saw_bookmark_action.append(True)
+                        return action
+                return None
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10), QPoint(10, 10))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(saw_bookmark_action, [True])
+        self.assertEqual(emitted, [2])
+
+    def test_pdf_canvas_context_menu_selection_annotation_clears_selection(self) -> None:
+        pixmap = QPixmap(80, 80)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas(page_index=1)
+        canvas.set_page(pixmap, [])
+        canvas._selected_text = "selected excerpt"
+        canvas._selected_rects_norm = [[0.1, 0.1, 0.2, 0.2]]
+        emitted: list[tuple[int, str, list, str, str]] = []
+        canvas.annotation_requested.connect(lambda page, kind, rects, text, color: emitted.append((page, kind, rects, text, color)))
+
+        class FakeMenu:
+            def __init__(self, *_args):
+                self._actions = []
+
+            def addAction(self, action):
+                self._actions.append(action)
+
+            def addMenu(self, _label: str):
+                return self
+
+            def addSeparator(self) -> None:
+                pass
+
+            def exec(self, _pos: QPoint):
+                for action in self._actions:
+                    if action.text() == "Yellow":
+                        return action
+                return None
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10), QPoint(10, 10))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(emitted, [(1, "highlight", [[0.1, 0.1, 0.2, 0.2]], "selected excerpt", "#fde047")])
+        self.assertEqual(canvas._selected_text, "")
+        self.assertEqual(canvas._selected_rects_norm, [])
 
     def test_pdf_canvas_selects_and_copies_text(self) -> None:
         pixmap = QPixmap(200, 100)
@@ -230,7 +306,8 @@ class GuiSmokeTest(unittest.TestCase):
         canvas.copy_selected_text()
 
         self.assertEqual(QApplication.clipboard().text(), "Hello PDF")
-        self.assertEqual(canvas._selected_rects_norm, [[0.1, 0.1, 0.5, 0.3]])
+        self.assertEqual(canvas._selected_text, "")
+        self.assertEqual(canvas._selected_rects_norm, [])
 
     def test_pdf_canvas_selects_contiguous_lines_and_merges_rects(self) -> None:
         pixmap = QPixmap(300, 180)
@@ -699,6 +776,15 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn("> chosen text\n> second line", note.markdown)
                 self.assertIn("> chosen text\n> second line", load_notes(window.pdf_key)[0].markdown)
 
+                canvas = window.page_canvases[0]
+                canvas._selected_text = "shortcut selected text"
+                canvas._selected_rects_norm = [[0.1, 0.1, 0.2, 0.2]]
+                window.canvas = canvas
+                window.append_selection_shortcut.activated.emit()
+                self.assertIn("> shortcut selected text", note.markdown)
+                self.assertEqual(canvas._selected_text, "")
+                self.assertEqual(canvas._selected_rects_norm, [])
+
                 window.export_note_shortcut.activated.emit()
                 exported_path = Path(note.exported_markdown_path)
                 self.assertTrue(exported_path.exists())
@@ -773,6 +859,31 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.notes[-1].markdown, "# Introduction-2\n")
                 self.assertEqual(window.notes[-1].note_number, 2)
                 self.assertEqual(window.note_counters.get(key), 3)
+            finally:
+                window.close()
+
+    def test_reset_note_counters_counts_remaining_notes_not_highest_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "reset-high-number.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.add_note(0, 0.20, 0.20)
+                remaining = window.notes[0]
+                remaining.note_number = 5
+                remaining.update_markdown("# page-1-5\n")
+                window.note_counters[window._counter_key(0)] = 6
+
+                window.reset_note_counters_to_current_notes()
+                self.assertEqual(window.note_counters, {window._counter_key(0): 2})
+
+                window.add_note(0, 0.40, 0.20)
+                self.assertEqual(window.notes[-1].markdown, "# page-1-2\n")
+                self.assertEqual(window.notes[-1].note_number, 2)
             finally:
                 window.close()
 
@@ -940,6 +1051,75 @@ class GuiSmokeTest(unittest.TestCase):
         finally:
             window.close()
 
+    def test_outline_actions_use_pic_icons(self) -> None:
+        window = MainWindow()
+        try:
+            expected_contents_buttons = {
+                "OutlineMoreButton",
+                "OutlineNewButton",
+                "OutlineChildButton",
+                "OutlineDeleteButton",
+                "OutlineSaveButton",
+            }
+            expected_bookmark_buttons = {
+                "BookmarkAddButton",
+                "BookmarkDeleteButton",
+            }
+            expected_buttons = expected_contents_buttons | expected_bookmark_buttons
+            buttons = {
+                button.objectName(): button
+                for button in window.outline_panel.findChildren(QToolButton)
+                if button.objectName() in expected_buttons
+            }
+
+            self.assertEqual(set(buttons), expected_buttons)
+            for button in buttons.values():
+                self.assertEqual(button.text(), "")
+                self.assertFalse(button.icon().isNull())
+                self.assertEqual(button.iconSize().width(), 22)
+                self.assertEqual(button.width(), 36)
+                self.assertTrue(button.toolTip())
+            self.assertEqual(buttons["OutlineChildButton"].toolTip(), "New subcontents item")
+            self.assertIn("#OutlineMoreButton::menu-indicator", window.styleSheet())
+            self.assertIn("image: none", window.styleSheet())
+
+            more_menu = buttons["OutlineMoreButton"].menu()
+            self.assertIsNotNone(more_menu)
+            assert more_menu is not None
+            actions_by_text = {action.text(): action for action in more_menu.actions()}
+            self.assertIn("Expand all", actions_by_text)
+            self.assertIn("Collapse all", actions_by_text)
+            self.assertTrue(actions_by_text["Expand all"].icon().isNull())
+            self.assertTrue(actions_by_text["Collapse all"].icon().isNull())
+
+            contents_tab = window.outline_panel.findChild(QWidget, "ContentsTab")
+            bookmarks_tab = window.outline_panel.findChild(QWidget, "BookmarksTab")
+            self.assertIsNotNone(contents_tab)
+            self.assertIsNotNone(bookmarks_tab)
+            assert contents_tab is not None
+            assert bookmarks_tab is not None
+            self.assertEqual(
+                {button.objectName() for button in contents_tab.findChildren(QToolButton) if button.objectName()},
+                expected_contents_buttons,
+            )
+            self.assertEqual(
+                {button.objectName() for button in bookmarks_tab.findChildren(QToolButton) if button.objectName()},
+                expected_bookmark_buttons,
+            )
+
+            icon_image = QImage(str(Path(__file__).resolve().parents[1] / "Pic" / "more.png"))
+            dark_pixels = [
+                icon_image.pixelColor(x, y)
+                for y in range(icon_image.height())
+                for x in range(icon_image.width())
+                if icon_image.pixelColor(x, y).alpha() > 0
+            ]
+            self.assertTrue(dark_pixels)
+            self.assertLessEqual(max(max(pixel.red(), pixel.green(), pixel.blue()) for pixel in dark_pixels), 80)
+            self.assertFalse((Path(__file__).resolve().parents[1] / "Pic" / "foldall.png").exists())
+        finally:
+            window.close()
+
     def test_pdf_outline_jumps_to_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -971,9 +1151,8 @@ class GuiSmokeTest(unittest.TestCase):
             window = MainWindow()
             try:
                 window.load_pdf(pdf_path)
-                window.go_to_page(1)
                 with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("Bookmark title", True)):
-                    window.add_bookmark()
+                    window.add_bookmark_for_page(1)
 
                 self.assertEqual(len(window.bookmarks), 1)
                 _notes, _counters, bookmarks = load_notes_data(window.pdf_key)

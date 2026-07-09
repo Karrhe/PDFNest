@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.1"
+    [string]$Version = "0.2.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +24,7 @@ $IconPng = Join-Path $ReleaseAssets "PDFNest-256x256-transparent.png"
 $IconIco = Join-Path $ReleaseAssets "PDFNest-transparent.ico"
 $Main = Join-Path $Root "src\pdf_notes_reader\main.py"
 $Asset = Join-Path $Root "src\pdf_notes_reader\assets\Icon.png"
+$PicAssets = Join-Path $Root "Pic"
 
 New-Item -ItemType Directory -Force -Path $ReleaseAssets | Out-Null
 New-Item -ItemType Directory -Force -Path $Release | Out-Null
@@ -34,6 +35,10 @@ if (-not (Test-Path $IconPng)) {
 
 if (-not (Test-Path $IconIco)) {
     throw "Missing transparent ICO icon source: $IconIco"
+}
+
+if (-not (Test-Path $PicAssets)) {
+    throw "Missing UI icon assets folder: $PicAssets"
 }
 
 function Write-StartMenuAssets {
@@ -99,7 +104,7 @@ Copy-Item -LiteralPath $IconPng -Destination (Join-Path $Root "Icon.png") -Force
 Copy-Item -LiteralPath $IconPng -Destination (Join-Path $Root "PDFNest-Icon.png") -Force
 Copy-Item -LiteralPath $IconPng -Destination $Asset -Force
 
-& $PyInstaller --noconfirm --clean --windowed --name PDFNest --paths (Join-Path $Root "src") --distpath $Release --workpath $WorkOnedir --specpath $WorkOnedir --icon $IconIco --add-data "$Asset;pdf_notes_reader\assets" $Main
+& $PyInstaller --noconfirm --clean --windowed --name PDFNest --paths (Join-Path $Root "src") --distpath $Release --workpath $WorkOnedir --specpath $WorkOnedir --icon $IconIco --add-data "$Asset;pdf_notes_reader\assets" --add-data "$PicAssets;Pic" $Main
 Write-StartMenuAssets -TargetDir (Join-Path $Release "PDFNest") -ExeStem "PDFNest"
 
 $Zip = Join-Path $Release "PDFNest-$Version-windows-x64.zip"
@@ -108,7 +113,7 @@ if (Test-Path $Zip) {
 }
 Compress-Archive -Path (Join-Path $Release "PDFNest") -DestinationPath $Zip -CompressionLevel Optimal
 
-& $PyInstaller --noconfirm --clean --onefile --windowed --name "PDFNest-$Version-windows-x64" --paths (Join-Path $Root "src") --distpath $Release --workpath $WorkOnefile --specpath $WorkOnefile --icon $IconIco --add-data "$Asset;pdf_notes_reader\assets" $Main
+& $PyInstaller --noconfirm --clean --onefile --windowed --name "PDFNest-$Version-windows-x64" --paths (Join-Path $Root "src") --distpath $Release --workpath $WorkOnefile --specpath $WorkOnefile --icon $IconIco --add-data "$Asset;pdf_notes_reader\assets" --add-data "$PicAssets;Pic" $Main
 Write-StartMenuAssets -TargetDir $Release -ExeStem "PDFNest-$Version-windows-x64"
 
 Get-ChildItem $Release | Format-Table Name,Length,LastWriteTime

@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTabWidget,
     QTextBrowser,
+    QToolButton,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
@@ -74,6 +75,19 @@ ANNOTATION_COLORS = [
     ("Red", "#fca5a5"),
     ("Purple", "#c4b5fd"),
 ]
+
+
+def app_resource_path(*parts: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[2]))
+    candidate = base.joinpath(*parts)
+    if candidate.exists():
+        return candidate
+    return Path(__file__).resolve().parents[2].joinpath(*parts)
+
+
+def pic_icon(name: str) -> QIcon:
+    path = app_resource_path("Pic", name)
+    return QIcon(str(path)) if path.exists() else QIcon()
 
 
 MATH_BLOCK_RE = re.compile(r"\$\$(.+?)\$\$", re.DOTALL)
@@ -372,6 +386,7 @@ class PdfCanvas(QWidget):
     add_note_requested = Signal(int, float, float)
     append_selection_requested = Signal(str)
     annotation_requested = Signal(int, str, list, str, str)
+    bookmark_requested = Signal(int)
     fit_requested = Signal(str)
     mode_requested = Signal(str)
     note_selected = Signal(str)
@@ -497,6 +512,7 @@ class PdfCanvas(QWidget):
         target_note = self._note_at(event.pos())
         menu = QMenu(self)
         add_action = QAction("Add note", self)
+        add_bookmark_action = QAction("Add bookmark", self)
         reset_note_numbers_action = QAction("Reset note numbering", self)
         copy_action = QAction("Copy selected text", self)
         append_selection_action = QAction("Add selected text to current note", self)
@@ -530,6 +546,7 @@ class PdfCanvas(QWidget):
             menu.addSeparator()
 
         menu.addAction(add_action)
+        menu.addAction(add_bookmark_action)
         menu.addAction(reset_note_numbers_action)
         if self._selected_text:
             menu.addAction(copy_action)
@@ -569,16 +586,29 @@ class PdfCanvas(QWidget):
         elif chosen == add_action:
             x_norm, y_norm = self._point_to_norm(event.pos())
             self.add_note_requested.emit(self.page_index, x_norm, y_norm)
+        elif chosen == add_bookmark_action:
+            self.bookmark_requested.emit(self.page_index)
         elif chosen == reset_note_numbers_action:
             self.reset_note_counters_requested.emit()
         elif chosen == copy_action:
             self.copy_selected_text()
         elif chosen == append_selection_action:
-            self.append_selection_requested.emit(self._selected_text)
+            selected_text = self._selected_text
+            self.append_selection_requested.emit(selected_text)
+            self.clear_selection()
+            self.update()
         elif chosen in highlight_actions:
-            self.annotation_requested.emit(self.page_index, "highlight", self._selected_rects_norm, self._selected_text, highlight_actions[chosen])
+            selected_rects = [list(rect) for rect in self._selected_rects_norm]
+            selected_text = self._selected_text
+            self.annotation_requested.emit(self.page_index, "highlight", selected_rects, selected_text, highlight_actions[chosen])
+            self.clear_selection()
+            self.update()
         elif chosen in underline_actions:
-            self.annotation_requested.emit(self.page_index, "underline", self._selected_rects_norm, self._selected_text, underline_actions[chosen])
+            selected_rects = [list(rect) for rect in self._selected_rects_norm]
+            selected_text = self._selected_text
+            self.annotation_requested.emit(self.page_index, "underline", selected_rects, selected_text, underline_actions[chosen])
+            self.clear_selection()
+            self.update()
         elif chosen == fit_width_action:
             self.fit_requested.emit("width")
         elif chosen == fit_height_action:
@@ -638,6 +668,8 @@ class PdfCanvas(QWidget):
     def copy_selected_text(self) -> None:
         if self._selected_text:
             QApplication.clipboard().setText(self._selected_text)
+            self.clear_selection()
+            self.update()
 
     def selected_text(self) -> str:
         return self._selected_text
@@ -1030,8 +1062,8 @@ class OutlinePanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("OutlinePanel")
-        self.setMinimumWidth(180)
-        self.setMaximumWidth(320)
+        self.setMinimumWidth(220)
+        self.setMaximumWidth(360)
 
         title = QLabel("Contents")
         title.setObjectName("OutlineTitle")
@@ -1046,13 +1078,10 @@ class OutlinePanel(QWidget):
         self.bookmark_tree.itemPressed.connect(self._open_bookmark_item)
         self.bookmark_tree.itemActivated.connect(self._open_bookmark_item)
 
-        tabs = QTabWidget()
-        tabs.addTab(self.tree, "Contents")
-        tabs.addTab(self.bookmark_tree, "Bookmarks")
-
-        menu_button = QPushButton("Menu")
+        menu_button = self._icon_button("more.png", "More contents actions", "OutlineMoreButton")
+        menu_button.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(menu_button)
-        export_action = QAction("Export all notes", self)
+        export_action = QAction(pic_icon("markdown.png"), "Export all notes", self)
         expand_action = QAction("Expand all", self)
         collapse_action = QAction("Collapse all", self)
         export_action.triggered.connect(self.export_all_notes_requested.emit)
@@ -1064,12 +1093,13 @@ class OutlinePanel(QWidget):
         menu.addAction(export_action)
         menu_button.setMenu(menu)
 
-        add_outline_button = QPushButton("New")
-        add_child_button = QPushButton("Sub")
-        delete_outline_button = QPushButton("Delete")
-        save_outline_button = QPushButton("Save PDF")
-        add_bookmark_button = QPushButton("Bookmark")
-        delete_bookmark_button = QPushButton("Remove")
+        add_outline_button = self._icon_button("siblingnode.png", "New contents item", "OutlineNewButton")
+        add_child_button = self._icon_button("subnode.png", "New subcontents item", "OutlineChildButton")
+        delete_outline_button = self._icon_button("note-del.png", "Delete selected contents item", "OutlineDeleteButton")
+        save_outline_button = self._icon_button("save.png", "Save contents to PDF", "OutlineSaveButton")
+        add_bookmark_button = self._icon_button("bookmarks.png", "Add bookmark for current page", "BookmarkAddButton")
+        delete_bookmark_button = self._icon_button("note-del.png", "Delete selected bookmark", "BookmarkDeleteButton")
+
         add_outline_button.clicked.connect(self.outline_new_requested.emit)
         add_child_button.clicked.connect(self.outline_new_child_requested.emit)
         delete_outline_button.clicked.connect(self.outline_delete_requested.emit)
@@ -1077,22 +1107,57 @@ class OutlinePanel(QWidget):
         add_bookmark_button.clicked.connect(self.bookmark_add_requested.emit)
         delete_bookmark_button.clicked.connect(self._emit_delete_bookmark)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(4)
-        controls.addWidget(menu_button)
-        controls.addWidget(add_outline_button)
-        controls.addWidget(add_child_button)
-        controls.addWidget(delete_outline_button)
-        controls.addWidget(save_outline_button)
-        controls.addWidget(add_bookmark_button)
-        controls.addWidget(delete_bookmark_button)
+        contents_tab = QWidget()
+        contents_tab.setObjectName("ContentsTab")
+        contents_controls = QHBoxLayout()
+        contents_controls.setContentsMargins(0, 0, 0, 0)
+        contents_controls.setSpacing(3)
+        contents_controls.addWidget(menu_button)
+        contents_controls.addWidget(add_outline_button)
+        contents_controls.addWidget(add_child_button)
+        contents_controls.addWidget(delete_outline_button)
+        contents_controls.addWidget(save_outline_button)
+        contents_controls.addStretch(1)
+        contents_layout = QVBoxLayout(contents_tab)
+        contents_layout.setContentsMargins(0, 0, 0, 0)
+        contents_layout.setSpacing(6)
+        contents_layout.addLayout(contents_controls)
+        contents_layout.addWidget(self.tree, 1)
+
+        bookmarks_tab = QWidget()
+        bookmarks_tab.setObjectName("BookmarksTab")
+        bookmark_controls = QHBoxLayout()
+        bookmark_controls.setContentsMargins(0, 0, 0, 0)
+        bookmark_controls.setSpacing(3)
+        bookmark_controls.addWidget(add_bookmark_button)
+        bookmark_controls.addWidget(delete_bookmark_button)
+        bookmark_controls.addStretch(1)
+        bookmarks_layout = QVBoxLayout(bookmarks_tab)
+        bookmarks_layout.setContentsMargins(0, 0, 0, 0)
+        bookmarks_layout.setSpacing(6)
+        bookmarks_layout.addLayout(bookmark_controls)
+        bookmarks_layout.addWidget(self.bookmark_tree, 1)
+
+        tabs = QTabWidget()
+        tabs.addTab(contents_tab, "Contents")
+        tabs.addTab(bookmarks_tab, "Bookmarks")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
         layout.addWidget(title)
-        layout.addLayout(controls)
         layout.addWidget(tabs, 1)
+
+    @staticmethod
+    def _icon_button(icon_name: str, tooltip: str, object_name: str) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName(object_name)
+        button.setIcon(pic_icon(icon_name))
+        button.setIconSize(QSize(22, 22))
+        button.setToolTip(tooltip)
+        button.setFixedSize(36, 36)
+        button.setAutoRaise(True)
+        return button
 
     def set_outline(self, toc: list[list]) -> None:
         self.tree.clear()
@@ -1874,6 +1939,7 @@ class MainWindow(QMainWindow):
         canvas.add_note_requested.connect(self.add_note)
         canvas.append_selection_requested.connect(self.append_selected_text_to_current_note)
         canvas.annotation_requested.connect(self.add_text_annotation)
+        canvas.bookmark_requested.connect(self.add_bookmark_for_page)
         canvas.fit_requested.connect(self.fit_page)
         canvas.mode_requested.connect(self.set_reading_mode)
         canvas.note_selected.connect(self.select_note)
@@ -2054,14 +2120,21 @@ class MainWindow(QMainWindow):
 
     def append_selected_text_to_current_note_from_shortcut(self) -> None:
         text = ""
+        selected_canvas: PdfCanvas | None = None
         if self.canvas is not None:
             text = self.canvas.selected_text()
+            if text:
+                selected_canvas = self.canvas
         if not text:
             for canvas in self.page_canvases.values():
                 text = canvas.selected_text()
                 if text:
+                    selected_canvas = canvas
                     break
         self.append_selected_text_to_current_note(text)
+        if selected_canvas is not None:
+            selected_canvas.clear_selection()
+            selected_canvas.update()
 
     def append_selected_text_to_current_note(self, selected_text: str) -> None:
         cleaned = selected_text.strip()
@@ -2111,8 +2184,7 @@ class MainWindow(QMainWindow):
         self.render_page_preserving_view()
 
     def reset_note_counters_to_current_notes(self) -> None:
-        self.note_counters = {}
-        self._ensure_note_counters(force=True)
+        self._rebuild_note_counters_from_current_note_counts()
         self.persist_notes()
         self.statusBar().showMessage("Reset note numbering to current note counts.", 5000)
 
@@ -2139,13 +2211,17 @@ class MainWindow(QMainWindow):
         self.note_panel.set_folder_path(self.note_export_dir)
 
     def add_bookmark(self) -> None:
+        self.add_bookmark_for_page(self.page_index)
+
+    def add_bookmark_for_page(self, page_index: int) -> None:
         if self.document is None or self.pdf_key is None:
             return
-        default_title = self._note_location_label(self.page_index) or f"Page {self.page_index + 1}"
+        page_index = max(0, min(int(page_index), self.document.page_count - 1))
+        default_title = self._note_location_label(page_index) or f"Page {page_index + 1}"
         title, accepted = QInputDialog.getText(self, "Add bookmark", "Bookmark title:", text=default_title)
         if not accepted:
             return
-        bookmark = Bookmark.create(pdf_key=self.pdf_key, page_index=self.page_index, title=title)
+        bookmark = Bookmark.create(pdf_key=self.pdf_key, page_index=page_index, title=title)
         self.bookmarks.append(bookmark)
         self.persist_notes()
         self.outline_panel.set_bookmarks(self.bookmarks)
@@ -2196,7 +2272,7 @@ class MainWindow(QMainWindow):
             return
 
         self.outline_panel.set_outline(self.document.get_toc())
-        self._ensure_note_counters(force=True)
+        self._rebuild_note_counters_from_current_note_counts()
         self.persist_notes()
         self.statusBar().showMessage("Saved contents to PDF and refreshed note numbering counters.", 5000)
 
@@ -2302,6 +2378,13 @@ class MainWindow(QMainWindow):
 
     def _note_counters_need_migration(self) -> bool:
         return any(key.isdecimal() for key in self.note_counters)
+
+    def _rebuild_note_counters_from_current_note_counts(self) -> None:
+        counts_by_key: dict[str, int] = {}
+        for note in self.notes:
+            key = self._counter_key(note.page_index)
+            counts_by_key[key] = counts_by_key.get(key, 0) + 1
+        self.note_counters = {key: count + 1 for key, count in counts_by_key.items() if count > 0}
 
     def _legacy_note_number_from_title(self, note: Note) -> int:
         location = self._note_location_label(note.page_index)
@@ -2658,6 +2741,11 @@ class MainWindow(QMainWindow):
             QToolButton:checked {
                 background: {colors["editor"]};
                 border-radius: 4px;
+            }
+            #OutlineMoreButton::menu-indicator {
+                image: none;
+                width: 0px;
+                height: 0px;
             }
             QLabel {
                 color: {colors["text"]};
