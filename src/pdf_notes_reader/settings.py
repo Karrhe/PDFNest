@@ -50,6 +50,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "theme": "beige",
     "note_marker_radius": 7,
     "append_selection_shortcut": "Ctrl+Shift+C",
+    "wheel_scroll_lines": 3,
+    "auto_save_current_note": True,
+    "window_width": 1180,
+    "window_height": 820,
+    "window_maximized": False,
 }
 
 
@@ -59,6 +64,22 @@ def clamp_marker_radius(value: Any) -> int:
     except (TypeError, ValueError):
         number = 7
     return max(3, min(24, number))
+
+
+def clamp_wheel_scroll_lines(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 3
+    return max(1, min(30, number))
+
+
+def clamp_window_dimension(value: Any, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(640, min(4096, number))
 
 
 def settings_path(data_dir: Path | None = None) -> Path:
@@ -115,6 +136,11 @@ def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
 
     settings.update({key: value for key, value in loaded.items() if key in DEFAULT_SETTINGS})
     settings["note_marker_radius"] = clamp_marker_radius(settings.get("note_marker_radius"))
+    settings["wheel_scroll_lines"] = clamp_wheel_scroll_lines(settings.get("wheel_scroll_lines"))
+    settings["auto_save_current_note"] = bool(settings.get("auto_save_current_note"))
+    settings["window_width"] = clamp_window_dimension(settings.get("window_width"), 1180)
+    settings["window_height"] = clamp_window_dimension(settings.get("window_height"), 820)
+    settings["window_maximized"] = bool(settings.get("window_maximized"))
     return settings
 
 
@@ -124,6 +150,11 @@ def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Pat
     payload = deepcopy(DEFAULT_SETTINGS)
     payload.update({key: value for key, value in settings.items() if key in DEFAULT_SETTINGS})
     payload["note_marker_radius"] = clamp_marker_radius(payload.get("note_marker_radius"))
+    payload["wheel_scroll_lines"] = clamp_wheel_scroll_lines(payload.get("wheel_scroll_lines"))
+    payload["auto_save_current_note"] = bool(payload.get("auto_save_current_note"))
+    payload["window_width"] = clamp_window_dimension(payload.get("window_width"), 1180)
+    payload["window_height"] = clamp_window_dimension(payload.get("window_height"), 820)
+    payload["window_maximized"] = bool(payload.get("window_maximized"))
     tmp_path = path.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

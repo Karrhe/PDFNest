@@ -17,6 +17,9 @@ class PdfHistoryEntry:
     page_count: int
     opened_at: str
     updated_at: str
+    last_note_id: str = ""
+    zoom: float = 1.25
+    fit_mode: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PdfHistoryEntry":
@@ -29,6 +32,9 @@ class PdfHistoryEntry:
             page_count=max(0, int(data.get("page_count", 0))),
             opened_at=str(data.get("opened_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
+            last_note_id=str(data.get("last_note_id") or ""),
+            zoom=normalize_zoom(data.get("zoom")),
+            fit_mode=normalize_fit_mode(data.get("fit_mode")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,6 +47,19 @@ class PdfHistoryEntry:
 
 def history_path(data_dir: Path | None = None) -> Path:
     return (data_dir or default_data_dir()) / "pdf_history.json"
+
+
+def normalize_zoom(value: Any) -> float:
+    try:
+        zoom = float(value)
+    except (TypeError, ValueError):
+        zoom = 1.25
+    return max(0.3, min(4.0, zoom))
+
+
+def normalize_fit_mode(value: Any) -> str:
+    mode = str(value or "")
+    return mode if mode in {"width", "height"} else ""
 
 
 def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
@@ -88,6 +107,9 @@ def upsert_history_entry(
     path: str | Path,
     page_count: int,
     last_page_index: int,
+    last_note_id: str = "",
+    zoom: float = 1.25,
+    fit_mode: str | None = "",
 ) -> PdfHistoryEntry:
     now = utc_now()
     absolute_path = str(Path(path).expanduser().resolve(strict=False))
@@ -102,6 +124,9 @@ def upsert_history_entry(
             page_count=max(0, page_count),
             opened_at=now,
             updated_at=now,
+            last_note_id=str(last_note_id or ""),
+            zoom=normalize_zoom(zoom),
+            fit_mode=normalize_fit_mode(fit_mode),
         )
         entries.append(entry)
     else:
@@ -109,6 +134,9 @@ def upsert_history_entry(
         entry.title = Path(absolute_path).name
         entry.page_count = max(0, page_count)
         entry.last_page_index = max(0, min(last_page_index, max(page_count - 1, 0)))
+        entry.last_note_id = str(last_note_id or "")
+        entry.zoom = normalize_zoom(zoom)
+        entry.fit_mode = normalize_fit_mode(fit_mode)
         entry.updated_at = now
 
     entries.sort(key=lambda item: item.updated_at, reverse=True)

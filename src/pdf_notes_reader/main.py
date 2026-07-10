@@ -13,6 +13,7 @@ from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QT
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
@@ -62,7 +63,16 @@ from pdf_notes_reader.notes import (
     pdf_key_for_path,
     save_notes,
 )
-from pdf_notes_reader.settings import clamp_marker_radius, load_settings, load_theme_files, save_settings, settings_path, themes_dir
+from pdf_notes_reader.settings import (
+    clamp_marker_radius,
+    clamp_window_dimension,
+    clamp_wheel_scroll_lines,
+    load_settings,
+    load_theme_files,
+    save_settings,
+    settings_path,
+    themes_dir,
+)
 
 
 APP_TITLE = "PDFNest"
@@ -889,8 +899,7 @@ class NotePanel(QWidget):
 
         with QSignalBlocker(self.note_selector):
             self.note_selector.clear()
-            if self._current_note_id is None:
-                self.note_selector.addItem("Select note...", "")
+            self.note_selector.addItem("Select note...", "")
             for note in self._notes:
                 self.note_selector.addItem(self.note_label(note), note.id)
         self._sync_selector_current()
@@ -933,6 +942,8 @@ class NotePanel(QWidget):
             with QSignalBlocker(self.note_selector):
                 if self.note_selector.count() == 0:
                     self.note_selector.addItem("Select note...", "")
+                elif self.note_selector.itemData(0) != "":
+                    self.note_selector.insertItem(0, "Select note...", "")
                 self.note_selector.setCurrentIndex(0)
             return
 
@@ -1294,6 +1305,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("PDFNest Settings")
+        self.resize(760, 460)
 
         self.theme_combo = QComboBox()
         for theme_name in sorted(themes):
@@ -1306,6 +1318,13 @@ class SettingsDialog(QDialog):
         self.marker_size_spin = QSpinBox()
         self.marker_size_spin.setRange(3, 24)
         self.marker_size_spin.setValue(clamp_marker_radius(settings.get("note_marker_radius")))
+
+        self.auto_save_note_checkbox = QCheckBox("Save current note when switching notes or closing")
+        self.auto_save_note_checkbox.setChecked(bool(settings.get("auto_save_current_note", True)))
+
+        self.wheel_scroll_lines_spin = QSpinBox()
+        self.wheel_scroll_lines_spin.setRange(1, 30)
+        self.wheel_scroll_lines_spin.setValue(clamp_wheel_scroll_lines(settings.get("wheel_scroll_lines")))
 
         self.append_selection_shortcut_edit = QKeySequenceEdit()
         shortcut_text = str(settings.get("append_selection_shortcut") or "Ctrl+Shift+C")
@@ -1322,23 +1341,71 @@ class SettingsDialog(QDialog):
         theme_dir_label = QLabel(str(theme_dir))
         theme_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        form = QFormLayout()
-        form.addRow("Theme", self.theme_combo)
-        form.addRow("Note dot size", self.marker_size_spin)
-        form.addRow("Add selection shortcut", self.append_selection_shortcut_edit)
-        form.addRow("Data folder", data_label)
-        form.addRow("Current note JSON", note_label)
-        form.addRow("Markdown export base", markdown_label)
-        form.addRow("Settings file", settings_label)
-        form.addRow("Theme folder", theme_dir_label)
+        self.category_list = QTreeWidget()
+        self.category_list.setHeaderHidden(True)
+        self.category_list.setRootIsDecorated(False)
+        self.category_list.setFixedWidth(140)
+        self.category_list.itemSelectionChanged.connect(self._sync_category_page)
+
+        self.pages = QStackedWidget()
+
+        basic_form = QFormLayout()
+        basic_form.addRow("Theme", self.theme_combo)
+
+        note_form = QFormLayout()
+        note_form.addRow("Note dot size", self.marker_size_spin)
+        note_form.addRow("Auto save", self.auto_save_note_checkbox)
+
+        display_form = QFormLayout()
+        display_form.addRow("Mouse wheel scroll lines", self.wheel_scroll_lines_spin)
+
+        shortcuts_form = QFormLayout()
+        shortcuts_form.addRow("Add selection shortcut", self.append_selection_shortcut_edit)
+
+        storage_form = QFormLayout()
+        storage_form.addRow("Data folder", data_label)
+        storage_form.addRow("Current note JSON", note_label)
+        storage_form.addRow("Markdown export base", markdown_label)
+        storage_form.addRow("Settings file", settings_label)
+        storage_form.addRow("Theme folder", theme_dir_label)
+
+        self._add_settings_page("Basic", basic_form)
+        self._add_settings_page("Notes", note_form)
+        self._add_settings_page("Page display", display_form)
+        self._add_settings_page("Storage", storage_form)
+        self._add_settings_page("Shortcuts", shortcuts_form)
+        self._add_settings_page("Other", QFormLayout())
+        self.category_list.setCurrentItem(self.category_list.topLevelItem(0))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        body = QHBoxLayout()
+        body.addWidget(self.category_list)
+        body.addWidget(self.pages, 1)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.addLayout(body, 1)
         layout.addWidget(buttons)
+
+    def _add_settings_page(self, title: str, form: QFormLayout) -> None:
+        page = QWidget()
+        form.setContentsMargins(18, 18, 18, 18)
+        form.setSpacing(12)
+        page.setLayout(form)
+        index = self.pages.addWidget(page)
+        item = QTreeWidgetItem([title])
+        item.setData(0, Qt.UserRole, index)
+        self.category_list.addTopLevelItem(item)
+
+    def _sync_category_page(self) -> None:
+        item = self.category_list.currentItem()
+        if item is None:
+            return
+        index = item.data(0, Qt.UserRole)
+        if index is not None:
+            self.pages.setCurrentIndex(int(index))
 
     @property
     def selected_theme(self) -> str:
@@ -1353,6 +1420,14 @@ class SettingsDialog(QDialog):
         sequence = self.append_selection_shortcut_edit.keySequence().toString(QKeySequence.PortableText)
         return sequence or "Ctrl+Shift+C"
 
+    @property
+    def wheel_scroll_lines(self) -> int:
+        return int(self.wheel_scroll_lines_spin.value())
+
+    @property
+    def auto_save_current_note(self) -> bool:
+        return self.auto_save_note_checkbox.isChecked()
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -1362,12 +1437,21 @@ class MainWindow(QMainWindow):
         self.resize(1180, 820)
 
         self.settings = load_settings()
+        self.resize(
+            clamp_window_dimension(self.settings.get("window_width"), 1180),
+            clamp_window_dimension(self.settings.get("window_height"), 820),
+        )
+        self.restore_window_maximized = bool(self.settings.get("window_maximized"))
+        if self.restore_window_maximized:
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
         self.themes = load_theme_files()
         self.theme_name = str(self.settings.get("theme") or "beige")
         if self.theme_name not in self.themes:
             self.theme_name = "beige"
             self.settings["theme"] = self.theme_name
         self.note_marker_radius = clamp_marker_radius(self.settings.get("note_marker_radius"))
+        self.wheel_scroll_lines = clamp_wheel_scroll_lines(self.settings.get("wheel_scroll_lines"))
+        self.auto_save_current_note = bool(self.settings.get("auto_save_current_note", True))
         self.document: fitz.Document | None = None
         self.pdf_path: Path | None = None
         self.pdf_key: str | None = None
@@ -1497,10 +1581,12 @@ class MainWindow(QMainWindow):
         self.main_stack.addWidget(self.history_panel)
         self.main_stack.addWidget(self.reader_splitter)
         self.setCentralWidget(self.main_stack)
+        self.statusBar().setSizeGripEnabled(False)
 
         self._build_toolbar()
         self._build_shortcuts()
         self._render_empty_state()
+        self._apply_wheel_scroll_lines()
         self.apply_theme()
         self.restore_last_session()
         self._refresh_actions()
@@ -1553,6 +1639,26 @@ class MainWindow(QMainWindow):
     def _refresh_append_selection_shortcut(self) -> None:
         self.append_selection_shortcut.setKey(self._append_selection_key_sequence())
 
+    def _apply_wheel_scroll_lines(self) -> None:
+        lines = clamp_wheel_scroll_lines(self.wheel_scroll_lines)
+        self.wheel_scroll_lines = lines
+        app = QApplication.instance()
+        if app is not None:
+            app.setWheelScrollLines(lines)
+
+    def _save_runtime_settings(self) -> None:
+        normal_geometry = self.normalGeometry()
+        width = normal_geometry.width() if self.isMaximized() and normal_geometry.isValid() else self.width()
+        height = normal_geometry.height() if self.isMaximized() and normal_geometry.isValid() else self.height()
+        self.settings["window_width"] = clamp_window_dimension(width, 1180)
+        self.settings["window_height"] = clamp_window_dimension(height, 820)
+        self.settings["window_maximized"] = self.isMaximized()
+        self.settings["theme"] = self.theme_name
+        self.settings["note_marker_radius"] = self.note_marker_radius
+        self.settings["wheel_scroll_lines"] = self.wheel_scroll_lines
+        self.settings["auto_save_current_note"] = self.auto_save_current_note
+        save_settings(self.settings)
+
     def _set_app_icon(self) -> None:
         frozen_base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
         candidates = [
@@ -1596,12 +1702,17 @@ class MainWindow(QMainWindow):
         self.settings["theme"] = self.theme_name
         self.note_marker_radius = dialog.marker_radius
         self.settings["note_marker_radius"] = self.note_marker_radius
+        self.wheel_scroll_lines = dialog.wheel_scroll_lines
+        self.settings["wheel_scroll_lines"] = self.wheel_scroll_lines
+        self.auto_save_current_note = dialog.auto_save_current_note
+        self.settings["auto_save_current_note"] = self.auto_save_current_note
         self.settings["append_selection_shortcut"] = dialog.append_selection_shortcut
         save_settings(self.settings)
         self._refresh_append_selection_shortcut()
+        self._apply_wheel_scroll_lines()
         self.themes = load_theme_files()
         self.apply_theme()
-        self.render_page(render_neighbors=False)
+        self.render_page_preserving_view(render_neighbors=False)
 
     def open_pdf(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
@@ -1627,17 +1738,30 @@ class MainWindow(QMainWindow):
         self._cache_page_base_sizes()
         if restore_last_page and entry is not None:
             self.page_index = min(entry.last_page_index, max(document.page_count - 1, 0))
+            self.zoom = entry.zoom
+            self.fit_mode = entry.fit_mode or None
         else:
             self.page_index = 0
+            self.zoom = 1.25
+            self.fit_mode = None
         self.note_panel.set_note(None)
         self._refresh_note_selector()
-        self._record_current_pdf()
         self.outline_panel.set_outline(document.get_toc())
         self.outline_panel.set_bookmarks(self.bookmarks)
-        self.render_page()
         self.show_reader()
+        if self.fit_mode is None:
+            self.render_page()
+        else:
+            self._apply_fit_mode(anchor_page=self.page_index)
+            self._schedule_fit_refresh(anchor_page=self.page_index)
+        restored_note = find_note(self.notes, entry.last_note_id) if restore_last_page and entry is not None else None
+        if restored_note is not None:
+            self.note_panel.set_note(restored_note)
+            self._refresh_note_selector(restored_note.id)
+        self._record_current_pdf()
 
     def close_document(self) -> None:
+        self._auto_save_current_note()
         self._record_current_pdf()
         if self.document is not None:
             self.document.close()
@@ -1653,12 +1777,18 @@ class MainWindow(QMainWindow):
     def _record_current_pdf(self) -> None:
         if self.document is None or self.pdf_path is None or self.pdf_key is None:
             return
+        current_note_id = self.note_panel.current_note_id
+        if current_note_id is not None and find_note(self.notes, current_note_id) is None:
+            current_note_id = None
         upsert_history_entry(
             self.history_entries,
             pdf_key=self.pdf_key,
             path=self.pdf_path,
             page_count=self.document.page_count,
             last_page_index=self.page_index,
+            last_note_id=current_note_id or "",
+            zoom=self.zoom,
+            fit_mode=self.fit_mode or "",
         )
         save_history(self.history_entries)
         self.history_panel.set_entries(self.history_entries)
@@ -1763,16 +1893,47 @@ class MainWindow(QMainWindow):
             self.render_page(render_neighbors=render_neighbors)
             return
 
-        scroll_bar = self.scroll_area.verticalScrollBar()
-        scroll_value = scroll_bar.value()
-        page_index = self.page_index
+        view = self._current_view_snapshot()
         self.render_page(center_current=False, render_neighbors=render_neighbors)
+        self._restore_view_snapshot(view)
+
+    def _current_view_snapshot(self) -> tuple[int, int] | None:
+        if self.document is None or not self.continuous_scroll:
+            return None
+        scroll_value = self.scroll_area.verticalScrollBar().value()
+        page_index = self.page_index
+        if self.page_tops and self.page_heights:
+            visible_y = scroll_value + 1
+            for candidate, page_top in enumerate(self.page_tops):
+                page_bottom = page_top + self.page_heights[candidate]
+                if page_top <= visible_y <= page_bottom:
+                    page_index = candidate
+                    break
+        if not self._has_page_geometry(page_index):
+            return page_index, scroll_value
+        return page_index, scroll_value - self.page_tops[page_index]
+
+    def _restore_view_snapshot(self, snapshot: tuple[int, int] | None) -> None:
+        if snapshot is None:
+            return
+        page_index, page_offset = snapshot
+        self._restore_page_offset(page_index, page_offset)
+        for delay in (0, 50, 150):
+            QTimer.singleShot(delay, lambda page=page_index, offset=page_offset: self._restore_page_offset(page, offset))
+
+    def _restore_page_offset(self, page_index: int, page_offset: int) -> None:
+        if self.document is None:
+            return
+        if self._has_page_geometry(page_index):
+            scroll_value = self.page_tops[page_index] + page_offset
+        else:
+            scroll_value = page_offset
         self._restore_scroll_position(scroll_value, page_index)
-        QTimer.singleShot(0, lambda value=scroll_value, page=page_index: self._restore_scroll_position(value, page))
 
     def _restore_scroll_position(self, scroll_value: int, page_index: int) -> None:
         if self.document is None:
             return
+        self._pending_scroll_id += 1
         scroll_bar = self.scroll_area.verticalScrollBar()
         was_suppressed = self._suppress_scroll_sync
         self._suppress_scroll_sync = True
@@ -2004,6 +2165,7 @@ class MainWindow(QMainWindow):
         else:
             raise TypeError("add_note expects x/y or page_index/x/y")
 
+        self._auto_save_current_note()
         note_number = self._allocate_note_number(page_index)
         note = Note.create(
             pdf_key=self.pdf_key,
@@ -2023,6 +2185,7 @@ class MainWindow(QMainWindow):
     def add_text_annotation(self, page_index: int, note_type: str, rects_norm: list, selected_text: str, color: str = "") -> None:
         if self.document is None or self.pdf_key is None or not rects_norm:
             return
+        self._auto_save_current_note()
         cleaned_rects = []
         for rect in rects_norm:
             if isinstance(rect, list | tuple) and len(rect) == 4:
@@ -2054,9 +2217,28 @@ class MainWindow(QMainWindow):
         self._refresh_note_selector(note.id)
 
     def select_note(self, note_id: str) -> None:
+        if note_id != self.note_panel.current_note_id:
+            self._auto_save_current_note()
         note = find_note(self.notes, note_id)
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id if note else None)
+
+    def _auto_save_current_note(self) -> None:
+        if not self.auto_save_current_note:
+            return
+        note_id = self.note_panel.current_note_id
+        if note_id is None:
+            return
+        note = find_note(self.notes, note_id)
+        if note is None:
+            self.note_panel.set_note(None)
+            return
+        markdown = self.note_panel.editor.toPlainText()
+        if note.markdown == markdown:
+            return
+        note.update_markdown(markdown)
+        self.persist_notes()
+        self._refresh_note_selector(note.id)
 
     def set_note_color(self, note_id: str, color: str) -> None:
         note = find_note(self.notes, note_id)
@@ -2184,9 +2366,11 @@ class MainWindow(QMainWindow):
         self.render_page_preserving_view()
 
     def reset_note_counters_to_current_notes(self) -> None:
+        view = self._current_view_snapshot()
         self._rebuild_note_counters_from_current_note_counts()
         self.persist_notes()
         self.statusBar().showMessage("Reset note numbering to current note counts.", 5000)
+        self._restore_view_snapshot(view)
 
     def _refresh_note_selector(self, current_note_id: str | None = None) -> None:
         current = current_note_id if current_note_id is not None else self.note_panel.current_note_id
@@ -2216,23 +2400,28 @@ class MainWindow(QMainWindow):
     def add_bookmark_for_page(self, page_index: int) -> None:
         if self.document is None or self.pdf_key is None:
             return
+        view = self._current_view_snapshot()
         page_index = max(0, min(int(page_index), self.document.page_count - 1))
         default_title = self._note_location_label(page_index) or f"Page {page_index + 1}"
         title, accepted = QInputDialog.getText(self, "Add bookmark", "Bookmark title:", text=default_title)
         if not accepted:
+            self._restore_view_snapshot(view)
             return
         bookmark = Bookmark.create(pdf_key=self.pdf_key, page_index=page_index, title=title)
         self.bookmarks.append(bookmark)
         self.persist_notes()
         self.outline_panel.set_bookmarks(self.bookmarks)
+        self._restore_view_snapshot(view)
 
     def delete_bookmark(self, bookmark_id: str) -> None:
+        view = self._current_view_snapshot()
         before = len(self.bookmarks)
         self.bookmarks = [bookmark for bookmark in self.bookmarks if bookmark.id != bookmark_id]
         if len(self.bookmarks) == before:
             return
         self.persist_notes()
         self.outline_panel.set_bookmarks(self.bookmarks)
+        self._restore_view_snapshot(view)
 
     def add_outline_item(self) -> None:
         self._add_outline_item(as_child=False)
@@ -2464,12 +2653,8 @@ class MainWindow(QMainWindow):
         if self.document is None:
             return
         self.page_index = max(0, min(page_index, self.document.page_count - 1))
-        self.note_panel.set_note(None)
         self._record_current_pdf()
-        if self.continuous_scroll:
-            self.render_page()
-        else:
-            self.render_page()
+        self.render_page()
 
     def go_to_page_number(self, page_number: int) -> None:
         if self.document is None or page_number < 1:
@@ -2570,7 +2755,6 @@ class MainWindow(QMainWindow):
         if self.continuous_scroll == next_continuous:
             return
         self.continuous_scroll = next_continuous
-        self.note_panel.set_note(None)
         self.render_page()
 
     def change_zoom(self, delta: float, *, clear_fit: bool = True) -> None:
@@ -2885,6 +3069,7 @@ class MainWindow(QMainWindow):
             widget.setAutoFillBackground(True)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._save_runtime_settings()
         self.close_document()
         super().closeEvent(event)
 
@@ -2892,7 +3077,10 @@ class MainWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.show()
+    if window.restore_window_maximized:
+        window.showMaximized()
+    else:
+        window.show()
     return app.exec()
 
 

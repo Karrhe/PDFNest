@@ -16,7 +16,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QToolBar, QToolButton, QWidget
 from PySide6.QtWidgets import QMessageBox
 
-from pdf_notes_reader.history import PdfHistoryEntry, save_history
+from pdf_notes_reader.history import PdfHistoryEntry, load_history, save_history
 from pdf_notes_reader.main import MainWindow, PdfCanvas, SettingsDialog
 from pdf_notes_reader.main import render_markdown_preview
 from pdf_notes_reader.notes import default_data_dir
@@ -351,6 +351,103 @@ class GuiSmokeTest(unittest.TestCase):
             second_window.load_pdf(pdf_path)
             self.assertEqual(second_window.page_index, 2)
             second_window.close()
+
+    def test_reopens_pdf_with_current_note_and_autosaved_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "notes-restore.pdf"
+            self._create_sample_pdf(pdf_path, page_count=3)
+
+            first_window = MainWindow()
+            try:
+                first_window.load_pdf(pdf_path)
+                first_window.add_note(1, 0.25, 0.30)
+                first_note_id = first_window.note_panel.current_note_id
+                first_window.note_panel.editor.setPlainText("# First edited without manual save\nBody")
+
+                first_window.add_note(1, 0.50, 0.30)
+                second_note_id = first_window.note_panel.current_note_id
+                first_window.note_panel.editor.setPlainText("# Second left open\nDraft")
+            finally:
+                first_window.close()
+
+            notes = load_notes(pdf_key_for_path(pdf_path))
+            note_text_by_id = {note.id: note.markdown for note in notes}
+            self.assertEqual(note_text_by_id[first_note_id], "# First edited without manual save\nBody")
+            self.assertEqual(note_text_by_id[second_note_id], "# Second left open\nDraft")
+            self.assertEqual(load_history()[0].last_note_id, second_note_id)
+
+            second_window = MainWindow()
+            try:
+                self.assertEqual(second_window.pdf_path, pdf_path)
+                self.assertEqual(second_window.page_index, 1)
+                self.assertEqual(second_window.note_panel.current_note_id, second_note_id)
+                self.assertIn("# Second left open", second_window.note_panel.editor.toPlainText())
+            finally:
+                second_window.close()
+
+    def test_reopens_window_size_and_pdf_view_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "view-state.pdf"
+            self._create_sample_pdf(pdf_path, page_count=4)
+
+            first_window = MainWindow()
+            try:
+                first_window.resize(1010, 710)
+                first_window.show()
+                self.app.processEvents()
+                first_window.load_pdf(pdf_path)
+                first_window.go_to_page(2)
+                first_window.set_zoom_percent(175)
+            finally:
+                first_window.close()
+
+            saved_settings = load_settings()
+            self.assertAlmostEqual(load_history()[0].zoom, 1.75)
+            second_window = MainWindow()
+            try:
+                self.assertEqual(second_window.width(), saved_settings["window_width"])
+                self.assertEqual(second_window.height(), saved_settings["window_height"])
+                self.assertEqual(second_window.page_index, 2)
+                self.assertIsNone(second_window.fit_mode)
+                self.assertAlmostEqual(second_window.zoom, 1.75)
+                second_window.fit_page("height")
+            finally:
+                second_window.close()
+
+            third_window = MainWindow()
+            try:
+                self.assertEqual(third_window.page_index, 2)
+                self.assertEqual(third_window.fit_mode, "height")
+            finally:
+                third_window.close()
+
+    def test_reopens_maximized_window_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            window = MainWindow()
+            try:
+                window.resize(960, 680)
+                window.showMaximized()
+                self.app.processEvents()
+            finally:
+                window.close()
+
+            settings = load_settings()
+            self.assertTrue(settings["window_maximized"])
+            self.assertGreaterEqual(settings["window_width"], 640)
+            self.assertGreaterEqual(settings["window_height"], 640)
+
+            restored = MainWindow()
+            try:
+                self.assertTrue(restored.restore_window_maximized)
+                self.assertTrue(bool(restored.windowState() & Qt.WindowMaximized))
+            finally:
+                restored.close()
 
     def test_scroll_position_is_saved_as_last_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -932,6 +1029,11 @@ class GuiSmokeTest(unittest.TestCase):
                 window.note_panel.note_selector.setCurrentIndex(index)
                 window.note_panel._emit_selected_note(index)
                 self.assertEqual(window.note_panel.current_note_id, second_id)
+
+                window.go_to_page(4)
+                self.assertEqual(window.note_panel.current_note_id, second_id)
+                self.assertIn("# page-4-2", window.note_panel.editor.toPlainText())
+                self.assertEqual(window.note_panel.note_selector.currentData(), second_id)
             finally:
                 window.close()
 
@@ -992,11 +1094,21 @@ class GuiSmokeTest(unittest.TestCase):
                 window.note_marker_radius = 13
                 window.settings["note_marker_radius"] = 13
                 window.settings["theme"] = "white"
+                window.settings["wheel_scroll_lines"] = 9
+                window.settings["auto_save_current_note"] = False
+                window.settings["window_width"] = 900
+                window.settings["window_height"] = 700
+                window.settings["window_maximized"] = True
                 save_settings(window.settings)
 
                 settings = load_settings()
                 self.assertEqual(settings["note_marker_radius"], 13)
                 self.assertEqual(settings["theme"], "white")
+                self.assertEqual(settings["wheel_scroll_lines"], 9)
+                self.assertFalse(settings["auto_save_current_note"])
+                self.assertEqual(settings["window_width"], 900)
+                self.assertEqual(settings["window_height"], 700)
+                self.assertTrue(settings["window_maximized"])
                 self.assertNotIn("themes", settings)
                 self.assertIn("beige", load_theme_files())
                 self.assertTrue((data_dir / "themes" / "beige.json").exists())
@@ -1023,11 +1135,21 @@ class GuiSmokeTest(unittest.TestCase):
             try:
                 dialog.setStyleSheet(window.styleSheet())
                 dialog.append_selection_shortcut_edit.setKeySequence(QKeySequence("Alt+C"))
+                dialog.wheel_scroll_lines_spin.setValue(11)
+                dialog.auto_save_note_checkbox.setChecked(False)
                 labels = [label.text() for label in dialog.findChildren(QLabel)]
+                categories = [
+                    dialog.category_list.topLevelItem(index).text(0)
+                    for index in range(dialog.category_list.topLevelItemCount())
+                ]
                 self.assertIn("QDialog", window.styleSheet())
                 self.assertNotIn("Theme files", labels)
                 self.assertIn("Theme folder", labels)
+                self.assertIn("Page display", categories)
+                self.assertIn("Storage", categories)
                 self.assertEqual(dialog.append_selection_shortcut, "Alt+C")
+                self.assertEqual(dialog.wheel_scroll_lines, 11)
+                self.assertFalse(dialog.auto_save_current_note)
             finally:
                 dialog.close()
                 window.close()
@@ -1146,18 +1268,34 @@ class GuiSmokeTest(unittest.TestCase):
             tmp_path = Path(tmp)
             os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
             pdf_path = tmp_path / "bookmarks.pdf"
-            self._create_sample_pdf(pdf_path, page_count=3)
+            self._create_sample_pdf(pdf_path, page_count=6)
 
             window = MainWindow()
             try:
+                window.resize(900, 600)
+                window.show()
                 window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.scroll_area.verticalScrollBar().setValue(window.page_tops[2] + 40)
+                self.app.processEvents()
+                window._sync_current_page_from_scroll()
+                before_scroll = window.scroll_area.verticalScrollBar().value()
+                before_offset = before_scroll - window.page_tops[2]
+
                 with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("Bookmark title", True)):
                     window.add_bookmark_for_page(1)
 
                 self.assertEqual(len(window.bookmarks), 1)
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - before_scroll), 2)
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - window.page_tops[2] - before_offset), 2)
                 _notes, _counters, bookmarks = load_notes_data(window.pdf_key)
                 self.assertEqual(bookmarks[0].title, "Bookmark title")
                 self.assertEqual(bookmarks[0].page_index, 1)
+
+                window.reset_note_counters_to_current_notes()
+                self.app.processEvents()
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - before_scroll), 2)
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - window.page_tops[2] - before_offset), 2)
 
                 item = window.outline_panel.bookmark_tree.topLevelItem(0)
                 window.go_to_page(0)
