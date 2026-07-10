@@ -5,7 +5,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from pdf_notes_reader.notes import default_data_dir, pdf_key_for_path, utc_now
+from pdf_notes_reader.notes import default_data_dir, notebook_dir_for_pdf, pdf_key_for_path, root_sync_lock_path, utc_now
+from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock
 
 
 @dataclass
@@ -46,6 +47,10 @@ class PdfHistoryEntry:
 
 
 def history_path(data_dir: Path | None = None) -> Path:
+    return (data_dir or default_data_dir()) / "recentnotes.json"
+
+
+def legacy_history_path(data_dir: Path | None = None) -> Path:
     return (data_dir or default_data_dir()) / "pdf_history.json"
 
 
@@ -65,12 +70,14 @@ def normalize_fit_mode(value: Any) -> str:
 def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
     path = history_path(data_dir)
     if not path.exists():
+        path = legacy_history_path(data_dir)
+    if not path.exists():
         return []
 
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
-    raw_entries = payload.get("entries", [])
+    raw_entries = payload if isinstance(payload, list) else payload.get("entries", [])
     if not isinstance(raw_entries, list):
         return []
 
@@ -81,19 +88,40 @@ def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
     return sorted(entries, key=lambda entry: entry.updated_at, reverse=True)
 
 
-def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None) -> Path:
+def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *, touched_pdf_keys: set[str] | None = None) -> Path:
     path = history_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": 1,
+        "app": "PDFNest",
         "entries": [entry.to_dict() for entry in entries],
     }
-    tmp_path = path.with_suffix(".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    tmp_path.replace(path)
+    _atomic_write_json(path, payload)
+    _write_sync_lock(root_sync_lock_path(data_dir))
+    touched = touched_pdf_keys
+    for entry in entries:
+        if touched is not None and entry.pdf_key not in touched:
+            continue
+        _save_notebook_recent_file(entry, data_dir)
     return path
+
+
+def _save_notebook_recent_file(entry: PdfHistoryEntry, data_dir: Path | None = None) -> None:
+    notebook_dir = notebook_dir_for_pdf(entry.path, entry.pdf_key, data_dir)
+    notebook_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(notebook_dir / "manifest.json", _manifest_payload(pdf_key=entry.pdf_key, pdf_path=entry.path, page_count=entry.page_count))
+    if not (notebook_dir / "markups.json").exists():
+        _atomic_write_json(notebook_dir / "markups.json", _markups_payload([]))
+    recent_payload = [
+        {
+            "~docid": 0,
+            "~entry": "",
+            "~mod": entry.updated_at,
+            "~view": [entry.last_page_index, -1, round(entry.zoom * 100, 4), 0, 0, False, 0, False, 0, False, False, False, ""],
+        }
+    ]
+    _atomic_write_json(notebook_dir / "recentfile.json", recent_payload)
+    _write_sync_lock(notebook_dir / "sync.lock")
+    _ensure_cover(entry.path, notebook_dir)
 
 
 def find_history_entry(entries: list[PdfHistoryEntry], pdf_key: str) -> PdfHistoryEntry | None:

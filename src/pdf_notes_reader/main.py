@@ -4,13 +4,14 @@ import hashlib
 import html
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -20,10 +21,12 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QKeySequenceEdit,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -35,6 +38,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTabBar,
     QTabWidget,
     QTextBrowser,
     QToolButton,
@@ -53,15 +57,25 @@ from pdf_notes_reader.history import (
     save_history,
     upsert_history_entry,
 )
+from pdf_notes_reader.library import (
+    LibraryFolder,
+    LibraryState,
+    UNFILED_FOLDER_ID,
+    load_library,
+    save_library,
+)
 from pdf_notes_reader.notes import (
     Bookmark,
     Note,
+    app_local_data_dir,
     default_data_dir,
     find_note,
     load_notes_data,
+    notebook_dir_for_key,
     notes_path_for_key,
     pdf_key_for_path,
     save_notes,
+    utc_now,
 )
 from pdf_notes_reader.settings import (
     clamp_marker_radius,
@@ -73,9 +87,82 @@ from pdf_notes_reader.settings import (
     settings_path,
     themes_dir,
 )
+from pdf_notes_reader.storage_migration import migrate_storage
 
 
 APP_TITLE = "PDFNest"
+
+
+@dataclass
+class PdfTabState:
+    pdf_key: str
+    pdf_path: Path
+    document: fitz.Document
+    notes: list[Note]
+    note_counters: dict[str, int]
+    bookmarks: list[Bookmark]
+    page_index: int
+    zoom: float
+    fit_mode: str | None
+    current_note_id: str = ""
+    page_text_words_cache: dict[int, list[dict[str, object]]] | None = None
+
+
+class ElidedLabel(QLabel):
+    def __init__(self, text: str = "", *, mode: Qt.TextElideMode = Qt.ElideRight) -> None:
+        super().__init__()
+        self._full_text = ""
+        self._elide_mode = mode
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        self._full_text = text
+        self.setToolTip(text)
+        self._refresh_elided_text()
+
+    def full_text(self) -> str:
+        return self._full_text
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._refresh_elided_text()
+
+    def _refresh_elided_text(self) -> None:
+        available_width = max(0, self.width() - 2)
+        if available_width <= 0:
+            super().setText(self._full_text)
+            return
+        super().setText(self.fontMetrics().elidedText(self._full_text, self._elide_mode, available_width))
+
+
+class LibraryFolderTree(QTreeWidget):
+    folder_drop_requested = Signal(str, str)
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().paintEvent(event)
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor(58, 58, 58), 1, Qt.SolidLine, Qt.SquareCap, Qt.MiterJoin))
+        item = self.topLevelItem(0)
+        while item is not None:
+            if item.childCount():
+                rect = self.visualItemRect(item)
+                if rect.isValid() and rect.intersects(event.rect()):
+                    x = max(3, rect.left() - 14)
+                    cy = rect.center().y()
+                    if item.isExpanded():
+                        painter.drawLine(x, cy - 2, x + 4, cy + 2)
+                        painter.drawLine(x + 4, cy + 2, x + 8, cy - 2)
+                    else:
+                        painter.drawLine(x + 2, cy - 4, x + 6, cy)
+                        painter.drawLine(x + 6, cy, x + 2, cy + 4)
+            item = self.itemBelow(item)
+        painter.end()
 
 ANNOTATION_COLORS = [
     ("Yellow", "#fde047"),
@@ -959,105 +1046,815 @@ class NotePanel(QWidget):
 
 class HistoryPanel(QWidget):
     open_requested = Signal(str)
+    archive_requested = Signal(str)
     remove_requested = Signal(str)
+    export_requested = Signal(str)
+    add_notebook_requested = Signal(str)
+    rename_requested = Signal(str, str)
+    restore_requested = Signal(str)
     settings_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.entries: list[PdfHistoryEntry] = []
+        self.library_state = load_library()
+        self.folder_filter = ""
+        self.home_mode = "recent"
+        self.view_mode = "list"
+        self.sort_mode = "time"
+        self.selected_pdf_key = ""
+        self._cover_cache: dict[tuple[str, int, int], QPixmap] = {}
+        self._entry_by_key: dict[str, PdfHistoryEntry] = {}
+        self._folder_by_id: dict[str, LibraryFolder] = {}
+        self._folder_children: dict[str, list[LibraryFolder]] = {}
+        self._folder_counts: dict[str, int] = {}
+        self._list_column_sizes = [520, 110, 110, 80, 360]
+        self._list_row_splitters: list[QSplitter] = []
+        self._syncing_list_splitters = False
+        self._dragging_pdf_key = ""
+        self._drag_cursor_active = False
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
-        self.list_container = QWidget()
-        self.list_layout = QVBoxLayout(self.list_container)
-        self.list_layout.setContentsMargins(0, 0, 0, 0)
-        self.list_layout.setSpacing(10)
-        self.list_layout.setAlignment(Qt.AlignTop)
+        self.recent_button = self._nav_button("recent.png", "Recent", "HomeRecentButton")
+        self.notebooks_button = self._nav_button("notebooks.png", "Notebooks", "HomeNotebooksButton")
+        self.trash_button = self._nav_button("note-del.png", "Archive", "HomeArchiveButton")
+        self.recent_button.clicked.connect(lambda: self._set_home_mode("recent"))
+        self.notebooks_button.clicked.connect(lambda: self._set_home_mode("notebooks"))
+        self.trash_button.clicked.connect(lambda: self._set_home_mode("archive"))
 
-        scroll = QScrollArea()
-        scroll.setWidget(self.list_container)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
+        self.folder_tree = LibraryFolderTree()
+        self.folder_tree.setObjectName("LibraryFolderTree")
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setMinimumWidth(250)
+        self.folder_tree.itemSelectionChanged.connect(self._handle_folder_selection)
+        self.folder_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
+        self.folder_tree.folder_drop_requested.connect(self._assign_entry_folder)
 
         title = QLabel("Recent PDFs")
         title.setObjectName("HistoryTitle")
-        settings_button = QPushButton("Settings")
-        settings_button.clicked.connect(self.settings_requested.emit)
-        header = QHBoxLayout()
-        header.addWidget(title)
-        header.addStretch(1)
-        header.addWidget(settings_button)
+        self.title_label = title
+        self.folder_count_label = QLabel("(0)")
+        self.folder_count_label.setObjectName("LibraryCountLabel")
 
-        hint = QLabel("Open a previous PDF from its absolute path. Missing files can be relocated.")
-        hint.setObjectName("HistoryHint")
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("LibrarySearch")
+        self.search_edit.setPlaceholderText("Search notebooks")
+        self.search_edit.textChanged.connect(self._rebuild_files)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.setObjectName("LibrarySortCombo")
+        self.sort_combo.addItem("Time", "time")
+        self.sort_combo.addItem("Name", "name")
+        self.sort_combo.currentIndexChanged.connect(self._set_sort_from_combo)
+
+        self.new_notebook_button = self._icon_tool_button("new-notebook.png", "Add planned PDF", "LibraryNewNotebookButton")
+        self.new_notebook_button.clicked.connect(lambda: self.add_notebook_requested.emit(self.folder_filter if self.home_mode == "notebooks" else ""))
+        self.new_folder_button = self._icon_tool_button("new-notegroup.png", "New folder", "LibraryNewFolderButton")
+        self.new_folder_button.clicked.connect(lambda: self._create_virtual_folder(parent_id=self.folder_filter))
+        self.view_toggle_button = self._icon_tool_button("iconmode.png", "Icon view", "LibraryViewToggleButton")
+        self.view_toggle_button.clicked.connect(self._toggle_view_mode)
+        self.list_mode_button = self.view_toggle_button
+        self.icon_mode_button = self.view_toggle_button
+
+        self.settings_button = QToolButton()
+        self.settings_button.setObjectName("HomeSettingsButton")
+        self.settings_button.setIcon(pic_icon("settings.png"))
+        self.settings_button.setIconSize(QSize(22, 22))
+        self.settings_button.setToolTip("Settings")
+        self.settings_button.setAutoRaise(True)
+        self.settings_button.clicked.connect(self.settings_requested.emit)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        header.addWidget(title)
+        header.addWidget(self.folder_count_label)
+        header.addStretch(1)
+        header.addWidget(self.search_edit, 2)
+        header.addWidget(self.sort_combo)
+        header.addWidget(self.new_notebook_button)
+        header.addWidget(self.new_folder_button)
+        header.addWidget(self.view_toggle_button)
+        header.addWidget(self.settings_button)
+
+        self.content_stack = QStackedWidget()
+        self.list_container = QWidget()
+        self.list_layout = QVBoxLayout(self.list_container)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setSpacing(0)
+        self.list_layout.setAlignment(Qt.AlignTop)
+
+        list_scroll = QScrollArea()
+        list_scroll.setWidget(self.list_container)
+        list_scroll.setWidgetResizable(True)
+        list_scroll.setFrameShape(QScrollArea.NoFrame)
+
+        self.grid_container = QWidget()
+        self.grid_layout = QGridLayout(self.grid_container)
+        self.grid_layout.setContentsMargins(16, 16, 16, 16)
+        self.grid_layout.setHorizontalSpacing(28)
+        self.grid_layout.setVerticalSpacing(28)
+        self.grid_layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+
+        grid_scroll = QScrollArea()
+        grid_scroll.setWidget(self.grid_container)
+        grid_scroll.setWidgetResizable(True)
+        grid_scroll.setFrameShape(QScrollArea.NoFrame)
+
+        self.content_stack.addWidget(list_scroll)
+        self.content_stack.addWidget(grid_scroll)
+
+        left_panel = QWidget()
+        left_panel.setObjectName("LibraryLeftPanel")
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(12, 10, 0, 10)
+        left_layout.setSpacing(8)
+        tree_title = QLabel("Folders")
+        tree_title.setObjectName("LibrarySidebarTitle")
+        left_layout.addWidget(tree_title)
+        left_layout.addWidget(self.folder_tree, 1)
+
+        nav_panel = QWidget()
+        nav_panel.setObjectName("HomeNavPanel")
+        nav_layout = QVBoxLayout(nav_panel)
+        nav_layout.setContentsMargins(6, 8, 6, 8)
+        nav_layout.setSpacing(8)
+        nav_layout.addWidget(self.recent_button)
+        nav_layout.addWidget(self.notebooks_button)
+        nav_layout.addWidget(self.trash_button)
+        nav_layout.addStretch(1)
+
+        right_panel = QWidget()
+        right_panel.setObjectName("LibraryRightPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(12, 10, 10, 10)
+        right_layout.setSpacing(10)
+        right_layout.addLayout(header)
+        right_layout.addWidget(self.content_stack, 1)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("LibrarySplitter")
+        splitter.addWidget(left_panel)
+        splitter.addWidget(right_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([340, 900])
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(28, 24, 28, 24)
-        layout.setSpacing(12)
-        layout.addLayout(header)
-        layout.addWidget(hint)
-        layout.addWidget(scroll, 1)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(nav_panel, 0)
+        row.addWidget(splitter, 1)
+        layout.addLayout(row, 1)
+        self._set_home_mode("recent")
 
     def set_entries(self, entries: list[PdfHistoryEntry]) -> None:
         self.entries = entries
-        self._rebuild()
+        self._entry_by_key = {entry.pdf_key: entry for entry in entries}
+        self.library_state = load_library()
+        self._rebuild_library_indexes()
+        self._rebuild_folders()
+        self._rebuild_files()
 
-    def _rebuild(self) -> None:
-        while self.list_layout.count():
-            item = self.list_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
+    @staticmethod
+    def _nav_button(icon_name: str, tooltip: str, object_name: str) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName(object_name)
+        button.setIcon(pic_icon(icon_name))
+        button.setIconSize(QSize(30, 30))
+        button.setToolTip(tooltip)
+        button.setCheckable(True)
+        button.setAutoRaise(True)
+        button.setFixedSize(48, 48)
+        return button
 
-        if not self.entries:
-            empty = QLabel("No PDFs opened yet.")
-            empty.setObjectName("HistoryEmpty")
-            self.list_layout.addWidget(empty)
+    @staticmethod
+    def _mode_button(icon_name: str, tooltip: str, object_name: str) -> QToolButton:
+        return HistoryPanel._icon_tool_button(icon_name, tooltip, object_name, checkable=True)
+
+    @staticmethod
+    def _icon_tool_button(icon_name: str, tooltip: str, object_name: str, *, checkable: bool = False) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName(object_name)
+        button.setIcon(pic_icon(icon_name))
+        button.setIconSize(QSize(22, 22))
+        button.setToolTip(tooltip)
+        button.setCheckable(checkable)
+        button.setAutoRaise(True)
+        button.setFixedSize(34, 34)
+        return button
+
+    def _set_home_mode(self, mode: str) -> None:
+        self.home_mode = mode if mode in {"recent", "notebooks", "archive"} else "recent"
+        self.recent_button.setChecked(self.home_mode == "recent")
+        self.notebooks_button.setChecked(self.home_mode == "notebooks")
+        self.trash_button.setChecked(self.home_mode == "archive")
+        self.title_label.setText({"recent": "Recent PDFs", "notebooks": "Notebooks", "archive": "Archive"}[self.home_mode])
+        self.folder_tree.parentWidget().setVisible(self.home_mode == "notebooks")
+        self.new_folder_button.setVisible(self.home_mode == "notebooks")
+        self._rebuild_files()
+
+    def _set_sort_from_combo(self) -> None:
+        self.sort_mode = str(self.sort_combo.currentData() or "time")
+        self._rebuild_library_indexes()
+        self._rebuild_folders()
+        self._rebuild_files()
+
+    def _set_view_mode(self, mode: str) -> None:
+        self.view_mode = "icon" if mode == "icon" else "list"
+        self.content_stack.setCurrentIndex(1 if self.view_mode == "icon" else 0)
+        self._refresh_view_toggle_button()
+        self._rebuild_files()
+
+    def _toggle_view_mode(self) -> None:
+        self._set_view_mode("icon" if self.view_mode == "list" else "list")
+
+    def _refresh_view_toggle_button(self) -> None:
+        if self.view_mode == "list":
+            self.view_toggle_button.setIcon(pic_icon("iconmode.png"))
+            self.view_toggle_button.setToolTip("Icon view")
+        else:
+            self.view_toggle_button.setIcon(pic_icon("listmode.png"))
+            self.view_toggle_button.setToolTip("List view")
+
+    def _entry_folder_id(self, entry: PdfHistoryEntry) -> str:
+        return self.library_state.assignments.get(entry.pdf_key, UNFILED_FOLDER_ID)
+
+    def _rebuild_library_indexes(self) -> None:
+        self._folder_by_id = {folder.id: folder for folder in self.library_state.folders}
+        self._folder_children = {"": []}
+        for folder in self.library_state.folders:
+            self._folder_children.setdefault(folder.parent_id, []).append(folder)
+            self._folder_children.setdefault(folder.id, [])
+        for children in self._folder_children.values():
+            unfiled = [folder for folder in children if folder.id == UNFILED_FOLDER_ID]
+            sortable = [folder for folder in children if folder.id != UNFILED_FOLDER_ID]
+            if self.sort_mode == "name":
+                sortable.sort(key=lambda item: (item.name.casefold(), item.created_at))
+            else:
+                sortable.sort(key=lambda item: item.created_at, reverse=True)
+            children[:] = unfiled + sortable
+        self._folder_counts = {folder.id: 0 for folder in self.library_state.folders}
+        for entry in self.entries:
+            folder_id = self._entry_folder_id(entry)
+            if folder_id in self._folder_counts:
+                self._folder_counts[folder_id] += 1
+
+    def _folder_descendant_ids(self, folder_id: str) -> set[str]:
+        result = {folder_id} if folder_id else set()
+        pending = list(self._folder_children.get(folder_id, []))
+        while pending:
+            folder = pending.pop()
+            if folder.id in result:
+                continue
+            result.add(folder.id)
+            pending.extend(self._folder_children.get(folder.id, []))
+        return result
+
+    def _folder_total_count(self, folder_id: str) -> int:
+        if not folder_id:
+            return len(self.entries)
+        return sum(self._folder_counts.get(folder, 0) for folder in self._folder_descendant_ids(folder_id))
+
+    def _entry_matches_folder(self, entry: PdfHistoryEntry) -> bool:
+        archived = entry.pdf_key in self.library_state.archived
+        if self.home_mode == "archive":
+            return archived
+        if archived:
+            return False
+        if self.home_mode == "recent":
+            return True
+        if not self.folder_filter:
+            return True
+        if self.folder_filter == UNFILED_FOLDER_ID:
+            return self._entry_folder_id(entry) == UNFILED_FOLDER_ID
+        return self._entry_folder_id(entry) in self._folder_descendant_ids(self.folder_filter)
+
+    def _filtered_entries(self) -> list[PdfHistoryEntry]:
+        query = self.search_edit.text().strip().casefold()
+        entries = [entry for entry in self.entries if self._entry_matches_folder(entry)]
+        if query:
+            entries = [
+                entry
+                for entry in entries
+                if query in self._entry_title(entry).casefold() or query in entry.path.casefold()
+            ]
+        if self.sort_mode == "name":
+            entries.sort(key=lambda entry: (self._entry_title(entry).casefold(), entry.updated_at))
+        else:
+            entries.sort(key=lambda entry: entry.updated_at, reverse=True)
+        return entries
+
+    def _entry_title(self, entry: PdfHistoryEntry) -> str:
+        return self.library_state.aliases.get(entry.pdf_key) or entry.title
+
+    def _rebuild_folders(self) -> None:
+        selected_id = self.folder_filter
+        expanded_ids = self._expanded_folder_ids()
+        blocker = QSignalBlocker(self.folder_tree)
+        self.folder_tree.clear()
+        root = QTreeWidgetItem([f"All ({len(self.entries)})"])
+        root.setData(0, Qt.UserRole, "")
+        self.folder_tree.addTopLevelItem(root)
+
+        def add_children(parent_item: QTreeWidgetItem, parent_id: str) -> None:
+            for folder in self._folder_children.get(parent_id, []):
+                item = QTreeWidgetItem([f"{folder.name} ({self._folder_total_count(folder.id)})"])
+                item.setData(0, Qt.UserRole, folder.id)
+                parent_item.addChild(item)
+                add_children(item, folder.id)
+                item.setExpanded(folder.id in expanded_ids)
+
+        root.setExpanded(True)
+        add_children(root, "")
+        self._select_folder(selected_id, fallback_to_root=True)
+        del blocker
+        self._handle_folder_selection()
+
+    def _expanded_folder_ids(self) -> set[str]:
+        expanded: set[str] = set()
+
+        def collect(item: QTreeWidgetItem) -> None:
+            folder_id = str(item.data(0, Qt.UserRole) or "")
+            if folder_id and item.isExpanded():
+                expanded.add(folder_id)
+            for index in range(item.childCount()):
+                collect(item.child(index))
+
+        root = self.folder_tree.topLevelItem(0)
+        if root is not None:
+            collect(root)
+        return expanded
+
+    def _handle_folder_selection(self) -> None:
+        item = self.folder_tree.currentItem()
+        self.folder_filter = str(item.data(0, Qt.UserRole) or "") if item is not None else ""
+        self._rebuild_files()
+
+    def _create_virtual_folder(self, *, parent_id: str = "") -> None:
+        if parent_id == UNFILED_FOLDER_ID:
+            parent_id = ""
+        name, accepted = QInputDialog.getText(self, "New folder", "Folder name:")
+        if not accepted or not name.strip():
+            return
+        folder = LibraryFolder.create(name, parent_id=parent_id)
+        self.library_state.folders.append(folder)
+        save_library(self.library_state)
+        self.folder_filter = folder.id
+        self._rebuild_library_indexes()
+        self._rebuild_folders()
+
+    def _select_folder(self, folder_id: str, *, fallback_to_root: bool = False) -> None:
+        root = self.folder_tree.topLevelItem(0)
+        if root is None:
             return
 
-        for entry in self.entries:
+        def find_item(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
+            if item.data(0, Qt.UserRole) == folder_id:
+                return item
+            for index in range(item.childCount()):
+                found = find_item(item.child(index))
+                if found is not None:
+                    return found
+            return None
+
+        found = find_item(root)
+        if found is not None:
+            self.folder_tree.setCurrentItem(found)
+        elif fallback_to_root:
+            self.folder_tree.setCurrentItem(root)
+
+    def _show_folder_context_menu(self, pos: QPoint) -> None:
+        item = self.folder_tree.itemAt(pos)
+        if item is None:
+            return
+        folder_id = str(item.data(0, Qt.UserRole) or "")
+        menu = QMenu(self)
+        new_child_action = menu.addAction("New subfolder" if folder_id else "New folder")
+        rename_action = menu.addAction("Rename") if folder_id and folder_id != UNFILED_FOLDER_ID else None
+        delete_action = menu.addAction("Delete") if folder_id and folder_id != UNFILED_FOLDER_ID else None
+        chosen = menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
+        if chosen == new_child_action:
+            self._create_virtual_folder(parent_id=folder_id)
+        elif rename_action is not None and chosen == rename_action:
+            self._rename_folder(folder_id)
+        elif delete_action is not None and chosen == delete_action:
+            self._delete_folder(folder_id)
+
+    def _rename_folder(self, folder_id: str) -> None:
+        folder = self._folder_by_id.get(folder_id)
+        if folder is None or folder.id == UNFILED_FOLDER_ID:
+            return
+        name, accepted = QInputDialog.getText(self, "Rename folder", "Folder name:", text=folder.name)
+        if not accepted or not name.strip():
+            return
+        folder.name = name.strip()
+        save_library(self.library_state)
+        self._rebuild_library_indexes()
+        self._rebuild_folders()
+        self._select_folder(folder.id)
+
+    def _delete_folder(self, folder_id: str) -> None:
+        if not folder_id or folder_id == UNFILED_FOLDER_ID:
+            return
+        delete_ids = self._folder_descendant_ids(folder_id)
+        parent_id = self._folder_by_id.get(folder_id).parent_id if folder_id in self._folder_by_id else ""
+        self.library_state.folders = [folder for folder in self.library_state.folders if folder.id not in delete_ids]
+        self.library_state.assignments = {
+            key: value for key, value in self.library_state.assignments.items() if value not in delete_ids
+        }
+        save_library(self.library_state)
+        self.folder_filter = parent_id if parent_id in {folder.id for folder in self.library_state.folders} else ""
+        self._rebuild_library_indexes()
+        self._rebuild_folders()
+
+    def _rebuild_files(self) -> None:
+        entries = self._filtered_entries()
+        self.folder_count_label.setText(f"({len(entries)})")
+        self._list_row_splitters = []
+        self._clear_layout_widgets(self.list_layout)
+        self._clear_layout_widgets(self.grid_layout)
+
+        if not entries:
+            list_empty = QLabel("No PDFs opened yet.")
+            list_empty.setObjectName("HistoryEmpty")
+            grid_empty = QLabel("No PDFs opened yet.")
+            grid_empty.setObjectName("HistoryEmpty")
+            self.list_layout.addWidget(list_empty)
+            self.grid_layout.addWidget(grid_empty, 0, 0)
+            return
+
+        self.list_layout.addWidget(self._build_list_header())
+        for entry in entries:
             self.list_layout.addWidget(self._build_row(entry))
+
+        for index, entry in enumerate(entries):
+            self.grid_layout.addWidget(self._build_grid_card(entry), index // 5, index % 5)
+
+    def _build_list_header(self) -> QWidget:
+        row = QWidget()
+        row.setObjectName("LibraryListHeader")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(10)
+        labels = ("Name", "Created", "Last read", "Pages", "Path")
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("LibraryHeaderSplitter")
+        splitter.setHandleWidth(1)
+        for label in labels:
+            widget = ElidedLabel(label)
+            widget.setObjectName("LibraryListHeaderLabel")
+            splitter.addWidget(widget)
+        for index, stretch in enumerate((6, 1, 1, 1, 4)):
+            splitter.setStretchFactor(index, stretch)
+            splitter.setCollapsible(index, True)
+        splitter.setSizes(self._list_column_sizes)
+        splitter.splitterMoved.connect(lambda _pos, _index, source=splitter: self._sync_list_column_sizes(source))
+        layout.addWidget(splitter)
+        return row
+
+    @staticmethod
+    def _clear_layout_widgets(layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
 
     def _build_row(self, entry: PdfHistoryEntry) -> QWidget:
         row = QWidget()
-        row.setObjectName("HistoryRowMissing" if not entry.exists else "HistoryRow")
+        row.setObjectName("LibraryRowMissing" if not entry.exists else "LibraryRow")
+        self._install_entry_context_menu(row, entry)
 
-        title = QLabel(entry.title)
+        cover = QLabel()
+        cover.setObjectName("LibraryRowCover")
+        cover.setFixedSize(34, 46)
+        cover.setAlignment(Qt.AlignCenter)
+        self._install_entry_context_menu(cover, entry)
+        pixmap = self._cover_pixmap(entry, QSize(34, 46))
+        if pixmap is not None:
+            cover.setPixmap(pixmap)
+        else:
+            cover.setText("PDF")
+
+        title = ElidedLabel(self._entry_title(entry))
         title.setObjectName("HistoryRowTitle")
         title.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        title.setWordWrap(False)
+        title.setFont(self._library_title_font())
+        self._install_entry_context_menu(title, entry)
 
-        path = QLabel(entry.path)
+        path = ElidedLabel(entry.path)
         path.setObjectName("HistoryRowPath")
         path.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        path.setWordWrap(True)
+        path.setWordWrap(False)
+        self._install_entry_context_menu(path, entry)
 
         page = entry.last_page_index + 1 if entry.page_count else 1
-        meta_text = f"Last page: {page}"
+        last_read = f"{page}"
         if entry.page_count:
-            meta_text += f" / {entry.page_count}"
-        meta_text += f"    Updated: {entry.updated_at}"
+            last_read += f" / {entry.page_count}"
         if not entry.exists:
-            meta_text += "    Missing"
-        meta = QLabel(meta_text)
-        meta.setObjectName("HistoryRowMeta")
+            last_read += " Missing"
 
-        open_button = QPushButton("Open")
-        open_button.clicked.connect(lambda _checked=False, key=entry.pdf_key: self.open_requested.emit(key))
+        name_box = QWidget()
+        name_box.setMinimumWidth(0)
+        name_box.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._install_entry_context_menu(name_box, entry)
+        name_layout = QHBoxLayout(name_box)
+        name_layout.setContentsMargins(0, 0, 0, 0)
+        name_layout.setSpacing(8)
+        name_layout.addWidget(cover)
+        name_layout.addWidget(title, 1)
 
-        remove_button = QPushButton("Remove")
-        remove_button.clicked.connect(lambda _checked=False, key=entry.pdf_key: self.remove_requested.emit(key))
-
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        buttons.addWidget(open_button)
-        buttons.addWidget(remove_button)
-
-        layout = QVBoxLayout(row)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(5)
-        layout.addWidget(title)
-        layout.addWidget(path)
-        layout.addWidget(meta)
-        layout.addLayout(buttons)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(0)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("LibraryRowSplitter")
+        splitter.setHandleWidth(1)
+        for widget in (
+            name_box,
+            self._list_cell_label(entry.opened_at[:10]),
+            self._list_cell_label(last_read),
+            self._list_cell_label(str(entry.page_count or "")),
+            path,
+        ):
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            splitter.addWidget(widget)
+        for index, stretch in enumerate((6, 1, 1, 1, 4)):
+            splitter.setStretchFactor(index, stretch)
+            splitter.setCollapsible(index, True)
+        splitter.setSizes(self._list_column_sizes)
+        splitter.splitterMoved.connect(lambda _pos, _index, source=splitter: self._sync_list_column_sizes(source))
+        self._list_row_splitters.append(splitter)
+        layout.addWidget(splitter)
         return row
+
+    @staticmethod
+    def _list_cell_label(text: str) -> ElidedLabel:
+        label = ElidedLabel(text)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        return label
+
+    def _sync_list_column_sizes(self, source: QSplitter) -> None:
+        if self._syncing_list_splitters:
+            return
+        self._syncing_list_splitters = True
+        try:
+            self._list_column_sizes = source.sizes()
+            for splitter in self.findChildren(QSplitter):
+                if splitter is source:
+                    continue
+                if splitter.objectName() in {"LibraryRowSplitter", "LibraryHeaderSplitter"} and splitter.count() == len(self._list_column_sizes):
+                    splitter.setSizes(self._list_column_sizes)
+        finally:
+            self._syncing_list_splitters = False
+
+    def _build_grid_card(self, entry: PdfHistoryEntry) -> QWidget:
+        card = QWidget()
+        card.setObjectName("LibraryGridCardMissing" if not entry.exists else "LibraryGridCard")
+        card.setFixedSize(214, 292)
+        self._install_entry_context_menu(card, entry)
+
+        cover = QLabel()
+        cover.setObjectName("LibraryGridCover")
+        cover.setFixedSize(156, 200)
+        cover.setAlignment(Qt.AlignCenter)
+        self._install_entry_context_menu(cover, entry)
+        pixmap = self._cover_pixmap(entry, QSize(156, 200))
+        if pixmap is not None:
+            cover.setPixmap(pixmap)
+        else:
+            cover.setText("PDF")
+
+        display_title = self._entry_title(entry)
+        title = QLabel(display_title)
+        title.setObjectName("LibraryGridTitle")
+        title.setText(self._middle_elide_text(display_title, max_chars=86))
+        title.setToolTip(display_title)
+        title.setFixedSize(190, 58)
+        title.setWordWrap(True)
+        title.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        title.setFont(self._library_title_font())
+        self._install_entry_context_menu(title, entry)
+
+        card.mouseDoubleClickEvent = lambda _event, key=entry.pdf_key: self.open_requested.emit(key)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        layout.addWidget(cover, 0, Qt.AlignHCenter)
+        layout.addWidget(title, 0, Qt.AlignHCenter)
+        return card
+
+    @staticmethod
+    def _middle_elide_text(value: str, *, max_chars: int) -> str:
+        text = re.sub(r"\s+", " ", value).strip()
+        if len(text) <= max_chars:
+            return text
+        keep_front = max(8, max_chars // 2 - 2)
+        keep_back = max(8, max_chars - keep_front - 3)
+        return f"{text[:keep_front].rstrip()}...{text[-keep_back:].lstrip()}"
+
+    @staticmethod
+    def _library_title_font() -> QFont:
+        font = QFont("Segoe UI", 10)
+        font.setWeight(QFont.Medium)
+        font.setStyleStrategy(QFont.PreferAntialias)
+        return font
+
+    def _install_entry_context_menu(self, widget: QWidget, entry: PdfHistoryEntry) -> None:
+        widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        widget.customContextMenuRequested.connect(
+            lambda pos, key=entry.pdf_key, source=widget: self._show_entry_context_menu(key, source.mapToGlobal(pos))
+        )
+        original_mouse_press = widget.mousePressEvent
+        original_mouse_move = widget.mouseMoveEvent
+        original_mouse_release = widget.mouseReleaseEvent
+        original_mouse_double_click = widget.mouseDoubleClickEvent
+
+        def handle_mouse_press(event, key=entry.pdf_key) -> None:
+            self.selected_pdf_key = key
+            if event.button() == Qt.LeftButton:
+                widget.setProperty("_pdfnest_drag_key", key)
+                widget.setProperty("_pdfnest_drag_start", self._mouse_event_pos(event))
+            original_mouse_press(event)
+
+        def handle_mouse_move(event, key=entry.pdf_key) -> None:
+            start = widget.property("_pdfnest_drag_start")
+            drag_key = widget.property("_pdfnest_drag_key")
+            if (
+                drag_key == key
+                and event.buttons() & Qt.LeftButton
+                and isinstance(start, QPoint)
+                and (self._mouse_event_pos(event) - start).manhattanLength() >= QApplication.startDragDistance()
+            ):
+                widget.setProperty("_pdfnest_drag_start", None)
+                self._start_entry_drag(widget, key)
+                return
+            original_mouse_move(event)
+
+        def handle_mouse_release(event) -> None:
+            widget.setProperty("_pdfnest_drag_start", None)
+            widget.setProperty("_pdfnest_drag_key", "")
+            original_mouse_release(event)
+
+        def handle_mouse_double_click(event, key=entry.pdf_key) -> None:
+            if event.button() == Qt.LeftButton:
+                self.open_requested.emit(key)
+                event.accept()
+                return
+            original_mouse_double_click(event)
+
+        widget.mousePressEvent = handle_mouse_press
+        widget.mouseMoveEvent = handle_mouse_move
+        widget.mouseReleaseEvent = handle_mouse_release
+        widget.mouseDoubleClickEvent = handle_mouse_double_click
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        if self._dragging_pdf_key:
+            if event.type() == QEvent.MouseMove:
+                self._update_folder_drag_hover(self._mouse_event_global_pos(event))
+            elif event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._finish_entry_drag(self._mouse_event_global_pos(event))
+            elif event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+                self._cancel_entry_drag()
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _mouse_event_pos(event) -> QPoint:
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        return event.pos()
+
+    @staticmethod
+    def _mouse_event_global_pos(event) -> QPoint:
+        if hasattr(event, "globalPosition"):
+            return event.globalPosition().toPoint()
+        return event.globalPos()
+
+    def _start_entry_drag(self, _source: QWidget, pdf_key: str) -> None:
+        self._dragging_pdf_key = pdf_key
+        if not self._drag_cursor_active:
+            QApplication.setOverrideCursor(Qt.ClosedHandCursor)
+            self._drag_cursor_active = True
+
+    def _update_folder_drag_hover(self, global_pos: QPoint) -> None:
+        item = self.folder_tree.itemAt(self.folder_tree.viewport().mapFromGlobal(global_pos))
+        if item is not None:
+            self.folder_tree.setCurrentItem(item)
+
+    def _finish_entry_drag(self, global_pos: QPoint) -> None:
+        pdf_key = self._dragging_pdf_key
+        self._cancel_entry_drag()
+        if not pdf_key:
+            return
+        item = self.folder_tree.itemAt(self.folder_tree.viewport().mapFromGlobal(global_pos))
+        if item is None:
+            return
+        folder_id = str(item.data(0, Qt.UserRole) or "")
+        self._assign_entry_folder(pdf_key, folder_id)
+
+    def _cancel_entry_drag(self) -> None:
+        self._dragging_pdf_key = ""
+        if self._drag_cursor_active:
+            QApplication.restoreOverrideCursor()
+            self._drag_cursor_active = False
+
+    def _show_entry_context_menu(self, pdf_key: str, global_pos: QPoint) -> None:
+        entry = self._entry_by_key.get(pdf_key)
+        if entry is None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Open")
+        rename_action = menu.addAction("Rename")
+        export_action = menu.addAction("Export all notes")
+        move_menu = menu.addMenu("Move to folder")
+        move_actions: dict[QAction, str] = {}
+        unfiled_action = move_menu.addAction("Unfiled")
+        move_actions[unfiled_action] = UNFILED_FOLDER_ID
+        for folder in self.library_state.folders:
+            if folder.id == UNFILED_FOLDER_ID:
+                continue
+            action = move_menu.addAction(self._folder_path_label(folder.id))
+            move_actions[action] = folder.id
+        restore_action = menu.addAction("Restore") if pdf_key in self.library_state.archived else None
+        archive_action = menu.addAction("Move to archive") if pdf_key not in self.library_state.archived else None
+        delete_action = menu.addAction("Permanent delete")
+        chosen = menu.exec(global_pos)
+        if chosen == open_action:
+            self.open_requested.emit(pdf_key)
+        elif chosen == rename_action:
+            name, accepted = QInputDialog.getText(self, "Rename notebook", "Display name:", text=self._entry_title(entry))
+            if accepted and name.strip():
+                self.rename_requested.emit(pdf_key, name.strip())
+        elif chosen == export_action:
+            self.export_requested.emit(pdf_key)
+        elif restore_action is not None and chosen == restore_action:
+            self.restore_requested.emit(pdf_key)
+        elif archive_action is not None and chosen == archive_action:
+            self.archive_requested.emit(pdf_key)
+        elif chosen == delete_action:
+            self.remove_requested.emit(pdf_key)
+        elif chosen in move_actions:
+            self._assign_entry_folder(pdf_key, move_actions[chosen])
+
+    def _folder_path_label(self, folder_id: str) -> str:
+        folder = self._folder_by_id.get(folder_id)
+        if folder is None:
+            return "Unfiled"
+        parts = [folder.name]
+        parent_id = folder.parent_id
+        seen = {folder.id}
+        while parent_id and parent_id not in seen:
+            seen.add(parent_id)
+            parent = self._folder_by_id.get(parent_id)
+            if parent is None:
+                break
+            parts.append(parent.name)
+            parent_id = parent.parent_id
+        return " / ".join(reversed(parts))
+
+    def _assign_entry_folder(self, pdf_key: str, folder_id: str) -> None:
+        if folder_id == UNFILED_FOLDER_ID:
+            self.library_state.assignments.pop(pdf_key, None)
+        else:
+            self.library_state.assignments[pdf_key] = folder_id
+        save_library(self.library_state)
+        self._rebuild_library_indexes()
+        self._rebuild_folders()
+        if self.folder_filter:
+            self._select_folder(self.folder_filter)
+        self._rebuild_files()
+
+    def _cover_pixmap(self, entry: PdfHistoryEntry, size: QSize) -> QPixmap | None:
+        cache_key = (entry.pdf_key, size.width(), size.height())
+        if cache_key in self._cover_cache:
+            return self._cover_cache[cache_key]
+        notebook_dir = notebook_dir_for_key(entry.pdf_key)
+        if notebook_dir is None:
+            return None
+        cover_path = notebook_dir / "cover.png"
+        if not cover_path.exists():
+            return None
+        pixmap = QPixmap(str(cover_path))
+        if pixmap.isNull():
+            return None
+        scaled = pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._cover_cache[cache_key] = scaled
+        return scaled
 
 
 class OutlinePanel(QWidget):
@@ -1075,9 +1872,6 @@ class OutlinePanel(QWidget):
         self.setObjectName("OutlinePanel")
         self.setMinimumWidth(220)
         self.setMaximumWidth(360)
-
-        title = QLabel("Contents")
-        title.setObjectName("OutlineTitle")
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
@@ -1156,7 +1950,6 @@ class OutlinePanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
-        layout.addWidget(title)
         layout.addWidget(tabs, 1)
 
     @staticmethod
@@ -1305,7 +2098,8 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("PDFNest Settings")
-        self.resize(760, 460)
+        self.resize(680, 460)
+        self.setMinimumWidth(720)
 
         self.theme_combo = QComboBox()
         for theme_name in sorted(themes):
@@ -1330,16 +2124,42 @@ class SettingsDialog(QDialog):
         shortcut_text = str(settings.get("append_selection_shortcut") or "Ctrl+Shift+C")
         self.append_selection_shortcut_edit.setKeySequence(QKeySequence(shortcut_text))
 
-        data_label = QLabel(str(data_dir))
-        data_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        note_label = QLabel(str(note_json_path) if note_json_path is not None else "Open a PDF to see this path.")
-        note_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        markdown_label = QLabel(str(markdown_dir))
-        markdown_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        settings_label = QLabel(str(settings_path(data_dir)))
-        settings_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        theme_dir_label = QLabel(str(theme_dir))
-        theme_dir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.storage_dir_edit = QLineEdit(str(settings.get("storage_dir") or data_dir))
+        self.storage_dir_edit.setAlignment(Qt.AlignLeft)
+        self.storage_dir_edit.setCursorPosition(0)
+        self.storage_dir_edit.setMinimumWidth(260)
+        self.storage_dir_edit.setMaximumWidth(420)
+        storage_browse_button = QPushButton("Browse")
+        storage_browse_button.clicked.connect(self._choose_storage_dir)
+        storage_copy_button = self._copy_button(lambda: self.storage_dir_edit.text())
+        storage_row = QWidget()
+        storage_row_layout = QHBoxLayout(storage_row)
+        storage_row_layout.setContentsMargins(0, 0, 0, 0)
+        storage_row_layout.setSpacing(8)
+        storage_row_layout.addWidget(self.storage_dir_edit, 1)
+        storage_row_layout.addWidget(storage_browse_button, 0)
+        storage_row_layout.addWidget(storage_copy_button, 0)
+
+        self.markdown_dir_edit = QLineEdit(str(settings.get("markdown_export_dir") or markdown_dir))
+        self.markdown_dir_edit.setAlignment(Qt.AlignLeft)
+        self.markdown_dir_edit.setCursorPosition(0)
+        self.markdown_dir_edit.setMinimumWidth(260)
+        self.markdown_dir_edit.setMaximumWidth(420)
+        markdown_browse_button = QPushButton("Browse")
+        markdown_browse_button.clicked.connect(self._choose_markdown_dir)
+        markdown_copy_button = self._copy_button(lambda: self.markdown_dir_edit.text())
+        markdown_row = QWidget()
+        markdown_row_layout = QHBoxLayout(markdown_row)
+        markdown_row_layout.setContentsMargins(0, 0, 0, 0)
+        markdown_row_layout.setSpacing(8)
+        markdown_row_layout.addWidget(self.markdown_dir_edit, 1)
+        markdown_row_layout.addWidget(markdown_browse_button, 0)
+        markdown_row_layout.addWidget(markdown_copy_button, 0)
+
+        data_label = self._path_row(str(data_dir))
+        note_label = self._path_row(str(note_json_path) if note_json_path is not None else "Open a PDF to see this path.")
+        settings_label = self._path_row(str(settings_path(data_dir)))
+        theme_dir_label = self._path_row(str(theme_dir))
 
         self.category_list = QTreeWidget()
         self.category_list.setHeaderHidden(True)
@@ -1362,12 +2182,15 @@ class SettingsDialog(QDialog):
         shortcuts_form = QFormLayout()
         shortcuts_form.addRow("Add selection shortcut", self.append_selection_shortcut_edit)
 
-        storage_form = QFormLayout()
-        storage_form.addRow("Data folder", data_label)
-        storage_form.addRow("Current note JSON", note_label)
-        storage_form.addRow("Markdown export base", markdown_label)
-        storage_form.addRow("Settings file", settings_label)
-        storage_form.addRow("Theme folder", theme_dir_label)
+        storage_form = QGridLayout()
+        self._add_storage_row(storage_form, 0, "PDFNest data folder", storage_row)
+        self._add_storage_row(storage_form, 1, "Data folder", data_label)
+        self._add_storage_row(storage_form, 2, "Current note data", note_label)
+        self._add_storage_row(storage_form, 3, "Markdown export base", markdown_row)
+        self._add_storage_row(storage_form, 4, "Settings file", settings_label)
+        self._add_storage_row(storage_form, 5, "Theme folder", theme_dir_label)
+        storage_form.setColumnStretch(0, 0)
+        storage_form.setColumnStretch(1, 1)
 
         self._add_settings_page("Basic", basic_form)
         self._add_settings_page("Notes", note_form)
@@ -1389,7 +2212,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(body, 1)
         layout.addWidget(buttons)
 
-    def _add_settings_page(self, title: str, form: QFormLayout) -> None:
+    def _add_settings_page(self, title: str, form) -> None:
         page = QWidget()
         form.setContentsMargins(18, 18, 18, 18)
         form.setSpacing(12)
@@ -1399,6 +2222,47 @@ class SettingsDialog(QDialog):
         item.setData(0, Qt.UserRole, index)
         self.category_list.addTopLevelItem(item)
 
+    @staticmethod
+    def _path_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setWordWrap(False)
+        label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        label.setMinimumWidth(0)
+        label.setToolTip(text)
+        return label
+
+    @staticmethod
+    def _copy_button(text_getter) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("CopyPathButton")
+        button.setText("⧉")
+        button.setToolTip("Copy path")
+        button.setFixedSize(26, 24)
+        button.clicked.connect(lambda: QApplication.clipboard().setText(str(text_getter())))
+        return button
+
+    @staticmethod
+    def _add_storage_row(layout: QGridLayout, row: int, label_text: str, value_widget: QWidget) -> None:
+        label = QLabel(label_text)
+        label.setObjectName("SettingsPathLabel")
+        label.setFixedWidth(160)
+        label.setMinimumHeight(28)
+        layout.addWidget(label, row, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        layout.addWidget(value_widget, row, 1)
+
+    @staticmethod
+    def _path_row(text: str) -> QWidget:
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        label = SettingsDialog._path_label(text)
+        copy_button = SettingsDialog._copy_button(lambda: text)
+        layout.addWidget(label, 1)
+        layout.addWidget(copy_button, 0)
+        return row
+
     def _sync_category_page(self) -> None:
         item = self.category_list.currentItem()
         if item is None:
@@ -1406,6 +2270,18 @@ class SettingsDialog(QDialog):
         index = item.data(0, Qt.UserRole)
         if index is not None:
             self.pages.setCurrentIndex(int(index))
+
+    def _choose_storage_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose PDFNest data folder", self.storage_dir_edit.text())
+        if path:
+            self.storage_dir_edit.setText(path)
+            self.storage_dir_edit.setCursorPosition(0)
+
+    def _choose_markdown_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose Markdown export folder", self.markdown_dir_edit.text())
+        if path:
+            self.markdown_dir_edit.setText(path)
+            self.markdown_dir_edit.setCursorPosition(0)
 
     @property
     def selected_theme(self) -> str:
@@ -1419,6 +2295,16 @@ class SettingsDialog(QDialog):
     def append_selection_shortcut(self) -> str:
         sequence = self.append_selection_shortcut_edit.keySequence().toString(QKeySequence.PortableText)
         return sequence or "Ctrl+Shift+C"
+
+    @property
+    def storage_dir(self) -> Path:
+        value = self.storage_dir_edit.text().strip()
+        return Path(value).expanduser() if value else default_data_dir()
+
+    @property
+    def markdown_dir(self) -> Path:
+        value = self.markdown_dir_edit.text().strip()
+        return Path(value).expanduser() if value else app_local_data_dir() / "markdown_notes"
 
     @property
     def wheel_scroll_lines(self) -> int:
@@ -1436,6 +2322,7 @@ class MainWindow(QMainWindow):
         self._set_app_icon()
         self.resize(1180, 820)
 
+        migrate_storage()
         self.settings = load_settings()
         self.resize(
             clamp_window_dimension(self.settings.get("window_width"), 1180),
@@ -1455,6 +2342,9 @@ class MainWindow(QMainWindow):
         self.document: fitz.Document | None = None
         self.pdf_path: Path | None = None
         self.pdf_key: str | None = None
+        self.pdf_tabs: dict[str, PdfTabState] = {}
+        self.active_pdf_key: str | None = None
+        self._updating_pdf_tabs = False
         self.notes: list[Note] = []
         self.note_counters: dict[str, int] = {}
         self.bookmarks: list[Bookmark] = []
@@ -1463,19 +2353,21 @@ class MainWindow(QMainWindow):
         self.zoom = 1.25
         self.fit_mode: str | None = None
         self.render_scale = 2.0
-        self.render_page_buffer = 1
+        self.render_page_buffer = 4
         self.page_margin = 24
         self.continuous_scroll = True
-        self.note_export_dir = default_data_dir() / "markdown_notes"
+        self.note_export_dir = Path(str(self.settings.get("markdown_export_dir") or app_local_data_dir() / "markdown_notes")).expanduser()
         self.page_widgets: dict[int, QWidget] = {}
         self.page_base_sizes: list[tuple[float, float]] = []
         self.page_tops: list[int] = []
         self.page_heights: list[int] = []
         self.page_widths: list[int] = []
+        self.page_text_words_cache: dict[int, list[dict[str, object]]] = {}
         self.document_content_size = QSize(1, 1)
         self._suppress_scroll_sync = False
         self._pending_scroll_id = 0
         self._fit_refresh_token = 0
+        self._page_window_render_token = 0
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.canvas = PdfCanvas()
@@ -1499,7 +2391,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
-        self.note_panel.choose_folder_requested.connect(self.choose_note_export_dir)
+        self.note_panel.choose_folder_requested.connect(self.open_current_note_location)
         self.note_panel.save_requested.connect(self.save_current_note)
         self.note_panel.export_requested.connect(self.export_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
@@ -1573,14 +2465,70 @@ class MainWindow(QMainWindow):
 
         self.history_panel = HistoryPanel()
         self.history_panel.open_requested.connect(self.open_history_entry)
+        self.history_panel.archive_requested.connect(self.archive_history_entry)
         self.history_panel.remove_requested.connect(self.remove_history_entry)
+        self.history_panel.export_requested.connect(self.export_history_entry_notes)
+        self.history_panel.add_notebook_requested.connect(self.add_planned_notebook)
+        self.history_panel.rename_requested.connect(self.rename_history_entry)
+        self.history_panel.restore_requested.connect(self.restore_history_entry)
         self.history_panel.settings_requested.connect(self.open_settings)
         self.history_panel.set_entries(self.history_entries)
 
         self.main_stack = QStackedWidget()
         self.main_stack.addWidget(self.history_panel)
         self.main_stack.addWidget(self.reader_splitter)
-        self.setCentralWidget(self.main_stack)
+        self.document_tab_bar = QTabBar()
+        self.document_tab_bar.setObjectName("DocumentTabBar")
+        self.document_tab_bar.setDocumentMode(True)
+        self.document_tab_bar.setExpanding(False)
+        self.document_tab_bar.setMovable(True)
+        self.document_tab_bar.setTabsClosable(False)
+        self.document_tab_bar.addTab("Home")
+        self.document_tab_bar.setTabData(0, "")
+        self.document_tab_bar.currentChanged.connect(self._handle_document_tab_changed)
+
+        self.open_tab_button = QPushButton("+ Open")
+        self.open_tab_button.setObjectName("OpenTabButton")
+        self.open_tab_button.clicked.connect(self.open_pdf)
+
+        tab_strip = QWidget()
+        tab_strip.setObjectName("DocumentTabStrip")
+        tab_strip_layout = QHBoxLayout(tab_strip)
+        tab_strip_layout.setContentsMargins(0, 0, 0, 0)
+        tab_strip_layout.setSpacing(0)
+        tab_strip_layout.addWidget(self.document_tab_bar, 1)
+        tab_strip_layout.addWidget(self.open_tab_button, 0)
+
+        self.outline_toggle_button = QToolButton()
+        self.outline_toggle_button.setObjectName("OutlineToggleButton")
+        self.outline_toggle_button.setText("Contents")
+        self.outline_toggle_button.setCheckable(True)
+        self.outline_toggle_button.setChecked(True)
+        self.outline_toggle_button.clicked.connect(self.set_outline_visible)
+
+        self.document_title_label = QLabel(APP_TITLE)
+        self.document_title_label.setObjectName("DocumentTitleLabel")
+        self.document_title_label.setAlignment(Qt.AlignCenter)
+        self.document_title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+
+        title_bar = QWidget()
+        title_bar.setObjectName("DocumentTitleBar")
+        self.document_title_bar = title_bar
+        title_bar_layout = QHBoxLayout(title_bar)
+        title_bar_layout.setContentsMargins(4, 2, 8, 2)
+        title_bar_layout.setSpacing(8)
+        title_bar_layout.addWidget(self.outline_toggle_button, 0)
+        title_bar_layout.addWidget(self.document_title_label, 1)
+
+        window_content = QWidget()
+        window_content.setObjectName("WindowContent")
+        window_layout = QVBoxLayout(window_content)
+        window_layout.setContentsMargins(0, 0, 0, 0)
+        window_layout.setSpacing(0)
+        window_layout.addWidget(tab_strip, 0)
+        window_layout.addWidget(title_bar, 0)
+        window_layout.addWidget(self.main_stack, 1)
+        self.setCentralWidget(window_content)
         self.statusBar().setSizeGripEnabled(False)
 
         self._build_toolbar()
@@ -1592,29 +2540,19 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _build_toolbar(self) -> None:
-        toolbar = QToolBar("PDF controls")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-
         self.home_action = QAction("Home", self)
         self.home_action.triggered.connect(self.show_home)
-        toolbar.addAction(self.home_action)
 
-        open_action = QAction("Open", self)
-        open_action.triggered.connect(self.open_pdf)
-        toolbar.addAction(open_action)
+        self.open_action = QAction("Open", self)
+        self.open_action.triggered.connect(self.open_pdf)
 
         self.reader_action = QAction("Reader", self)
         self.reader_action.triggered.connect(self.show_reader)
-        toolbar.addAction(self.reader_action)
-
-        toolbar.addSeparator()
 
         self.outline_action = QAction("Contents", self)
         self.outline_action.setCheckable(True)
         self.outline_action.setChecked(True)
         self.outline_action.triggered.connect(self.set_outline_visible)
-        toolbar.addAction(self.outline_action)
 
     def _build_shortcuts(self) -> None:
         self.save_note_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
@@ -1628,6 +2566,17 @@ class MainWindow(QMainWindow):
         self.append_selection_shortcut = QShortcut(self._append_selection_key_sequence(), self)
         self.append_selection_shortcut.setContext(Qt.ApplicationShortcut)
         self.append_selection_shortcut.activated.connect(self.append_selected_text_to_current_note_from_shortcut)
+
+        self.close_tab_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
+        self.close_tab_shortcut.setContext(Qt.ApplicationShortcut)
+        self.close_tab_shortcut.activated.connect(self.close_current_pdf_tab)
+
+        self.tab_switch_shortcuts: list[QShortcut] = []
+        for tab_number in range(1, 10):
+            shortcut = QShortcut(QKeySequence(f"Ctrl+{tab_number}"), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(lambda pdf_index=tab_number: self.switch_to_document_tab(pdf_index))
+            self.tab_switch_shortcuts.append(shortcut)
 
     def _append_selection_key_sequence(self) -> QKeySequence:
         shortcut_text = str(self.settings.get("append_selection_shortcut") or "Ctrl+Shift+C")
@@ -1679,7 +2628,223 @@ class MainWindow(QMainWindow):
                     app.setWindowIcon(icon)
                 return
 
+    def _tab_title_for_path(self, path: Path) -> str:
+        title = path.stem or path.name or "Untitled"
+        return title if len(title) <= 28 else f"{title[:25]}..."
+
+    def _pdf_tab_index(self, pdf_key: str) -> int:
+        for index in range(1, self.document_tab_bar.count()):
+            if self.document_tab_bar.tabData(index) == pdf_key:
+                return index
+        return -1
+
+    def _set_current_document_tab(self, index: int) -> None:
+        self._updating_pdf_tabs = True
+        try:
+            if 0 <= index < self.document_tab_bar.count():
+                self.document_tab_bar.setCurrentIndex(index)
+        finally:
+            self._updating_pdf_tabs = False
+
+    def _add_pdf_tab(self, state: PdfTabState) -> None:
+        index = self.document_tab_bar.addTab(self._tab_title_for_path(state.pdf_path))
+        self.document_tab_bar.setTabData(index, state.pdf_key)
+        self.document_tab_bar.setTabToolTip(index, str(state.pdf_path))
+        close_button = QToolButton()
+        close_button.setObjectName("DocumentTabCloseButton")
+        close_button.setIcon(pic_icon("closebtn.png"))
+        close_button.setIconSize(QSize(9, 9))
+        close_button.setToolTip("Close tab")
+        close_button.setAutoRaise(True)
+        close_button.setFixedSize(18, 18)
+        close_button.clicked.connect(lambda _checked=False, key=state.pdf_key: self.close_pdf_tab_by_key(key))
+        self.document_tab_bar.setTabButton(index, QTabBar.RightSide, close_button)
+
+    def _save_active_pdf_tab_state(self) -> None:
+        if self.active_pdf_key is None or self.document is None:
+            return
+        state = self.pdf_tabs.get(self.active_pdf_key)
+        if state is None:
+            return
+
+        self._auto_save_current_note()
+        self._record_current_pdf()
+        state.pdf_path = self.pdf_path or state.pdf_path
+        state.document = self.document
+        state.notes = self.notes
+        state.note_counters = self.note_counters
+        state.bookmarks = self.bookmarks
+        state.page_text_words_cache = self.page_text_words_cache
+        state.page_index = self.page_index
+        state.zoom = self.zoom
+        state.fit_mode = self.fit_mode
+        state.current_note_id = self.note_panel.current_note_id or ""
+
+    def _activate_pdf_tab(self, pdf_key: str) -> None:
+        state = self.pdf_tabs.get(pdf_key)
+        if state is None:
+            self.show_home()
+            return
+
+        if self.active_pdf_key == pdf_key and self.document is state.document and self.page_canvases:
+            self.main_stack.setCurrentWidget(self.reader_splitter)
+            self._set_current_document_tab(self._pdf_tab_index(pdf_key))
+            self._refresh_document_chrome()
+            self._refresh_actions()
+            return
+
+        if self.active_pdf_key != pdf_key:
+            self._save_active_pdf_tab_state()
+
+        self.active_pdf_key = pdf_key
+        self.document = state.document
+        self.pdf_path = state.pdf_path
+        self.pdf_key = state.pdf_key
+        self.notes = state.notes
+        self.note_counters = state.note_counters
+        self.bookmarks = state.bookmarks
+        self.page_text_words_cache = state.page_text_words_cache or {}
+        self.page_index = max(0, min(state.page_index, max(self.document.page_count - 1, 0)))
+        self.zoom = state.zoom
+        self.fit_mode = state.fit_mode
+        self._cache_page_base_sizes()
+        self.note_panel.set_note(None)
+        restored_note = find_note(self.notes, state.current_note_id) if state.current_note_id else None
+        if restored_note is not None:
+            self.note_panel.set_note(restored_note)
+            self._refresh_note_selector(restored_note.id)
+        else:
+            self._refresh_note_selector()
+        self.outline_panel.set_outline(self.document.get_toc())
+        self.outline_panel.set_bookmarks(self.bookmarks)
+        self.main_stack.setCurrentWidget(self.reader_splitter)
+        tab_index = self._pdf_tab_index(pdf_key)
+        self._set_current_document_tab(tab_index)
+        if self.fit_mode is None:
+            self.render_page()
+        else:
+            self._apply_fit_mode(anchor_page=self.page_index)
+            self._schedule_fit_refresh(anchor_page=self.page_index)
+        self._refresh_document_chrome()
+        self._refresh_actions()
+
+    def switch_to_document_tab(self, index: int) -> None:
+        if index == 0:
+            self.show_home()
+            return
+        if not (0 <= index < self.document_tab_bar.count()):
+            return
+        pdf_key = str(self.document_tab_bar.tabData(index) or "")
+        if pdf_key:
+            self._activate_pdf_tab(pdf_key)
+
+    def _handle_document_tab_changed(self, index: int) -> None:
+        if self._updating_pdf_tabs:
+            return
+        self.switch_to_document_tab(index)
+
+    def close_current_pdf_tab(self) -> None:
+        index = self.document_tab_bar.currentIndex()
+        if index <= 0:
+            return
+        self.close_pdf_tab_at_index(index)
+
+    def close_pdf_tab_by_key(self, pdf_key: str) -> None:
+        index = self._pdf_tab_index(pdf_key)
+        if index > 0:
+            self.close_pdf_tab_at_index(index)
+
+    def close_pdf_tab_at_index(self, index: int) -> None:
+        if index <= 0 or index >= self.document_tab_bar.count():
+            return
+        pdf_key = str(self.document_tab_bar.tabData(index) or "")
+        state = self.pdf_tabs.get(pdf_key)
+        if state is None:
+            return
+
+        closing_active = pdf_key == self.active_pdf_key
+        if closing_active:
+            self._save_active_pdf_tab_state()
+
+        state.document.close()
+        self.pdf_tabs.pop(pdf_key, None)
+        self._updating_pdf_tabs = True
+        try:
+            self.document_tab_bar.removeTab(index)
+        finally:
+            self._updating_pdf_tabs = False
+
+        if not closing_active:
+            return
+
+        next_index = min(index, self.document_tab_bar.count() - 1)
+        if next_index > 0:
+            next_key = str(self.document_tab_bar.tabData(next_index) or "")
+            if next_key:
+                self._activate_pdf_tab(next_key)
+                return
+
+        self._clear_current_pdf_state()
+        self.show_home()
+
+    def _clear_current_pdf_state(self) -> None:
+        self.active_pdf_key = None
+        self.document = None
+        self.pdf_path = None
+        self.pdf_key = None
+        self.notes = []
+        self.note_counters = {}
+        self.bookmarks = []
+        self.page_index = 0
+        self.zoom = 1.25
+        self.fit_mode = None
+        self.page_base_sizes = []
+        self.page_tops = []
+        self.page_heights = []
+        self.page_widths = []
+        self.page_text_words_cache = {}
+        self.document_content_size = QSize(1, 1)
+        self.note_panel.set_note(None)
+        self._refresh_note_selector()
+        self.outline_panel.set_outline([])
+        self.outline_panel.set_bookmarks([])
+        self._render_empty_state()
+        self._refresh_actions()
+        self._refresh_document_chrome()
+
+    def _close_all_pdf_tabs(self) -> None:
+        self._save_active_pdf_tab_state()
+        for state in list(self.pdf_tabs.values()):
+            state.document.close()
+        self.pdf_tabs.clear()
+        self._updating_pdf_tabs = True
+        try:
+            while self.document_tab_bar.count() > 1:
+                self.document_tab_bar.removeTab(1)
+            self.document_tab_bar.setCurrentIndex(0)
+        finally:
+            self._updating_pdf_tabs = False
+        self._clear_current_pdf_state()
+
+    def _refresh_document_chrome(self) -> None:
+        has_document = self.document is not None and self.pdf_path is not None
+        if self.main_stack.currentWidget() is self.history_panel:
+            self.document_title_bar.setVisible(False)
+            self.document_title_label.setText(APP_TITLE)
+            self.outline_toggle_button.setEnabled(False)
+            self._set_current_document_tab(0)
+            return
+
+        self.document_title_bar.setVisible(True)
+        self.document_title_label.setText(self.pdf_path.name if has_document and self.pdf_path is not None else APP_TITLE)
+        self.outline_toggle_button.setEnabled(has_document)
+        self.outline_toggle_button.setChecked(self.outline_panel.isVisible())
+        if self.active_pdf_key is not None:
+            index = self._pdf_tab_index(self.active_pdf_key)
+            self._set_current_document_tab(index)
+
     def open_settings(self) -> None:
+        old_data_dir = default_data_dir()
         self.themes = load_theme_files()
         if self.theme_name not in self.themes:
             self.theme_name = "beige"
@@ -1707,33 +2872,66 @@ class MainWindow(QMainWindow):
         self.auto_save_current_note = dialog.auto_save_current_note
         self.settings["auto_save_current_note"] = self.auto_save_current_note
         self.settings["append_selection_shortcut"] = dialog.append_selection_shortcut
+        self.settings["storage_dir"] = str(dialog.storage_dir)
+        self.note_export_dir = dialog.markdown_dir
+        self.settings["markdown_export_dir"] = str(self.note_export_dir)
+        self.note_panel.set_folder_path(self.note_export_dir)
         save_settings(self.settings)
+        migrate_storage(dialog.storage_dir)
         self._refresh_append_selection_shortcut()
         self._apply_wheel_scroll_lines()
+        if dialog.storage_dir != old_data_dir:
+            self.history_entries = load_history()
+            self.history_panel.set_entries(self.history_entries)
         self.themes = load_theme_files()
         self.apply_theme()
         self.render_page_preserving_view(render_neighbors=False)
 
     def open_pdf(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
+        filename = self._choose_pdf_file("Open PDF")
         if not filename:
             return
+        QApplication.processEvents()
         self.load_pdf(Path(filename))
+        self.repaint()
+
+    def _choose_pdf_file(self, title: str) -> str:
+        self.repaint()
+        QApplication.processEvents()
+        dialog = QFileDialog(self, title, "", "PDF files (*.pdf)")
+        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setNameFilter("PDF files (*.pdf)")
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        if dialog.exec() != QDialog.Accepted:
+            QApplication.processEvents()
+            self.repaint()
+            return ""
+        selected = dialog.selectedFiles()
+        QApplication.processEvents()
+        self.repaint()
+        return selected[0] if selected else ""
 
     def load_pdf(self, path: Path, *, pdf_key: str | None = None, restore_last_page: bool = True) -> None:
+        key = pdf_key or pdf_key_for_path(path)
+        if key in self.pdf_tabs:
+            self._activate_pdf_tab(key)
+            return
+
         try:
             document = fitz.open(path)
         except Exception as exc:  # PyMuPDF raises several exception types.
             QMessageBox.critical(self, "Open failed", f"Could not open PDF:\n{exc}")
             return
 
-        self.close_document()
-        key = pdf_key or pdf_key_for_path(path)
+        self._save_active_pdf_tab_state()
         entry = find_history_entry(self.history_entries, key)
         self.document = document
         self.pdf_path = path
         self.pdf_key = key
+        self.active_pdf_key = key
         self.notes, self.note_counters, self.bookmarks = load_notes_data(self.pdf_key)
+        self.page_text_words_cache = {}
         self._ensure_note_counters()
         self._cache_page_base_sizes()
         if restore_last_page and entry is not None:
@@ -1748,31 +2946,53 @@ class MainWindow(QMainWindow):
         self._refresh_note_selector()
         self.outline_panel.set_outline(document.get_toc())
         self.outline_panel.set_bookmarks(self.bookmarks)
-        self.show_reader()
+        restored_note = find_note(self.notes, entry.last_note_id) if restore_last_page and entry is not None else None
+        state = PdfTabState(
+            pdf_key=key,
+            pdf_path=path,
+            document=document,
+            notes=self.notes,
+            note_counters=self.note_counters,
+            bookmarks=self.bookmarks,
+            page_index=self.page_index,
+            zoom=self.zoom,
+            fit_mode=self.fit_mode,
+            current_note_id=restored_note.id if restored_note is not None else "",
+            page_text_words_cache=self.page_text_words_cache,
+        )
+        self.pdf_tabs[key] = state
+        self._add_pdf_tab(state)
+        self.main_stack.setCurrentWidget(self.reader_splitter)
+        self._set_current_document_tab(self._pdf_tab_index(key))
         if self.fit_mode is None:
             self.render_page()
         else:
             self._apply_fit_mode(anchor_page=self.page_index)
             self._schedule_fit_refresh(anchor_page=self.page_index)
-        restored_note = find_note(self.notes, entry.last_note_id) if restore_last_page and entry is not None else None
         if restored_note is not None:
             self.note_panel.set_note(restored_note)
             self._refresh_note_selector(restored_note.id)
         self._record_current_pdf()
+        self._refresh_document_chrome()
 
     def close_document(self) -> None:
-        self._auto_save_current_note()
-        self._record_current_pdf()
-        if self.document is not None:
+        self._save_active_pdf_tab_state()
+        key = self.active_pdf_key
+        state = self.pdf_tabs.pop(key, None) if key is not None else None
+        if state is not None:
+            state.document.close()
+            index = self._pdf_tab_index(state.pdf_key)
+            if index > 0:
+                self._updating_pdf_tabs = True
+                try:
+                    self.document_tab_bar.removeTab(index)
+                finally:
+                    self._updating_pdf_tabs = False
+        elif self.document is not None:
+            self._auto_save_current_note()
+            self._record_current_pdf()
             self.document.close()
-        self.document = None
-        self.page_base_sizes = []
-        self.page_tops = []
-        self.page_heights = []
-        self.page_widths = []
-        self.document_content_size = QSize(1, 1)
-        self.note_counters = {}
-        self.bookmarks = []
+        self._clear_current_pdf_state()
 
     def _record_current_pdf(self) -> None:
         if self.document is None or self.pdf_path is None or self.pdf_key is None:
@@ -1790,8 +3010,7 @@ class MainWindow(QMainWindow):
             zoom=self.zoom,
             fit_mode=self.fit_mode or "",
         )
-        save_history(self.history_entries)
-        self.history_panel.set_entries(self.history_entries)
+        save_history(self.history_entries, touched_pdf_keys={self.pdf_key})
 
     def open_history_entry(self, pdf_key: str) -> None:
         entry = find_history_entry(self.history_entries, pdf_key)
@@ -1814,30 +3033,143 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
 
-        filename, _ = QFileDialog.getOpenFileName(self, "Relocate PDF", "", "PDF files (*.pdf)")
+        filename = self._choose_pdf_file("Relocate PDF")
         if filename:
             self.load_pdf(Path(filename), pdf_key=entry.pdf_key, restore_last_page=True)
 
     def remove_history_entry(self, pdf_key: str) -> None:
         self.history_entries = remove_history_entry(self.history_entries, pdf_key)
         save_history(self.history_entries)
+        library = load_library()
+        library.assignments.pop(pdf_key, None)
+        library.aliases.pop(pdf_key, None)
+        library.archived.pop(pdf_key, None)
+        save_library(library)
         self.history_panel.set_entries(self.history_entries)
 
+    def archive_history_entry(self, pdf_key: str) -> None:
+        if not find_history_entry(self.history_entries, pdf_key):
+            return
+        library = load_library()
+        library.archived[pdf_key] = utc_now()
+        save_library(library)
+        self.history_panel.set_entries(self.history_entries)
+        self.statusBar().showMessage("Moved to archive.", 3000)
+
+    def restore_history_entry(self, pdf_key: str) -> None:
+        library = load_library()
+        library.archived.pop(pdf_key, None)
+        save_library(library)
+        self.history_panel.set_entries(self.history_entries)
+        self.statusBar().showMessage("Restored from archive.", 3000)
+
+    def rename_history_entry(self, pdf_key: str, name: str) -> None:
+        library = load_library()
+        if name.strip():
+            library.aliases[pdf_key] = name.strip()
+        else:
+            library.aliases.pop(pdf_key, None)
+        save_library(library)
+        self.history_panel.set_entries(self.history_entries)
+
+    def add_planned_notebook(self, folder_id: str = "") -> None:
+        filename = self._choose_pdf_file("Add planned PDF")
+        if not filename:
+            return
+        path = Path(filename)
+        pdf_key = pdf_key_for_path(path)
+        page_count = 0
+        try:
+            document = fitz.open(path)
+        except Exception:
+            document = None
+        if document is not None:
+            try:
+                page_count = document.page_count
+            finally:
+                document.close()
+
+        upsert_history_entry(
+            self.history_entries,
+            pdf_key=pdf_key,
+            path=path,
+            page_count=page_count,
+            last_page_index=0,
+            zoom=1.25,
+            fit_mode="",
+        )
+        save_history(self.history_entries, touched_pdf_keys={pdf_key})
+        if folder_id and folder_id != UNFILED_FOLDER_ID:
+            library = load_library()
+            folder_ids = {folder.id for folder in library.folders}
+            if folder_id in folder_ids:
+                library.assignments[pdf_key] = folder_id
+                save_library(library)
+        self.history_panel.set_entries(self.history_entries)
+
+    def export_history_entry_notes(self, pdf_key: str) -> None:
+        if self.pdf_key == pdf_key:
+            self.export_all_notes()
+            return
+
+        entry = find_history_entry(self.history_entries, pdf_key)
+        if entry is None:
+            return
+        notes, counters, bookmarks = load_notes_data(pdf_key)
+        if not notes:
+            self.statusBar().showMessage("No notes to export.", 3000)
+            return
+
+        document = None
+        path = Path(entry.path)
+        if path.exists():
+            try:
+                document = fitz.open(path)
+            except Exception:
+                document = None
+
+        exported = 0
+        try:
+            for note in sorted(notes, key=lambda item: (item.page_index, item.note_number, item.created_at)):
+                exported_path = self.export_markdown_note_for_pdf(
+                    pdf_path=path,
+                    note=note,
+                    document=document,
+                    replace_existing=bool(note.exported_markdown_path),
+                )
+                if exported_path is not None:
+                    exported += 1
+        finally:
+            if document is not None:
+                document.close()
+        save_notes(
+            pdf_key=pdf_key,
+            pdf_path=path,
+            notes=notes,
+            note_counters=counters,
+            bookmarks=bookmarks,
+        )
+        self.statusBar().showMessage(f"Exported {exported} Markdown notes.", 5000)
+
     def show_home(self) -> None:
-        self._record_current_pdf()
+        self._save_active_pdf_tab_state()
         self.history_panel.set_entries(self.history_entries)
         self.main_stack.setCurrentWidget(self.history_panel)
+        self._refresh_document_chrome()
         self._refresh_actions()
 
     def show_reader(self) -> None:
         if self.document is not None:
             self.main_stack.setCurrentWidget(self.reader_splitter)
+        self._refresh_document_chrome()
         self._refresh_actions()
 
     def set_outline_visible(self, visible: bool) -> None:
         anchor_page = self.page_index
         with QSignalBlocker(self.outline_action):
             self.outline_action.setChecked(visible)
+        with QSignalBlocker(self.outline_toggle_button):
+            self.outline_toggle_button.setChecked(visible)
 
         was_suppressed = self._suppress_scroll_sync
         self._suppress_scroll_sync = True
@@ -1902,13 +3234,6 @@ class MainWindow(QMainWindow):
             return None
         scroll_value = self.scroll_area.verticalScrollBar().value()
         page_index = self.page_index
-        if self.page_tops and self.page_heights:
-            visible_y = scroll_value + 1
-            for candidate, page_top in enumerate(self.page_tops):
-                page_bottom = page_top + self.page_heights[candidate]
-                if page_top <= visible_y <= page_bottom:
-                    page_index = candidate
-                    break
         if not self._has_page_geometry(page_index):
             return page_index, scroll_value
         return page_index, scroll_value - self.page_tops[page_index]
@@ -1971,6 +3296,9 @@ class MainWindow(QMainWindow):
     def _page_text_words(self, page_index: int) -> list[dict[str, object]]:
         if self.document is None:
             return []
+        cached_words = self.page_text_words_cache.get(page_index)
+        if cached_words is not None:
+            return cached_words
 
         page = self.document.load_page(page_index)
         rect = page.rect
@@ -1996,6 +3324,7 @@ class MainWindow(QMainWindow):
                     "word_no": int(word_no),
                 }
             )
+        self.page_text_words_cache[page_index] = words
         return words
 
     def _cache_page_base_sizes(self) -> None:
@@ -2392,7 +3721,28 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self.note_export_dir = Path(path)
+        self.settings["markdown_export_dir"] = str(self.note_export_dir)
+        save_settings(self.settings)
         self.note_panel.set_folder_path(self.note_export_dir)
+
+    def current_note_location_dir(self) -> Path:
+        note_id = self.note_panel.current_note_id
+        note = find_note(self.notes, note_id) if note_id is not None else None
+        if note is not None and note.exported_markdown_path:
+            return Path(note.exported_markdown_path).expanduser().parent
+        if self.pdf_path is not None:
+            return self.note_export_dir / self._safe_filename(self.pdf_path.stem, max_length=48)
+        return self.note_export_dir
+
+    def open_current_note_location(self) -> None:
+        target = self.current_note_location_dir()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Open notes folder failed", f"Could not create notes folder:\n{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
+            self.statusBar().showMessage(f"Could not open notes folder: {target}", 5000)
 
     def add_bookmark(self) -> None:
         self.add_bookmark_for_page(self.page_index)
@@ -2507,26 +3857,42 @@ class MainWindow(QMainWindow):
         if self.pdf_path is None:
             return None
 
+        path = self.export_markdown_note_for_pdf(
+            pdf_path=self.pdf_path,
+            note=note,
+            document=self.document,
+            replace_existing=replace_existing,
+        )
+        if path is not None:
+            self.persist_notes()
+        return path
+
+    def export_markdown_note_for_pdf(
+        self,
+        *,
+        pdf_path: Path,
+        note: Note,
+        document: fitz.Document | None,
+        replace_existing: bool = False,
+    ) -> Path | None:
         if replace_existing and note.exported_markdown_path:
             path = Path(note.exported_markdown_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(note.markdown, encoding="utf-8")
             note.exported_markdown_path = str(path)
-            self.persist_notes()
             return path
 
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        pdf_name = self._safe_filename(self.pdf_path.stem, max_length=48)
+        pdf_name = self._safe_filename(pdf_path.stem, max_length=48)
         export_dir = self.note_export_dir / pdf_name
         export_dir.mkdir(parents=True, exist_ok=True)
-        location = self._safe_filename(self._note_location_label(note.page_index), max_length=48)
+        location = self._safe_filename(self._note_location_label_for_document(document, note.page_index), max_length=48)
         note_number = self._note_number(note)
         filename_stem = self._safe_filename(f"{timestamp}-{location}-{note_number}", max_length=150)
         path = export_dir / f"{filename_stem}.md"
         path = self._unique_markdown_path(path)
         path.write_text(note.markdown, encoding="utf-8")
         note.exported_markdown_path = str(path)
-        self.persist_notes()
         return path
 
     def _default_note_title(self, page_index: int, note_number: int) -> str:
@@ -2534,6 +3900,9 @@ class MainWindow(QMainWindow):
 
     def _note_location_label(self, page_index: int) -> str:
         return self._chapter_name_for_page(page_index) or f"page-{page_index + 1}"
+
+    def _note_location_label_for_document(self, document: fitz.Document | None, page_index: int) -> str:
+        return self._chapter_name_for_document(document, page_index) or f"page-{page_index + 1}"
 
     def _counter_key(self, page_index: int) -> str:
         chapter = self._chapter_for_page(page_index)
@@ -2593,15 +3962,21 @@ class MainWindow(QMainWindow):
         return len(page_notes) + 1
 
     def _chapter_name_for_page(self, page_index: int) -> str | None:
-        chapter = self._chapter_for_page(page_index)
+        return self._chapter_name_for_document(self.document, page_index)
+
+    def _chapter_name_for_document(self, document: fitz.Document | None, page_index: int) -> str | None:
+        chapter = self._chapter_for_document(document, page_index)
         return chapter[0] if chapter is not None else None
 
     def _chapter_for_page(self, page_index: int) -> tuple[str, int] | None:
-        if self.document is None:
+        return self._chapter_for_document(self.document, page_index)
+
+    def _chapter_for_document(self, document: fitz.Document | None, page_index: int) -> tuple[str, int] | None:
+        if document is None:
             return None
 
         best: tuple[str, int] | None = None
-        for raw in self.document.get_toc():
+        for raw in document.get_toc():
             if len(raw) < 3:
                 continue
             toc_page_index = max(0, int(raw[2]) - 1)
@@ -2654,7 +4029,9 @@ class MainWindow(QMainWindow):
             return
         self.page_index = max(0, min(page_index, self.document.page_count - 1))
         self._record_current_pdf()
-        self.render_page()
+        self.render_page(center_current=False)
+        if self.continuous_scroll:
+            self._scroll_to_page(self.page_index, center=False)
 
     def go_to_page_number(self, page_number: int) -> None:
         if self.document is None or page_number < 1:
@@ -2739,13 +4116,26 @@ class MainWindow(QMainWindow):
             if closest_page in self.page_canvases:
                 self.canvas = self.page_canvases[closest_page]
             self._refresh_actions()
-            self._record_current_pdf()
             rendered_pages = sorted(self.page_canvases)
             needs_render = closest_page not in self.page_canvases
             if rendered_pages:
-                needs_render = needs_render or closest_page in (rendered_pages[0], rendered_pages[-1])
+                buffer_edge = max(1, self.render_page_buffer // 2)
+                needs_render = needs_render or closest_page <= rendered_pages[0] + buffer_edge
+                needs_render = needs_render or closest_page >= rendered_pages[-1] - buffer_edge
             if needs_render:
-                self.render_page(center_current=False)
+                self._schedule_page_window_render()
+
+    def _schedule_page_window_render(self) -> None:
+        if self.document is None:
+            return
+        self._page_window_render_token += 1
+        token = self._page_window_render_token
+        QTimer.singleShot(35, lambda token=token: self._render_scheduled_page_window(token))
+
+    def _render_scheduled_page_window(self, token: int) -> None:
+        if token != self._page_window_render_token or self.document is None:
+            return
+        self.render_page(center_current=False)
 
     def set_continuous_scroll(self, checked: bool) -> None:
         self.set_reading_mode("continuous" if checked else "single")
@@ -2863,15 +4253,45 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
             return
 
-        if event.key() in (Qt.Key_Left, Qt.Key_Up, Qt.Key_PageUp):
+        if self.main_stack.currentWidget() is self.history_panel and event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            key = self.history_panel.selected_pdf_key
+            if key:
+                if event.modifiers() & Qt.ShiftModifier:
+                    self.remove_history_entry(key)
+                else:
+                    self.archive_history_entry(key)
+                event.accept()
+                return
+
+        if event.key() in (Qt.Key_Left, Qt.Key_PageUp):
             self.previous_page()
             event.accept()
             return
-        if event.key() in (Qt.Key_Right, Qt.Key_Down, Qt.Key_PageDown):
+        if event.key() in (Qt.Key_Right, Qt.Key_PageDown):
             self.next_page()
             event.accept()
             return
+        if event.key() == Qt.Key_Up:
+            self.scroll_reader_lines(-1)
+            event.accept()
+            return
+        if event.key() == Qt.Key_Down:
+            self.scroll_reader_lines(1)
+            event.accept()
+            return
         super().keyPressEvent(event)
+
+    def scroll_reader_lines(self, direction: int) -> None:
+        if self.document is None:
+            return
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        step = max(16, self.wheel_scroll_lines * 40)
+        was_suppressed = self._suppress_scroll_sync
+        self._suppress_scroll_sync = True
+        try:
+            scroll_bar.setValue(max(0, min(scroll_bar.maximum(), scroll_bar.value() + direction * step)))
+        finally:
+            self._suppress_scroll_sync = was_suppressed
 
     def _refresh_actions(self) -> None:
         has_document = self.document is not None
@@ -2880,8 +4300,10 @@ class MainWindow(QMainWindow):
         self.next_page_button.setEnabled(has_document and self.page_index < page_count - 1)
         self.outline_action.setEnabled(has_document)
         self.reader_action.setEnabled(has_document)
+        self.outline_toggle_button.setEnabled(has_document and self.main_stack.currentWidget() is self.reader_splitter)
         self.page_spin.setEnabled(has_document)
         self.zoom_spin.setEnabled(has_document)
+        self._refresh_document_chrome()
 
         if has_document:
             with QSignalBlocker(self.page_spin):
@@ -2898,6 +4320,8 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self) -> None:
         colors = self._theme_colors()
+        down_arrow_icon = app_resource_path("Pic", "down-arrow.png").as_posix()
+        up_arrow_icon = app_resource_path("Pic", "up-arrow.png").as_posix()
         style = """
             QMainWindow {
                 background: {colors["window"]};
@@ -2923,8 +4347,146 @@ class MainWindow(QMainWindow):
                 background: {colors["button_hover"]};
             }
             QToolButton:checked {
-                background: {colors["editor"]};
+                background: {colors["button_hover"]};
+                color: {colors["text"]};
                 border-radius: 4px;
+            }
+            #DocumentTabStrip {
+                background: {colors["toolbar"]};
+                border-bottom: 1px solid {colors["border"]};
+            }
+            #DocumentTabBar {
+                background: {colors["toolbar"]};
+            }
+            #DocumentTabBar::tab {
+                background: transparent;
+                border: 0;
+                border-right: 1px solid {colors["border"]};
+                color: {colors["text"]};
+                min-width: 108px;
+                max-width: 250px;
+                padding: 8px 34px 8px 12px;
+            }
+            #DocumentTabBar::tab:selected {
+                background: {colors["editor"]};
+                border-bottom: 1px solid {colors["border"]};
+            }
+            #DocumentTabCloseButton {
+                background: transparent;
+                border: 0;
+                min-width: 18px;
+                max-width: 18px;
+                min-height: 18px;
+                max-height: 18px;
+                padding: 0px;
+            }
+            #DocumentTabCloseButton:hover {
+                background: {colors["button_hover"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 9px;
+            }
+            #DocumentTabCloseButton:focus {
+                background: {colors["button_hover"]};
+                border: 1px solid {colors["selection"]};
+                border-radius: 9px;
+            }
+            #OpenTabButton {
+                background: transparent;
+                border: 0;
+                border-left: 1px solid {colors["border"]};
+                border-radius: 0;
+                min-height: 34px;
+                padding: 0 14px;
+                font-weight: 600;
+            }
+            #OpenTabButton:hover {
+                background: {colors["button_hover"]};
+            }
+            #DocumentTitleBar {
+                background: {colors["panel"]};
+                border-bottom: 1px solid {colors["border"]};
+            }
+            #DocumentTitleLabel {
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 3px;
+                color: {colors["text"]};
+                font-size: 12px;
+                min-height: 22px;
+                padding: 0 8px;
+            }
+            #OutlineToggleButton {
+                padding: 3px 8px;
+            }
+            #LibraryLeftPanel, #LibraryRightPanel {
+                background: {colors["window"]};
+            }
+            #LibrarySidebarTitle {
+                font-weight: 700;
+            }
+            #LibraryFolderTree {
+                background: {colors["window"]};
+                border: 0;
+                outline: none;
+            }
+            #LibraryFolderTree::branch {
+                width: 16px;
+                height: 16px;
+            }
+            #LibraryFolderTree::branch:closed:has-children {
+                image: none;
+            }
+            #LibraryFolderTree::branch:open:has-children {
+                image: none;
+            }
+            #LibrarySearch {
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 12px;
+                min-height: 24px;
+                padding: 2px 12px;
+                color: {colors["text"]};
+            }
+            #HomeSettingsButton, #LibraryListModeButton, #LibraryIconModeButton {
+                padding: 4px;
+            }
+            #LibraryListHeader {
+                background: {colors["panel"]};
+                border-top: 1px solid {colors["border"]};
+                border-bottom: 1px solid {colors["border"]};
+                min-height: 32px;
+            }
+            #LibraryListHeaderLabel {
+                color: {colors["text"]};
+                font-weight: 600;
+            }
+            #LibraryRow, #LibraryRowMissing {
+                border-bottom: 1px solid {colors["border"]};
+                min-height: 58px;
+            }
+            #LibraryRow:hover, #LibraryGridCard:hover {
+                background: {colors["panel"]};
+            }
+            #LibraryRowMissing, #LibraryGridCardMissing {
+                color: {colors["muted"]};
+            }
+            #LibraryRowCover {
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+            }
+            #LibraryGridCard, #LibraryGridCardMissing {
+                background: transparent;
+                border: 1px solid {colors["border"]};
+                border-radius: 4px;
+            }
+            #LibraryGridCover {
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+            }
+            #LibraryGridTitle {
+                font-family: "Segoe UI", "Microsoft YaHei UI";
+                font-size: 13px;
+                font-weight: 500;
             }
             #OutlineMoreButton::menu-indicator {
                 image: none;
@@ -2966,16 +4528,26 @@ class MainWindow(QMainWindow):
                 background: {colors["panel"]};
                 border: 1px solid {colors["border"]};
                 color: {colors["text"]};
+                outline: none;
             }
             QTreeWidget::item {
                 min-height: 22px;
                 padding: 2px 4px;
+                outline: none;
             }
             QTreeWidget::item:selected {
-                background: {colors["button"]};
+                background: {colors["button_hover"]};
+                color: {colors["text"]};
+                border: 1px solid {colors["selection"]};
+            }
+            QTreeWidget::item:focus {
+                outline: none;
             }
             QSplitter::handle {
                 background: {colors["border"]};
+            }
+            QSplitter::handle:horizontal {
+                width: 1px;
             }
             QTabWidget::pane {
                 border: 1px solid {colors["border"]};
@@ -2987,12 +4559,14 @@ class MainWindow(QMainWindow):
             }
             QTabBar::tab:selected {
                 background: {colors["editor"]};
+                color: {colors["text"]};
             }
             QPlainTextEdit, QTextBrowser {
                 background: {colors["editor"]};
                 border: 1px solid {colors["border"]};
                 color: {colors["text"]};
                 selection-background-color: {colors["selection"]};
+                selection-color: {colors["text"]};
             }
             QPushButton {
                 background: {colors["button"]};
@@ -3002,6 +4576,16 @@ class MainWindow(QMainWindow):
                 padding: 5px 10px;
             }
             QPushButton:hover {
+                background: {colors["button_hover"]};
+            }
+            #CopyPathButton {
+                background: {colors["editor"]};
+                border: 1px solid {colors["border"]};
+                border-radius: 3px;
+                color: {colors["text"]};
+                padding: 0px;
+            }
+            #CopyPathButton:hover {
                 background: {colors["button_hover"]};
             }
             QPushButton:disabled {
@@ -3015,10 +4599,27 @@ class MainWindow(QMainWindow):
                 color: {colors["text"]};
                 min-height: 24px;
                 padding: 2px 6px;
+                selection-background-color: {colors["selection"]};
+                selection-color: {colors["text"]};
             }
             QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
                 background: {colors["button"]};
                 border-left: 1px solid {colors["border"]};
+            }
+            QComboBox::down-arrow {
+                image: url("{down_arrow_icon}");
+                width: 9px;
+                height: 9px;
+            }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: url("{up_arrow_icon}");
+                width: 9px;
+                height: 9px;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: url("{down_arrow_icon}");
+                width: 9px;
+                height: 9px;
             }
             #HistoryTitle {
                 font-size: 18px;
@@ -3037,8 +4638,9 @@ class MainWindow(QMainWindow):
                 border-color: {colors["underline"]};
             }
             #HistoryRowTitle {
-                font-size: 15px;
-                font-weight: 600;
+                font-family: "Segoe UI", "Microsoft YaHei UI";
+                font-size: 14px;
+                font-weight: 500;
             }
             #HistoryRowPath {
                 color: {colors["text"]};
@@ -3052,6 +4654,8 @@ class MainWindow(QMainWindow):
             """
         for key, value in colors.items():
             style = style.replace(f'{{colors["{key}"]}}', value)
+        style = style.replace("{down_arrow_icon}", down_arrow_icon)
+        style = style.replace("{up_arrow_icon}", up_arrow_icon)
         self.setStyleSheet(style)
         self._apply_reader_palette()
 
@@ -3070,7 +4674,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._save_runtime_settings()
-        self.close_document()
+        self._close_all_pdf_tabs()
         super().closeEvent(event)
 
 

@@ -4,7 +4,8 @@ A Python desktop PDF reader with external anchored Markdown notes.
 
 ## Features
 
-- Open and render local PDF files.
+- Open and render multiple local PDF files in browser-style tabs.
+- Use `Ctrl+W` to close the current PDF tab, and `Ctrl+1` through `Ctrl+9` to switch tabs.
 - Read in continuous vertical scroll mode by default, or switch to single-page mode from the PDF context menu.
 - Navigate pages with the bottom `- Page n / l +` control or keyboard arrow keys.
 - Jump by editing the bottom page number directly.
@@ -80,8 +81,8 @@ For end-user distribution on Windows, build the executable package with PyInstal
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.2.1-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.2.1-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.2.2-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.2.2-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
@@ -144,14 +145,35 @@ Notes and PDF-related metadata are saved outside the original PDF. The app never
 Default storage location:
 
 ```text
-<project-or-program-folder>\.local-data\
+<project-or-program-folder>\Note_PDFNest\
 ```
 
-Note JSON files are stored under:
+PDFNest stores PDF history, bookmarks, notebook data, and app settings in this structure:
 
 ```text
-<project-or-program-folder>\.local-data\notes\
+Note_PDFNest\
+|-- bookmarks\
+|   |-- <pdf_key>_bookmark.json
+|   `-- sync.lock
+|-- notebooks\
+|   |-- index.json
+|   `-- <PDF_name>\
+|       |-- note\
+|       |   `-- notes.json
+|       |-- cover.png
+|       |-- manifest.json
+|       |-- markups.json
+|       |-- recentfile.json
+|       `-- sync.lock
+|-- library.json
+|-- migration_state.json
+|-- recentnotes.json
+`-- user_config.json
 ```
+
+`library.json` stores PDFNest-only virtual folders, optional `parent_id` links for nested folders, and each PDF's folder assignment. It does not move or rename the original PDF files. Deleting a virtual folder only removes that folder metadata and returns its PDFs to `Unfiled`.
+
+On startup, PDFNest runs a one-time migration from the older `.local-data\pdf_history.json`, `.local-data\notes\*.json`, and `.local-data\settings.json` layout when those files are present. The migration writes `notebooks\index.json`, so normal note and bookmark lookups do not scan every notebook folder.
 
 The default Markdown export folder is:
 
@@ -161,30 +183,30 @@ The default Markdown export folder is:
 The app settings file is:
 
 ```text
-<project-or-program-folder>\.local-data\settings.json
+<project-or-program-folder>\Note_PDFNest\user_config.json
 ```
 
-It stores the selected theme name and note marker size. It does not store theme color definitions.
+It stores the selected theme name, note marker size, shortcut settings, and the configurable PDFNest data folder.
 
 Theme files are stored as independent JSON files under:
 
 ```text
-<project-or-program-folder>\.local-data\themes\
+<project-or-program-folder>\Note_PDFNest\themes\
 ```
 
-Each `*.json` filename becomes a theme name in Settings. For example, `.local-data\themes\white.json` appears as `white`. Default `beige.json` and `white.json` files are created automatically if they are missing.
+Each `*.json` filename becomes a theme name in Settings. For example, `Note_PDFNest\themes\white.json` appears as `white`. Default `beige.json` and `white.json` files are created automatically if they are missing.
 
 To store note files inside this project while developing, set `PDF_NOTES_READER_DATA_DIR` before launching the app:
 
 ```powershell
-$env:PDF_NOTES_READER_DATA_DIR = "$PWD\.local-data"
+$env:PDF_NOTES_READER_DATA_DIR = "$PWD\Note_PDFNest"
 .\.venv\Scripts\python.exe -m pdf_notes_reader.main
 ```
 
 With that setting, note files are written under:
 
 ```text
-.\.local-data\notes\<pdf_key>.json
+.\Note_PDFNest\notebooks\<PDF_name>\note\notes.json
 ```
 
 Markdown exports are written under this folder unless the base folder is changed from the right sidebar:
@@ -196,17 +218,17 @@ Markdown exports are written under this folder unless the base folder is changed
 The PDF history file is written under:
 
 ```text
-.\.local-data\pdf_history.json
+.\Note_PDFNest\recentnotes.json
 ```
 
 The settings file and theme folder are written under:
 
 ```text
-.\.local-data\settings.json
-.\.local-data\themes\*.json
+.\Note_PDFNest\user_config.json
+.\Note_PDFNest\themes\*.json
 ```
 
-The project `.gitignore` ignores `.local-data/`, so private local notes, Markdown exports, history, settings, and local themes are not picked up by Git by default.
+The project `.gitignore` ignores `.local-data/` and `Note_PDFNest/`, so private local notes, Markdown exports, history, settings, and local themes are not picked up by Git by default.
 
 ### PDF Key And File Naming
 
@@ -216,21 +238,21 @@ Each PDF gets a stable key derived from its canonical file path:
 pdf_key = first 24 characters of sha256(normcase(resolved_pdf_path))
 ```
 
-The note JSON file path is:
+The primary note data file path is:
 
 ```text
-<data_dir>\notes\<pdf_key>.json
+<data_dir>\notebooks\<PDF_name>\note\notes.json
 ```
 
-For example, if `PDF_NOTES_READER_DATA_DIR=F:\...\PDFReading\.local-data`, a PDF with key `abc123...` stores notes at:
+For example, if `PDF_NOTES_READER_DATA_DIR=F:\...\PDFReading\Note_PDFNest`, `example.pdf` stores notes at:
 
 ```text
-F:\...\PDFReading\.local-data\notes\abc123....json
+F:\...\PDFReading\Note_PDFNest\notebooks\example\note\notes.json
 ```
 
 ### JSON Contents
 
-Each PDF has one JSON file. The file stores the PDF key, the PDF path recorded when notes were saved, the schema version, and all note anchors/content. Point notes use `note_type: "point"`. Text highlights and underlines use `note_type: "highlight"` or `note_type: "underline"`, plus normalized text rectangles:
+Each PDF notebook has a `note` folder with a primary `notes.json` file. The file stores the PDF key, the PDF path recorded when notes were saved, the schema version, and all note anchors/content. Point notes use `note_type: "point"`. Text highlights and underlines use `note_type: "highlight"` or `note_type: "underline"`, plus normalized text rectangles:
 
 ```json
 {

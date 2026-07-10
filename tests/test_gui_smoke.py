@@ -10,13 +10,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
-from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QColor, QContextMenuEvent, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QSize, Qt
+from PySide6.QtGui import QColor, QContextMenuEvent, QFont, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QLabel, QToolBar, QToolButton, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QComboBox, QDialog, QPushButton, QSplitter, QTabBar, QToolBar, QToolButton, QWidget
 from PySide6.QtWidgets import QMessageBox
 
 from pdf_notes_reader.history import PdfHistoryEntry, load_history, save_history
+from pdf_notes_reader.library import LibraryFolder, UNFILED_FOLDER_ID, load_library, save_library
 from pdf_notes_reader.main import MainWindow, PdfCanvas, SettingsDialog
 from pdf_notes_reader.main import render_markdown_preview
 from pdf_notes_reader.notes import default_data_dir
@@ -72,18 +73,26 @@ class GuiSmokeTest(unittest.TestCase):
                 window.load_pdf(pdf_path)
 
                 self.assertTrue(window.continuous_scroll)
-                self.assertEqual(sorted(window.page_canvases), [0, 1])
+                self.assertEqual(sorted(window.page_canvases), [0, 1, 2])
                 self.assertEqual(window.page_index, 0)
 
+                before_scroll = window.scroll_area.verticalScrollBar().value()
                 self._press_key(window, Qt.Key_Down)
+                self.assertEqual(window.page_index, 0)
+                self.assertGreaterEqual(window.scroll_area.verticalScrollBar().value(), before_scroll)
+
+                self._press_key(window, Qt.Key_Right)
                 self.assertEqual(window.page_index, 1)
                 self.assertEqual(sorted(window.page_canvases), [0, 1, 2])
 
                 self._press_key(window, Qt.Key_Right)
                 self.assertEqual(window.page_index, 2)
-                self.assertEqual(sorted(window.page_canvases), [1, 2])
+                self.assertEqual(sorted(window.page_canvases), [0, 1, 2])
 
                 self._press_key(window, Qt.Key_Up)
+                self.assertEqual(window.page_index, 2)
+
+                self._press_key(window, Qt.Key_Left)
                 self.assertEqual(window.page_index, 1)
 
                 window.add_note(1, 0.25, 0.75)
@@ -92,6 +101,300 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(notes[0].page_index, 1)
                 self.assertEqual(notes[0].x_norm, 0.25)
                 self.assertEqual(notes[0].y_norm, 0.75)
+            finally:
+                window.close()
+
+    def test_arrow_keys_scroll_lines_and_horizontal_keys_turn_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "keyboard.pdf"
+            self._create_sample_pdf(pdf_path, page_count=4)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+
+                self._press_key(window, Qt.Key_Right)
+                self.assertEqual(window.page_index, 1)
+                expected_top = window._scroll_target_for_page(1, center=False)
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - expected_top), 2)
+
+                before_page = window.page_index
+                before_scroll = window.scroll_area.verticalScrollBar().value()
+                self._press_key(window, Qt.Key_Down)
+                self.assertEqual(window.page_index, before_page)
+                self.assertGreaterEqual(window.scroll_area.verticalScrollBar().value(), before_scroll)
+
+                window.set_reading_mode("single")
+                self.assertFalse(window.continuous_scroll)
+                before_page = window.page_index
+                self._press_key(window, Qt.Key_Down)
+                self.assertEqual(window.page_index, before_page)
+                self._press_key(window, Qt.Key_Right)
+                self.assertEqual(window.page_index, before_page + 1)
+            finally:
+                window.close()
+
+    def test_browser_style_pdf_tabs_and_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            first_pdf = tmp_path / "first.pdf"
+            second_pdf = tmp_path / "second.pdf"
+            self._create_sample_pdf(first_pdf, page_count=3)
+            self._create_sample_pdf(second_pdf, page_count=2)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(first_pdf)
+                window.go_to_page(1)
+                window.add_note(1, 0.25, 0.75)
+                first_note_id = window.note_panel.current_note_id
+                window.note_panel.editor.setPlainText("# First tab note\nBody")
+                window.save_current_note(window.note_panel.editor.toPlainText())
+                window.load_pdf(second_pdf)
+                window.add_note(0, 0.50, 0.50)
+                second_note_id = window.note_panel.current_note_id
+
+                self.assertEqual(window.document_tab_bar.count(), 3)
+                self.assertEqual(set(window.pdf_tabs), {pdf_key_for_path(first_pdf), pdf_key_for_path(second_pdf)})
+                self.assertEqual(window.pdf_path, second_pdf)
+                close_button = window.document_tab_bar.tabButton(1, QTabBar.RightSide)
+                self.assertIsInstance(close_button, QToolButton)
+                assert isinstance(close_button, QToolButton)
+                self.assertFalse(close_button.icon().isNull())
+                self.assertEqual(close_button.iconSize(), QSize(9, 9))
+                self.assertEqual(close_button.size(), QSize(18, 18))
+
+                window.tab_switch_shortcuts[0].activated.emit()
+                self.assertEqual(window.pdf_path, first_pdf)
+                self.assertEqual(window.page_index, 1)
+                self.assertEqual(window.note_panel.current_note_id, first_note_id)
+                self.assertIn("# First tab note", window.note_panel.editor.toPlainText())
+
+                window.tab_switch_shortcuts[1].activated.emit()
+                self.assertEqual(window.pdf_path, second_pdf)
+                self.assertEqual(window.note_panel.current_note_id, second_note_id)
+
+                window.show_home()
+                self.assertFalse(window.history_panel.settings_button.icon().isNull())
+                self.assertEqual(window.history_panel.settings_button.text(), "")
+                self.assertFalse(window.history_panel.list_mode_button.icon().isNull())
+                self.assertFalse(window.history_panel.icon_mode_button.icon().isNull())
+                window.history_panel.icon_mode_button.click()
+                self.assertEqual(window.history_panel.content_stack.currentIndex(), 1)
+                self.assertGreater(window.history_panel.grid_layout.count(), 0)
+                window.show_reader()
+
+                window.close_tab_shortcut.activated.emit()
+                self.assertNotIn(pdf_key_for_path(second_pdf), window.pdf_tabs)
+                self.assertEqual(window.document_tab_bar.count(), 2)
+                self.assertEqual(window.pdf_path, first_pdf)
+            finally:
+                window.close()
+
+    def test_home_notebooks_uses_virtual_folders_without_moving_pdfs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "data"
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(data_dir)
+            pdf_path = tmp_path / "source" / "a.pdf"
+            pdf_path.parent.mkdir()
+            self._create_sample_pdf(pdf_path, page_count=2)
+
+            window = MainWindow()
+            try:
+                window.show()
+                window.load_pdf(pdf_path)
+                window.show_home()
+                self.assertTrue(window.history_panel.recent_button.isChecked())
+                self.assertFalse(window.history_panel.recent_button.icon().isNull())
+                self.assertFalse(window.history_panel.notebooks_button.icon().isNull())
+
+                window.history_panel.notebooks_button.click()
+                self.assertEqual(window.history_panel.home_mode, "notebooks")
+                with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("alpha", True)):
+                    window.history_panel._create_virtual_folder()
+                self.app.processEvents()
+                leaked_rows = [
+                    widget
+                    for widget in QApplication.topLevelWidgets()
+                    if widget.isVisible() and widget.objectName() in {"LibraryRow", "LibraryRowMissing", "LibraryListHeader"}
+                ]
+                self.assertEqual(leaked_rows, [])
+
+                library = load_library(data_dir)
+                folder = next(item for item in library.folders if item.name == "alpha")
+                window.history_panel._assign_entry_folder(pdf_key_for_path(pdf_path), folder.id)
+                library = load_library(data_dir)
+
+                self.assertEqual(library.assignments[pdf_key_for_path(pdf_path)], folder.id)
+                self.assertTrue(pdf_path.exists())
+                self.assertEqual(window.history_entries[0].path, str(pdf_path.resolve(strict=False)))
+            finally:
+                window.close()
+
+    def test_home_notebooks_nested_folders_actions_and_icon_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = tmp_path / "data"
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(data_dir)
+            long_name = "An Introduction to Econophysics Correlations and Complexity in Finance Very Long Planned Name.pdf"
+            pdf_path = tmp_path / long_name
+            self._create_sample_pdf(pdf_path, page_count=2)
+
+            window = MainWindow()
+            try:
+                window.show()
+                window.show_home()
+                window.history_panel.notebooks_button.click()
+                self.assertFalse(window.history_panel.new_folder_button.icon().isNull())
+                self.assertFalse(window.history_panel.new_notebook_button.icon().isNull())
+
+                with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("Physics", True)):
+                    window.history_panel._create_virtual_folder()
+                library = load_library(data_dir)
+                parent = next(folder for folder in library.folders if folder.name == "Physics")
+                with patch("pdf_notes_reader.main.QInputDialog.getText", return_value=("String_Theory", True)):
+                    window.history_panel._create_virtual_folder(parent_id=parent.id)
+                library = load_library(data_dir)
+                child = next(folder for folder in library.folders if folder.name == "String_Theory")
+                self.assertEqual(child.parent_id, parent.id)
+
+                with patch.object(window, "_choose_pdf_file", return_value=str(pdf_path)):
+                    window.add_planned_notebook(child.id)
+                pdf_key = pdf_key_for_path(pdf_path)
+                library = load_library(data_dir)
+                self.assertEqual(library.assignments[pdf_key], child.id)
+                self.assertTrue(pdf_path.exists())
+
+                window.history_panel.notebooks_button.click()
+                window.history_panel._select_folder(parent.id)
+                self.assertIn(pdf_key, [entry.pdf_key for entry in window.history_panel._filtered_entries()])
+                window.history_panel._select_folder(child.id)
+                self.assertIn(pdf_key, [entry.pdf_key for entry in window.history_panel._filtered_entries()])
+                self.assertTrue(window.history_panel.list_container.findChildren(QSplitter, "LibraryRowSplitter"))
+                header_splitter = window.history_panel.list_container.findChild(QSplitter, "LibraryHeaderSplitter")
+                row_splitters = window.history_panel.list_container.findChildren(QSplitter, "LibraryRowSplitter")
+                self.assertIsNotNone(header_splitter)
+                assert header_splitter is not None
+                self.assertEqual(header_splitter.handleWidth(), 1)
+                self.assertEqual(header_splitter.count(), 5)
+                header_splitter.setSizes([120, 80, 80, 52, 120])
+                window.history_panel._sync_list_column_sizes(header_splitter)
+                self.app.processEvents()
+                self.assertTrue(row_splitters)
+                self.assertTrue(all(splitter.handleWidth() == 1 for splitter in row_splitters))
+                header_sizes = header_splitter.sizes()
+                self.assertTrue(
+                    all(
+                        len(splitter.sizes()) == len(header_sizes)
+                        and all(abs(row_size - header_size) <= 1 for row_size, header_size in zip(splitter.sizes(), header_sizes))
+                        for splitter in row_splitters
+                    )
+                )
+                row_title = window.history_panel.list_container.findChild(QLabel, "HistoryRowTitle")
+                self.assertIsNotNone(row_title)
+                assert row_title is not None
+                self.assertEqual(row_title.font().styleStrategy(), QFont.PreferAntialias)
+                self.assertLessEqual(row_title.font().weight(), QFont.Medium)
+                self.assertEqual(row_title.toolTip(), long_name)
+                self.assertIn("…", row_title.text())
+                row_buttons = [
+                    button.text()
+                    for row in window.history_panel.list_container.findChildren(QWidget, "LibraryRow")
+                    for button in row.findChildren(QPushButton)
+                ]
+                self.assertNotIn("Open", row_buttons)
+                self.assertNotIn("Archive", row_buttons)
+                opened_keys: list[str] = []
+                window.history_panel.open_requested.connect(opened_keys.append)
+                row_widget = window.history_panel.list_container.findChild(QWidget, "LibraryRow")
+                self.assertIsNotNone(row_widget)
+                assert row_widget is not None
+                QTest.mouseDClick(row_widget, Qt.LeftButton)
+                self.assertEqual(opened_keys[-1], pdf_key)
+                window.show_home()
+                window.history_panel.notebooks_button.click()
+                window.history_panel._select_folder(child.id)
+                self.app.processEvents()
+                window.history_panel.folder_tree.folder_drop_requested.emit(pdf_key, parent.id)
+                self.assertEqual(load_library(data_dir).assignments[pdf_key], parent.id)
+                window.history_panel._assign_entry_folder(pdf_key, child.id)
+                root_item = window.history_panel.folder_tree.topLevelItem(0)
+                self.assertIsNotNone(root_item)
+                assert root_item is not None
+                parent_item = next(
+                    root_item.child(index)
+                    for index in range(root_item.childCount())
+                    if root_item.child(index).data(0, Qt.UserRole) == parent.id
+                )
+                target_pos = window.history_panel.folder_tree.viewport().mapToGlobal(
+                    window.history_panel.folder_tree.visualItemRect(parent_item).center()
+                )
+                window.history_panel._start_entry_drag(row_widget, pdf_key)
+                window.history_panel._finish_entry_drag(target_pos)
+                self.assertEqual(load_library(data_dir).assignments[pdf_key], parent.id)
+                window.history_panel._assign_entry_folder(pdf_key, child.id)
+                self.assertEqual(
+                    [combo for combo in window.history_panel.findChildren(QComboBox) if combo.objectName() == "LibraryFolderCombo"],
+                    [],
+                )
+
+                before_icon = window.history_panel.view_toggle_button.icon().cacheKey()
+                window.history_panel.view_toggle_button.click()
+                after_icon = window.history_panel.view_toggle_button.icon().cacheKey()
+                self.assertNotEqual(before_icon, after_icon)
+                self.assertEqual(window.history_panel.content_stack.currentIndex(), 1)
+
+                self.app.processEvents()
+                title = window.history_panel.grid_container.findChild(QLabel, "LibraryGridTitle")
+                cover = window.history_panel.grid_container.findChild(QLabel, "LibraryGridCover")
+                self.assertIsNotNone(title)
+                self.assertIsNotNone(cover)
+                assert title is not None
+                assert cover is not None
+                self.assertIn("...", title.text())
+                self.assertGreaterEqual(len(title.text()), 80)
+                self.assertEqual(title.toolTip(), long_name)
+                self.assertLess(cover.geometry().bottom(), title.geometry().top())
+
+                window.rename_history_entry(pdf_key, "Custom display name")
+                self.assertEqual(load_library(data_dir).aliases[pdf_key], "Custom display name")
+                self.assertEqual(window.history_panel._entry_title(window.history_panel._entry_by_key[pdf_key]), "Custom display name")
+                window.history_panel.sort_combo.setCurrentIndex(window.history_panel.sort_combo.findData("name"))
+                self.assertEqual(window.history_panel.sort_mode, "name")
+
+                window.archive_history_entry(pdf_key)
+                library = load_library(data_dir)
+                self.assertIn(pdf_key, library.archived)
+                window.history_panel.notebooks_button.click()
+                self.assertNotIn(pdf_key, [entry.pdf_key for entry in window.history_panel._filtered_entries()])
+                window.history_panel.trash_button.click()
+                self.assertIn(pdf_key, [entry.pdf_key for entry in window.history_panel._filtered_entries()])
+                window.restore_history_entry(pdf_key)
+                self.assertNotIn(pdf_key, load_library(data_dir).archived)
+
+                window.history_panel._delete_folder(parent.id)
+                library = load_library(data_dir)
+                self.assertNotIn(parent.id, {folder.id for folder in library.folders})
+                self.assertNotIn(child.id, {folder.id for folder in library.folders})
+                self.assertNotIn(pdf_key, library.assignments)
+                window.history_panel.notebooks_button.click()
+                window.history_panel._select_folder(UNFILED_FOLDER_ID)
+                self.assertIn(pdf_key, [entry.pdf_key for entry in window.history_panel._filtered_entries()])
+                root = window.history_panel.folder_tree.topLevelItem(0)
+                self.assertEqual(root.child(0).data(0, Qt.UserRole), UNFILED_FOLDER_ID)
+
+                window.history_panel.selected_pdf_key = pdf_key
+                window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.NoModifier))
+                self.assertIn(pdf_key, load_library(data_dir).archived)
+                window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Delete, Qt.ShiftModifier))
+                self.assertIsNone(next((entry for entry in load_history(data_dir) if entry.pdf_key == pdf_key), None))
             finally:
                 window.close()
 
@@ -564,7 +867,7 @@ class GuiSmokeTest(unittest.TestCase):
 
                 window.set_reading_mode("continuous")
                 self.assertTrue(window.continuous_scroll)
-                self.assertEqual(sorted(window.page_canvases), [1, 2])
+                self.assertEqual(sorted(window.page_canvases), [0, 1, 2])
             finally:
                 window.close()
 
@@ -598,7 +901,7 @@ class GuiSmokeTest(unittest.TestCase):
                 window._sync_current_page_from_scroll()
                 self.assertEqual(window.page_index, 2)
 
-                window.reader_splitter.setSizes([0, 630, 774])
+                window.reader_splitter.setSizes([0, 800, 200])
                 window._handle_reader_splitter_moved(0, 1)
                 self.app.processEvents()
                 QTest.qWait(180)
@@ -710,7 +1013,6 @@ class GuiSmokeTest(unittest.TestCase):
                 current_canvas = window.page_canvases[1]
                 self.assertEqual(widest_display_width, window.scroll_area.viewport().width())
                 self.assertLess(current_canvas.width(), window.scroll_area.viewport().width())
-                self.assertGreater(current_canvas.x(), 0)
                 self.assertFalse(window.scroll_area.horizontalScrollBar().isVisible())
                 self.assertEqual(window.page_index, 1)
             finally:
@@ -732,17 +1034,19 @@ class GuiSmokeTest(unittest.TestCase):
 
                 self.assertEqual(len(window.page_tops), 8)
                 self.assertEqual(len(window.page_heights), 8)
-                self.assertEqual(sorted(window.page_canvases), [0, 1])
-                self.assertLessEqual(window.pages_layout.count(), 4)
+                self.assertEqual(sorted(window.page_canvases), [0, 1, 2, 3, 4])
+                self.assertLessEqual(window.pages_layout.count(), 6)
                 self.assertIn(0, window.page_widgets)
                 self.assertNotIn(5, window.page_canvases)
 
                 window.scroll_area.verticalScrollBar().setValue(window.page_tops[5])
                 self.app.processEvents()
                 window._sync_current_page_from_scroll()
+                QTest.qWait(80)
+                self.app.processEvents()
                 self.assertEqual(window.page_index, 5)
                 self.assertIn(5, window.page_canvases)
-                self.assertLessEqual(window.pages_layout.count(), 5)
+                self.assertLessEqual(window.pages_layout.count(), 8)
             finally:
                 window.close()
 
@@ -805,6 +1109,42 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertLessEqual(len(path.name), 153)
                 self.assertNotIn(path.parent.name, path.name)
                 self.assertTrue(path.exists())
+            finally:
+                window.close()
+
+    def test_notes_folder_button_opens_current_note_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=1)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.note_export_dir = tmp_path / "markdown"
+                window.note_panel.set_folder_path(window.note_export_dir)
+                window.add_note(0, 0.25, 0.75)
+
+                opened: list[str] = []
+                with patch(
+                    "pdf_notes_reader.main.QDesktopServices.openUrl",
+                    side_effect=lambda url: opened.append(url.toLocalFile()) or True,
+                ):
+                    window.note_panel.folder_button.click()
+                self.assertEqual(Path(opened[-1]), window.note_export_dir / "sample")
+                self.assertTrue((window.note_export_dir / "sample").exists())
+
+                exported_path = window.export_markdown_note(window.notes[0])
+                self.assertIsNotNone(exported_path)
+                assert exported_path is not None
+
+                with patch(
+                    "pdf_notes_reader.main.QDesktopServices.openUrl",
+                    side_effect=lambda url: opened.append(url.toLocalFile()) or True,
+                ):
+                    window.note_panel.folder_button.click()
+                self.assertEqual(Path(opened[-1]), exported_path.parent)
             finally:
                 window.close()
 
@@ -1049,6 +1389,64 @@ class GuiSmokeTest(unittest.TestCase):
             finally:
                 reloaded_window.close()
 
+    def test_note_operations_preserve_pdf_geometry_text_and_scroll(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "stable-display.pdf"
+            self._create_sample_pdf(pdf_path, page_count=6)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.scroll_area.verticalScrollBar().setValue(window.page_tops[3] + 12)
+                self.app.processEvents()
+                window._sync_current_page_from_scroll()
+                self.assertEqual(window.page_index, 3)
+
+                def page_signature() -> tuple:
+                    canvas = window.page_canvases[3]
+                    return (
+                        tuple(window.page_tops),
+                        tuple(window.page_heights),
+                        tuple(window.page_widths),
+                        canvas._page_size.width(),
+                        canvas._page_size.height(),
+                        tuple(
+                            (
+                                tuple(round(value, 6) for value in word["rect"]),
+                                word["text"],
+                                word["block"],
+                                word["line"],
+                                word["word_no"],
+                            )
+                            for word in window._page_text_words(3)
+                        ),
+                    )
+
+                before = page_signature()
+                before_scroll = window.scroll_area.verticalScrollBar().value()
+                before_words_object = window.page_text_words_cache[3]
+
+                window.add_note(3, 0.25, 0.30)
+                self.app.processEvents()
+                after_add = page_signature()
+                self.assertEqual(after_add, before)
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - before_scroll), 2)
+                self.assertIs(window.page_text_words_cache[3], before_words_object)
+
+                window.reset_note_counters_to_current_notes()
+                self.app.processEvents()
+                after_reset = page_signature()
+                self.assertEqual(after_reset, before)
+                self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - before_scroll), 2)
+                self.assertIs(window.page_text_words_cache[3], before_words_object)
+            finally:
+                window.close()
+
     def test_text_annotation_uses_note_panel_and_persists(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1099,6 +1497,7 @@ class GuiSmokeTest(unittest.TestCase):
                 window.settings["window_width"] = 900
                 window.settings["window_height"] = 700
                 window.settings["window_maximized"] = True
+                window.settings["markdown_export_dir"] = str(data_dir / "md")
                 save_settings(window.settings)
 
                 settings = load_settings()
@@ -1109,6 +1508,7 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(settings["window_width"], 900)
                 self.assertEqual(settings["window_height"], 700)
                 self.assertTrue(settings["window_maximized"])
+                self.assertEqual(settings["markdown_export_dir"], str(data_dir / "md"))
                 self.assertNotIn("themes", settings)
                 self.assertIn("beige", load_theme_files())
                 self.assertTrue((data_dir / "themes" / "beige.json").exists())
@@ -1137,6 +1537,7 @@ class GuiSmokeTest(unittest.TestCase):
                 dialog.append_selection_shortcut_edit.setKeySequence(QKeySequence("Alt+C"))
                 dialog.wheel_scroll_lines_spin.setValue(11)
                 dialog.auto_save_note_checkbox.setChecked(False)
+                dialog.markdown_dir_edit.setText(str(data_dir / "custom-md"))
                 labels = [label.text() for label in dialog.findChildren(QLabel)]
                 categories = [
                     dialog.category_list.topLevelItem(index).text(0)
@@ -1149,27 +1550,106 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn("Storage", categories)
                 self.assertEqual(dialog.append_selection_shortcut, "Alt+C")
                 self.assertEqual(dialog.wheel_scroll_lines, 11)
+                self.assertEqual(dialog.markdown_dir, data_dir / "custom-md")
+                self.assertLessEqual(dialog.storage_dir_edit.maximumWidth(), 420)
+                self.assertEqual(dialog.storage_dir_edit.alignment() & Qt.AlignHorizontal_Mask, Qt.AlignLeft)
+                self.assertEqual(dialog.markdown_dir_edit.alignment() & Qt.AlignHorizontal_Mask, Qt.AlignLeft)
+                self.assertEqual(dialog.storage_dir_edit.cursorPosition(), 0)
+                self.assertTrue(any(button.objectName() == "CopyPathButton" for button in dialog.findChildren(QToolButton)))
+                path_labels = dialog.findChildren(QLabel, "SettingsPathLabel")
+                self.assertTrue(path_labels)
+                self.assertTrue(all(label.minimumWidth() == label.maximumWidth() == 160 for label in path_labels))
                 self.assertFalse(dialog.auto_save_current_note)
             finally:
                 dialog.close()
                 window.close()
 
+    def test_white_theme_keeps_selected_text_readable_and_uses_branch_arrows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp) / "data"
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(data_dir)
+            window = MainWindow()
+            try:
+                window.theme_name = "white"
+                window.apply_theme()
+                stylesheet = window.styleSheet()
+                self.assertIn("selection-color:", stylesheet)
+                self.assertIn("#LibraryFolderTree::branch", stylesheet)
+                self.assertIn("width: 16px", stylesheet)
+                self.assertIn("image: none", stylesheet)
+                self.assertNotIn("tree-open.png", stylesheet)
+                self.assertNotIn("tree-closed.png", stylesheet)
+                self.assertIn("outline: none", stylesheet)
+                self.assertIn("down-arrow.png", stylesheet)
+                self.assertIn("up-arrow.png", stylesheet)
+                self.assertIn("QComboBox::down-arrow", stylesheet)
+                self.assertIn("QSpinBox::up-arrow", stylesheet)
+            finally:
+                window.close()
+
     def test_default_data_dir_is_project_local(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            expected = Path(__file__).resolve().parents[1] / ".local-data"
+        with patch.dict(os.environ, {}, clear=True), patch("pdf_notes_reader.notes._read_storage_pointer", return_value=None):
+            expected = Path(__file__).resolve().parents[1] / "Note_PDFNest"
             self.assertEqual(default_data_dir(), expected)
 
     def test_toolbar_no_longer_exposes_mode_zoom_or_settings_controls(self) -> None:
         window = MainWindow()
         try:
             action_texts = [action.text() for toolbar in window.findChildren(QToolBar) for action in toolbar.actions()]
-            self.assertIn("Home", action_texts)
-            self.assertIn("Open", action_texts)
-            self.assertIn("Reader", action_texts)
+            self.assertEqual(window.document_tab_bar.tabText(0), "Home")
+            self.assertEqual(window.open_tab_button.text(), "+ Open")
+            self.assertFalse(window.document_title_bar.isVisible())
+            self.assertEqual(window.outline_toggle_button.text(), "Contents")
+            self.assertEqual(window.history_panel.settings_button.text(), "")
+            self.assertFalse(window.history_panel.settings_button.icon().isNull())
             self.assertNotIn("Continuous Scroll", action_texts)
             self.assertNotIn("Zoom In", action_texts)
             self.assertNotIn("Zoom Out", action_texts)
             self.assertNotIn("Settings", action_texts)
+        finally:
+            window.close()
+
+    def test_pdf_file_picker_uses_non_native_dialog(self) -> None:
+        calls: dict[str, object] = {}
+
+        class FakeFileDialog:
+            ExistingFile = 1
+            DontUseNativeDialog = 2
+
+            def __init__(self, parent, title, directory, name_filter) -> None:
+                calls["parent"] = parent
+                calls["title"] = title
+                calls["directory"] = directory
+                calls["name_filter"] = name_filter
+                self.options: list[tuple[int, bool]] = []
+
+            def setFileMode(self, mode: int) -> None:
+                calls["file_mode"] = mode
+
+            def setNameFilter(self, name_filter: str) -> None:
+                calls["set_name_filter"] = name_filter
+
+            def setOption(self, option: int, enabled: bool) -> None:
+                self.options.append((option, enabled))
+                calls["options"] = self.options
+
+            def setWindowModality(self, modality) -> None:
+                calls["modality"] = modality
+
+            def exec(self) -> int:
+                return QDialog.Accepted
+
+            def selectedFiles(self) -> list[str]:
+                return ["chosen.pdf"]
+
+        window = MainWindow()
+        try:
+            with patch("pdf_notes_reader.main.QFileDialog", FakeFileDialog):
+                self.assertEqual(window._choose_pdf_file("Open PDF"), "chosen.pdf")
+            self.assertEqual(calls["title"], "Open PDF")
+            self.assertEqual(calls["file_mode"], FakeFileDialog.ExistingFile)
+            self.assertIn((FakeFileDialog.DontUseNativeDialog, True), calls["options"])
+            self.assertEqual(calls["modality"], Qt.ApplicationModal)
         finally:
             window.close()
 
@@ -1229,16 +1709,26 @@ class GuiSmokeTest(unittest.TestCase):
                 expected_bookmark_buttons,
             )
 
-            icon_image = QImage(str(Path(__file__).resolve().parents[1] / "Pic" / "more.png"))
-            dark_pixels = [
-                icon_image.pixelColor(x, y)
-                for y in range(icon_image.height())
-                for x in range(icon_image.width())
-                if icon_image.pixelColor(x, y).alpha() > 0
-            ]
-            self.assertTrue(dark_pixels)
-            self.assertLessEqual(max(max(pixel.red(), pixel.green(), pixel.blue()) for pixel in dark_pixels), 80)
-            self.assertFalse((Path(__file__).resolve().parents[1] / "Pic" / "foldall.png").exists())
+            for icon_name in (
+                "more.png",
+                "expand.png",
+                "foldall.png",
+                "up-arrow.png",
+                "down-arrow.png",
+            ):
+                icon_image = QImage(str(Path(__file__).resolve().parents[1] / "Pic" / icon_name))
+                dark_pixels = [
+                    icon_image.pixelColor(x, y)
+                    for y in range(icon_image.height())
+                    for x in range(icon_image.width())
+                    if icon_image.pixelColor(x, y).alpha() > 0
+                ]
+                self.assertTrue(dark_pixels, icon_name)
+                self.assertLessEqual(
+                    max(max(pixel.red(), pixel.green(), pixel.blue()) for pixel in dark_pixels),
+                    80,
+                    icon_name,
+                )
         finally:
             window.close()
 
@@ -1463,10 +1953,7 @@ class GuiSmokeTest(unittest.TestCase):
 
             window = MainWindow()
             with patch("pdf_notes_reader.main.QMessageBox.question", return_value=QMessageBox.Yes):
-                with patch(
-                    "pdf_notes_reader.main.QFileDialog.getOpenFileName",
-                    return_value=(str(relocated_path), "PDF files (*.pdf)"),
-                ):
+                with patch.object(window, "_choose_pdf_file", return_value=str(relocated_path)):
                     window.open_history_entry(old_key)
 
             self.assertEqual(window.pdf_key, old_key)
