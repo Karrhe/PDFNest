@@ -10,8 +10,8 @@ from pathlib import Path
 
 import fitz
 import markdown
-from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, QSignalBlocker, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -106,6 +106,7 @@ class PdfTabState:
     fit_mode: str | None
     current_note_id: str = ""
     page_text_words_cache: dict[int, list[dict[str, object]]] | None = None
+    reader_return_stack: list[tuple[int, int]] | None = None
 
 
 class ElidedLabel(QLabel):
@@ -898,7 +899,7 @@ class PdfCanvas(QWidget):
 
 
 class NotePanel(QWidget):
-    choose_folder_requested = Signal()
+    jump_note_requested = Signal()
     save_requested = Signal(str)
     export_requested = Signal(str)
     delete_requested = Signal()
@@ -929,14 +930,15 @@ class NotePanel(QWidget):
         self.save_button = QPushButton("Save")
         self.export_button = QPushButton("Export MD")
         self.delete_button = QPushButton("Delete")
-        self.folder_button = QPushButton("Notes folder")
+        self.folder_button = QPushButton("Go to note")
+        self.folder_button.setToolTip("Jump to this note in the PDF")
         self.folder_label = QLabel("")
         self.folder_label.setObjectName("NoteFolderLabel")
         self.folder_label.setWordWrap(True)
         self.save_button.clicked.connect(self._emit_save)
         self.export_button.clicked.connect(self._emit_export)
         self.delete_button.clicked.connect(self.delete_requested.emit)
-        self.folder_button.clicked.connect(self.choose_folder_requested.emit)
+        self.folder_button.clicked.connect(self.jump_note_requested.emit)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.save_button)
@@ -2364,6 +2366,7 @@ class MainWindow(QMainWindow):
         self.page_widths: list[int] = []
         self.page_text_words_cache: dict[int, list[dict[str, object]]] = {}
         self.document_content_size = QSize(1, 1)
+        self.reader_return_stack: list[tuple[int, int]] = []
         self._suppress_scroll_sync = False
         self._pending_scroll_id = 0
         self._fit_refresh_token = 0
@@ -2391,7 +2394,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
-        self.note_panel.choose_folder_requested.connect(self.open_current_note_location)
+        self.note_panel.jump_note_requested.connect(self.jump_to_current_note)
         self.note_panel.save_requested.connect(self.save_current_note)
         self.note_panel.export_requested.connect(self.export_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
@@ -2404,6 +2407,12 @@ class MainWindow(QMainWindow):
         self.next_page_button = QPushButton("+")
         self.next_page_button.setObjectName("PageNavButton")
         self.next_page_button.clicked.connect(self.next_page)
+        self.return_position_button = QToolButton()
+        self.return_position_button.setObjectName("PageNavButton")
+        self.return_position_button.setToolTip("Return to previous reading position")
+        self.return_position_button.setIcon(pic_icon("redo-disabled.png"))
+        self.return_position_button.setIconSize(QSize(16, 16))
+        self.return_position_button.clicked.connect(self.return_to_previous_reading_position)
         self.page_spin = QSpinBox()
         self.page_spin.setObjectName("PageSpin")
         self.page_spin.setRange(0, 0)
@@ -2426,6 +2435,7 @@ class MainWindow(QMainWindow):
         footer_layout.setContentsMargins(0, 4, 0, 6)
         footer_layout.setSpacing(8)
         footer_layout.addStretch(1)
+        footer_layout.addWidget(self.return_position_button)
         footer_layout.addWidget(self.prev_page_button)
         footer_layout.addWidget(self.page_spin)
         footer_layout.addWidget(self.page_count_label)
@@ -2444,7 +2454,7 @@ class MainWindow(QMainWindow):
         reader_layout.addWidget(footer, 0)
 
         self.outline_panel = OutlinePanel()
-        self.outline_panel.page_requested.connect(self.go_to_page)
+        self.outline_panel.page_requested.connect(self.jump_to_page_from_navigation)
         self.outline_panel.bookmark_add_requested.connect(self.add_bookmark)
         self.outline_panel.bookmark_delete_requested.connect(self.delete_bookmark)
         self.outline_panel.outline_new_requested.connect(self.add_outline_item)
@@ -2679,6 +2689,7 @@ class MainWindow(QMainWindow):
         state.zoom = self.zoom
         state.fit_mode = self.fit_mode
         state.current_note_id = self.note_panel.current_note_id or ""
+        state.reader_return_stack = list(self.reader_return_stack)
 
     def _activate_pdf_tab(self, pdf_key: str) -> None:
         state = self.pdf_tabs.get(pdf_key)
@@ -2704,6 +2715,7 @@ class MainWindow(QMainWindow):
         self.note_counters = state.note_counters
         self.bookmarks = state.bookmarks
         self.page_text_words_cache = state.page_text_words_cache or {}
+        self.reader_return_stack = list(state.reader_return_stack or [])
         self.page_index = max(0, min(state.page_index, max(self.document.page_count - 1, 0)))
         self.zoom = state.zoom
         self.fit_mode = state.fit_mode
@@ -2803,6 +2815,7 @@ class MainWindow(QMainWindow):
         self.page_heights = []
         self.page_widths = []
         self.page_text_words_cache = {}
+        self.reader_return_stack = []
         self.document_content_size = QSize(1, 1)
         self.note_panel.set_note(None)
         self._refresh_note_selector()
@@ -2932,6 +2945,7 @@ class MainWindow(QMainWindow):
         self.active_pdf_key = key
         self.notes, self.note_counters, self.bookmarks = load_notes_data(self.pdf_key)
         self.page_text_words_cache = {}
+        self.reader_return_stack = []
         self._ensure_note_counters()
         self._cache_page_base_sizes()
         if restore_last_page and entry is not None:
@@ -2959,6 +2973,7 @@ class MainWindow(QMainWindow):
             fit_mode=self.fit_mode,
             current_note_id=restored_note.id if restored_note is not None else "",
             page_text_words_cache=self.page_text_words_cache,
+            reader_return_stack=self.reader_return_stack,
         )
         self.pdf_tabs[key] = state
         self._add_pdf_tab(state)
@@ -3230,10 +3245,12 @@ class MainWindow(QMainWindow):
         self._restore_view_snapshot(view)
 
     def _current_view_snapshot(self) -> tuple[int, int] | None:
-        if self.document is None or not self.continuous_scroll:
+        if self.document is None:
             return None
         scroll_value = self.scroll_area.verticalScrollBar().value()
         page_index = self.page_index
+        if not self.continuous_scroll:
+            return page_index, scroll_value
         if not self._has_page_geometry(page_index):
             return page_index, scroll_value
         return page_index, scroll_value - self.page_tops[page_index]
@@ -3242,9 +3259,30 @@ class MainWindow(QMainWindow):
         if snapshot is None:
             return
         page_index, page_offset = snapshot
-        self._restore_page_offset(page_index, page_offset)
+        self._restore_reader_position(page_index, page_offset, rerender=False)
         for delay in (0, 50, 150):
-            QTimer.singleShot(delay, lambda page=page_index, offset=page_offset: self._restore_page_offset(page, offset))
+            QTimer.singleShot(delay, lambda page=page_index, offset=page_offset: self._restore_reader_position(page, offset, rerender=False))
+
+    def _push_reader_return_position(self) -> None:
+        snapshot = self._current_view_snapshot()
+        if snapshot is None:
+            return
+        self.reader_return_stack.append(snapshot)
+        if len(self.reader_return_stack) > 100:
+            self.reader_return_stack = self.reader_return_stack[-100:]
+        self._refresh_actions()
+
+    def _restore_reader_position(self, page_index: int, page_offset: int, *, rerender: bool = True) -> None:
+        if self.document is None:
+            return
+        page_index = max(0, min(page_index, self.document.page_count - 1))
+        self.page_index = page_index
+        if rerender:
+            self.render_page(center_current=False)
+        if self.continuous_scroll:
+            self._restore_page_offset(page_index, page_offset)
+        else:
+            self._restore_scroll_position(page_offset, page_index)
 
     def _restore_page_offset(self, page_index: int, page_offset: int) -> None:
         if self.document is None:
@@ -3552,6 +3590,34 @@ class MainWindow(QMainWindow):
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id if note else None)
 
+    def jump_to_current_note(self) -> None:
+        note_id = self.note_panel.current_note_id
+        note = find_note(self.notes, note_id) if note_id is not None else None
+        if note is None:
+            self.statusBar().showMessage("Select a note before jumping to it.", 3000)
+            return
+        self.jump_to_note(note)
+
+    def jump_to_note(self, note: Note) -> None:
+        if self.document is None:
+            return
+        self._push_reader_return_position()
+        self._go_to_page_offset(note.page_index, self._note_page_offset(note))
+        self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
+
+    def _note_page_offset(self, note: Note) -> int:
+        if self.document is None:
+            return 0
+        page_height = self._page_display_size(note.page_index).height()
+        rect_tops = [max(0.0, min(1.0, float(rect[1]))) for rect in note.rects_norm if len(rect) >= 4]
+        if rect_tops:
+            y_norm = min(rect_tops)
+        else:
+            y_norm = max(0.0, min(1.0, float(note.y_norm)))
+        viewport_margin = min(180, max(80, self.scroll_area.viewport().height() // 4))
+        return max(0, round(y_norm * page_height) - viewport_margin)
+
     def _auto_save_current_note(self) -> None:
         if not self.auto_save_current_note:
             return
@@ -3724,25 +3790,6 @@ class MainWindow(QMainWindow):
         self.settings["markdown_export_dir"] = str(self.note_export_dir)
         save_settings(self.settings)
         self.note_panel.set_folder_path(self.note_export_dir)
-
-    def current_note_location_dir(self) -> Path:
-        note_id = self.note_panel.current_note_id
-        note = find_note(self.notes, note_id) if note_id is not None else None
-        if note is not None and note.exported_markdown_path:
-            return Path(note.exported_markdown_path).expanduser().parent
-        if self.pdf_path is not None:
-            return self.note_export_dir / self._safe_filename(self.pdf_path.stem, max_length=48)
-        return self.note_export_dir
-
-    def open_current_note_location(self) -> None:
-        target = self.current_note_location_dir()
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            QMessageBox.warning(self, "Open notes folder failed", f"Could not create notes folder:\n{exc}")
-            return
-        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(target))):
-            self.statusBar().showMessage(f"Could not open notes folder: {target}", 5000)
 
     def add_bookmark(self) -> None:
         self.add_bookmark_for_page(self.page_index)
@@ -4033,10 +4080,37 @@ class MainWindow(QMainWindow):
         if self.continuous_scroll:
             self._scroll_to_page(self.page_index, center=False)
 
+    def jump_to_page_from_navigation(self, page_index: int) -> None:
+        if self.document is None:
+            return
+        self._push_reader_return_position()
+        self._go_to_page_offset(page_index, 0)
+
+    def return_to_previous_reading_position(self) -> None:
+        if self.document is None or not self.reader_return_stack:
+            self._refresh_actions()
+            return
+        page_index, page_offset = self.reader_return_stack.pop()
+        self._restore_reader_position(page_index, page_offset)
+        self._refresh_actions()
+
+    def _go_to_page_offset(self, page_index: int, page_offset: int) -> None:
+        if self.document is None:
+            return
+        self.page_index = max(0, min(page_index, self.document.page_count - 1))
+        self._record_current_pdf()
+        if self.continuous_scroll:
+            self.render_page(center_current=False)
+            self._restore_page_offset(self.page_index, page_offset)
+        else:
+            self.render_page(center_current=False)
+            self._restore_scroll_position(page_offset, self.page_index)
+
     def go_to_page_number(self, page_number: int) -> None:
         if self.document is None or page_number < 1:
             return
-        self.go_to_page(page_number - 1)
+        self._push_reader_return_position()
+        self._go_to_page_offset(page_number - 1, 0)
 
     def _scroll_to_page(self, page_index: int, *, center: bool = False) -> None:
         if not self._has_page_geometry(page_index):
@@ -4298,6 +4372,9 @@ class MainWindow(QMainWindow):
         page_count = self.document.page_count if self.document is not None else 0
         self.prev_page_button.setEnabled(has_document and self.page_index > 0)
         self.next_page_button.setEnabled(has_document and self.page_index < page_count - 1)
+        can_return = has_document and bool(self.reader_return_stack)
+        self.return_position_button.setEnabled(can_return)
+        self.return_position_button.setIcon(pic_icon("redo.png" if can_return else "redo-disabled.png"))
         self.outline_action.setEnabled(has_document)
         self.reader_action.setEnabled(has_document)
         self.outline_toggle_button.setEnabled(has_document and self.main_stack.currentWidget() is self.reader_splitter)

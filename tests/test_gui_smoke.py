@@ -1112,39 +1112,84 @@ class GuiSmokeTest(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_notes_folder_button_opens_current_note_location(self) -> None:
+    def test_go_to_note_button_jumps_reader_and_return_button_restores_position(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
             pdf_path = tmp_path / "sample.pdf"
-            self._create_sample_pdf(pdf_path, page_count=1)
+            self._create_sample_pdf(pdf_path, page_count=4)
 
             window = MainWindow()
             try:
                 window.load_pdf(pdf_path)
-                window.note_export_dir = tmp_path / "markdown"
-                window.note_panel.set_folder_path(window.note_export_dir)
-                window.add_note(0, 0.25, 0.75)
+                window.show()
+                QTest.qWait(80)
+                self.app.processEvents()
+                self.assertEqual(window.note_panel.folder_button.text(), "Go to note")
+                self.assertFalse(window.return_position_button.isEnabled())
 
-                opened: list[str] = []
-                with patch(
-                    "pdf_notes_reader.main.QDesktopServices.openUrl",
-                    side_effect=lambda url: opened.append(url.toLocalFile()) or True,
-                ):
-                    window.note_panel.folder_button.click()
-                self.assertEqual(Path(opened[-1]), window.note_export_dir / "sample")
-                self.assertTrue((window.note_export_dir / "sample").exists())
+                window.add_note(1, 0.25, 0.75)
+                note = window.notes[0]
+                window._go_to_page_offset(3, 160)
+                QTest.qWait(80)
+                self.app.processEvents()
+                previous_position = window._current_view_snapshot()
 
-                exported_path = window.export_markdown_note(window.notes[0])
-                self.assertIsNotNone(exported_path)
-                assert exported_path is not None
+                window.note_panel.folder_button.click()
+                QTest.qWait(160)
+                self.app.processEvents()
 
-                with patch(
-                    "pdf_notes_reader.main.QDesktopServices.openUrl",
-                    side_effect=lambda url: opened.append(url.toLocalFile()) or True,
-                ):
-                    window.note_panel.folder_button.click()
-                self.assertEqual(Path(opened[-1]), exported_path.parent)
+                self.assertEqual(window.page_index, note.page_index)
+                self.assertTrue(window.return_position_button.isEnabled())
+                self.assertEqual(window.reader_return_stack[-1], previous_position)
+
+                window.return_position_button.click()
+                QTest.qWait(160)
+                self.app.processEvents()
+
+                self.assertEqual(window._current_view_snapshot(), previous_position)
+                self.assertFalse(window.return_position_button.isEnabled())
+            finally:
+                window.close()
+
+    def test_return_position_records_jumps_but_not_normal_paging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "sample.pdf"
+            self._create_sample_pdf(pdf_path, page_count=4)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.show()
+                QTest.qWait(80)
+                self.app.processEvents()
+
+                window.next_page()
+                QTest.qWait(80)
+                self.app.processEvents()
+                self.assertEqual(window.page_index, 1)
+                self.assertEqual(window.reader_return_stack, [])
+
+                before_page_number_jump = window._current_view_snapshot()
+                window.page_spin.setValue(4)
+                QTest.qWait(120)
+                self.app.processEvents()
+                self.assertEqual(window.page_index, 3)
+                self.assertEqual(window.reader_return_stack[-1], before_page_number_jump)
+
+                window.return_to_previous_reading_position()
+                QTest.qWait(120)
+                self.app.processEvents()
+                self.assertEqual(window._current_view_snapshot(), before_page_number_jump)
+                self.assertEqual(window.reader_return_stack, [])
+
+                same_page_snapshot = window._current_view_snapshot()
+                window.jump_to_page_from_navigation(window.page_index)
+                QTest.qWait(120)
+                self.app.processEvents()
+                self.assertEqual(window.reader_return_stack[-1], same_page_snapshot)
             finally:
                 window.close()
 
