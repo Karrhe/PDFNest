@@ -648,6 +648,36 @@ class GuiSmokeTest(unittest.TestCase):
             [[0.1, 0.1, 0.4, 0.18], [0.1, 0.25, 0.4, 0.33], [0.1, 0.4, 0.2, 0.48]],
         )
 
+    def test_pdf_canvas_selection_uses_linewise_boundaries(self) -> None:
+        pixmap = QPixmap(400, 200)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas()
+        canvas.set_page(
+            pixmap,
+            [],
+            text_words=[
+                {"rect": [0.10, 0.10, 0.175, 0.20], "text": "one", "block": 0, "line": 0, "word_no": 0},
+                {"rect": [0.20, 0.10, 0.275, 0.20], "text": "two", "block": 0, "line": 0, "word_no": 1},
+                {"rect": [0.30, 0.10, 0.400, 0.20], "text": "three", "block": 0, "line": 0, "word_no": 2},
+                {"rect": [0.425, 0.10, 0.525, 0.20], "text": "four", "block": 0, "line": 0, "word_no": 3},
+                {"rect": [0.10, 0.30, 0.1875, 0.40], "text": "five", "block": 0, "line": 1, "word_no": 0},
+                {"rect": [0.2125, 0.30, 0.2875, 0.40], "text": "six", "block": 0, "line": 1, "word_no": 1},
+                {"rect": [0.30, 0.30, 0.400, 0.40], "text": "seven", "block": 0, "line": 1, "word_no": 2},
+                {"rect": [0.425, 0.30, 0.525, 0.40], "text": "eight", "block": 0, "line": 1, "word_no": 3},
+            ],
+        )
+
+        canvas._selection_start = QPoint(130, 30)
+        canvas._selection_end = QPoint(35, 70)
+        canvas._update_text_selection()
+        self.assertEqual(canvas._selected_text, "three four")
+        self.assertEqual(canvas._selected_rects_norm, [[0.3, 0.1, 0.525, 0.2]])
+
+        canvas._selection_end = QPoint(95, 70)
+        canvas._update_text_selection()
+        self.assertEqual(canvas._selected_text, "three four\nfive six")
+        self.assertEqual(canvas._selected_rects_norm, [[0.3, 0.1, 0.525, 0.2], [0.1, 0.3, 0.2875, 0.4]])
+
     def test_reopens_pdf_at_last_page(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1073,6 +1103,39 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.page_index, 5)
                 self.assertIn(5, window.page_canvases)
                 self.assertLessEqual(window.pages_layout.count(), 8)
+            finally:
+                window.close()
+
+    def test_continuous_scroll_renders_visible_placeholder_before_page_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "visible-placeholder.pdf"
+            self._create_sample_pdf(pdf_path, page_count=8)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.go_to_page(4)
+                self.app.processEvents()
+                window.render_page(center_current=False, render_neighbors=False)
+                self.app.processEvents()
+                self.assertEqual(sorted(window.page_canvases), [4])
+
+                scroll_bar = window.scroll_area.verticalScrollBar()
+                target_scroll = window.page_tops[4] + window.page_heights[4] - 90
+                scroll_bar.setValue(target_scroll)
+                self.assertGreater(scroll_bar.value() + window.scroll_area.viewport().height(), window.page_tops[5])
+                window._sync_current_page_from_scroll()
+                self.assertEqual(window.page_index, 4)
+                self.assertNotIn(5, window.page_canvases)
+
+                QTest.qWait(80)
+                self.app.processEvents()
+                self.assertIn(5, window.page_canvases)
             finally:
                 window.close()
 

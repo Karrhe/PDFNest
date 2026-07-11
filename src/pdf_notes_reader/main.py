@@ -822,30 +822,106 @@ class PdfCanvas(QWidget):
         return [self._norm_rect_to_page(rect) for rect in self._selected_rects_norm]
 
     def _update_text_selection(self) -> None:
-        selection = self._selection_rect()
-        if selection is None:
+        if self._selection_start is None or self._selection_end is None:
             return
 
         ordered_words = sorted(self._text_words, key=self._word_sort_key)
-        intersecting_indexes = [
-            index
-            for index, word in enumerate(ordered_words)
-            if self._norm_rect_to_page(word["rect"]).intersects(selection)
-        ]
-        if not intersecting_indexes:
+        if not ordered_words:
             self._selected_rects_norm = []
             self._selected_text = ""
             return
 
-        first_index = min(intersecting_indexes)
-        last_index = max(intersecting_indexes)
-        selected = ordered_words[first_index : last_index + 1]
+        line_groups = self._word_line_groups(ordered_words)
+        start_endpoint = self._selection_endpoint(self._selection_start, line_groups)
+        end_endpoint = self._selection_endpoint(self._selection_end, line_groups)
+        first_index, last_index = self._selection_word_bounds(start_endpoint, end_endpoint)
+        if first_index >= last_index:
+            self._selected_rects_norm = []
+            self._selected_text = ""
+            return
+
+        selected = ordered_words[first_index:last_index]
         self._selected_rects_norm = self._merge_word_rects_by_line(selected)
         self._selected_text = self._join_selected_words(selected)
 
     @staticmethod
     def _word_sort_key(word: dict[str, object]) -> tuple[int, int, int]:
         return (int(word["block"]), int(word["line"]), int(word["word_no"]))
+
+    @staticmethod
+    def _word_line_groups(words: list[dict[str, object]]) -> list[tuple[int, list[dict[str, object]]]]:
+        groups: list[tuple[int, list[dict[str, object]]]] = []
+        current_key: tuple[int, int] | None = None
+        current_start = 0
+        current_words: list[dict[str, object]] = []
+        for index, word in enumerate(words):
+            key = (int(word["block"]), int(word["line"]))
+            if current_key is None:
+                current_key = key
+                current_start = index
+            elif key != current_key:
+                groups.append((current_start, current_words))
+                current_key = key
+                current_start = index
+                current_words = []
+            current_words.append(word)
+        if current_words:
+            groups.append((current_start, current_words))
+        return groups
+
+    def _selection_endpoint(
+        self,
+        point: QPoint,
+        line_groups: list[tuple[int, list[dict[str, object]]]],
+    ) -> tuple[int, int | None]:
+        line_start, line_words = self._closest_word_line(point, line_groups)
+        hit_index: int | None = None
+        boundary = line_start + len(line_words)
+        for local_index, word in enumerate(line_words):
+            word_rect = self._norm_rect_to_page(word["rect"])
+            if hit_index is None and word_rect.contains(point):
+                hit_index = line_start + local_index
+            if point.x() < word_rect.center().x():
+                boundary = line_start + local_index
+                break
+        return boundary, hit_index
+
+    def _closest_word_line(
+        self,
+        point: QPoint,
+        line_groups: list[tuple[int, list[dict[str, object]]]],
+    ) -> tuple[int, list[dict[str, object]]]:
+        best_group = line_groups[0]
+        best_distance = float("inf")
+        for line_start, line_words in line_groups:
+            rects = [self._norm_rect_to_page(word["rect"]) for word in line_words]
+            top = min(rect.top() for rect in rects)
+            bottom = max(rect.bottom() for rect in rects)
+            if top <= point.y() <= bottom:
+                return line_start, line_words
+            distance = min(abs(point.y() - top), abs(point.y() - bottom))
+            if distance < best_distance:
+                best_distance = distance
+                best_group = (line_start, line_words)
+        return best_group
+
+    @staticmethod
+    def _selection_word_bounds(
+        start_endpoint: tuple[int, int | None],
+        end_endpoint: tuple[int, int | None],
+    ) -> tuple[int, int]:
+        start_boundary, start_hit = start_endpoint
+        end_boundary, end_hit = end_endpoint
+        if start_boundary <= end_boundary:
+            lower_boundary, lower_hit = start_boundary, start_hit
+            upper_boundary, upper_hit = end_boundary, end_hit
+        else:
+            lower_boundary, lower_hit = end_boundary, end_hit
+            upper_boundary, upper_hit = start_boundary, start_hit
+
+        first_index = min(lower_boundary, lower_hit) if lower_hit is not None else lower_boundary
+        last_index = max(upper_boundary, upper_hit + 1) if upper_hit is not None else upper_boundary
+        return first_index, last_index
 
     @staticmethod
     def _join_selected_words(words: list[dict[str, object]]) -> str:
@@ -3254,8 +3330,8 @@ class MainWindow(QMainWindow):
         self._suppress_scroll_sync = True
         try:
             self._clear_page_widgets()
-            rendered_pages = set(self._page_indexes_to_render(render_neighbors=render_neighbors))
             self._recalculate_page_metrics()
+            rendered_pages = set(self._page_indexes_to_render(render_neighbors=render_neighbors))
             if self.continuous_scroll:
                 self._populate_continuous_pages(rendered_pages)
             else:
@@ -3343,14 +3419,31 @@ class MainWindow(QMainWindow):
         finally:
             self._suppress_scroll_sync = was_suppressed
 
-    def _page_indexes_to_render(self, *, render_neighbors: bool = True) -> range:
+    def _page_indexes_to_render(self, *, render_neighbors: bool = True) -> list[int]:
         if self.document is None:
-            return range(0)
+            return []
         if not self.continuous_scroll or not render_neighbors:
-            return range(self.page_index, self.page_index + 1)
+            return [self.page_index]
         start = max(0, self.page_index - self.render_page_buffer)
         end = min(self.document.page_count, self.page_index + self.render_page_buffer + 1)
-        return range(start, end)
+        page_indexes = set(range(start, end))
+        page_indexes.update(self._visible_page_indexes())
+        return sorted(page_indexes)
+
+    def _visible_page_indexes(self, *, margin: int = 0) -> list[int]:
+        if self.document is None or not self.page_tops:
+            return []
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        viewport_top = scroll_bar.value() - margin
+        viewport_bottom = scroll_bar.value() + self.scroll_area.viewport().height() + margin
+        visible_pages: list[int] = []
+        for page_index, page_top in enumerate(self.page_tops):
+            if page_index >= len(self.page_heights):
+                break
+            page_bottom = page_top + self.page_heights[page_index]
+            if page_bottom >= viewport_top and page_top <= viewport_bottom:
+                visible_pages.append(page_index)
+        return visible_pages
 
     def _render_page_pixmap(self, page_index: int) -> tuple[QPixmap, QSize]:
         if self.document is None:
@@ -4236,19 +4329,22 @@ class MainWindow(QMainWindow):
                 closest_distance = distance
                 closest_page = page_index
 
-        if closest_page != self.page_index:
+        page_changed = closest_page != self.page_index
+        if page_changed:
             self.page_index = closest_page
             if closest_page in self.page_canvases:
                 self.canvas = self.page_canvases[closest_page]
             self._refresh_actions()
-            rendered_pages = sorted(self.page_canvases)
-            needs_render = closest_page not in self.page_canvases
-            if rendered_pages:
-                buffer_edge = max(1, self.render_page_buffer // 2)
-                needs_render = needs_render or closest_page <= rendered_pages[0] + buffer_edge
-                needs_render = needs_render or closest_page >= rendered_pages[-1] - buffer_edge
-            if needs_render:
-                self._schedule_page_window_render()
+
+        rendered_pages = sorted(self.page_canvases)
+        needs_render = closest_page not in self.page_canvases
+        needs_render = needs_render or any(page_index not in self.page_canvases for page_index in self._visible_page_indexes(margin=24))
+        if rendered_pages:
+            buffer_edge = max(1, self.render_page_buffer // 2)
+            needs_render = needs_render or closest_page <= rendered_pages[0] + buffer_edge
+            needs_render = needs_render or closest_page >= rendered_pages[-1] - buffer_edge
+        if needs_render:
+            self._schedule_page_window_render()
 
     def _schedule_page_window_render(self) -> None:
         if self.document is None:
