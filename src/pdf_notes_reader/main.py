@@ -2347,6 +2347,7 @@ class MainWindow(QMainWindow):
         self.pdf_tabs: dict[str, PdfTabState] = {}
         self.active_pdf_key: str | None = None
         self._updating_pdf_tabs = False
+        self._updating_document_title_combo = False
         self.notes: list[Note] = []
         self.note_counters: dict[str, int] = {}
         self.bookmarks: list[Bookmark] = []
@@ -2413,11 +2414,13 @@ class MainWindow(QMainWindow):
         self.return_position_button.setIcon(pic_icon("redo-disabled.png"))
         self.return_position_button.setIconSize(QSize(16, 16))
         self.return_position_button.clicked.connect(self.return_to_previous_reading_position)
-        self.page_spin = QSpinBox()
+        self.page_spin = QLineEdit()
         self.page_spin.setObjectName("PageSpin")
-        self.page_spin.setRange(0, 0)
-        self.page_spin.setPrefix("Page ")
-        self.page_spin.valueChanged.connect(self.go_to_page_number)
+        self.page_spin.setAlignment(Qt.AlignCenter)
+        self.page_spin.setFixedWidth(86)
+        self.page_spin.returnPressed.connect(self.commit_page_number_input)
+        self.page_spin.editingFinished.connect(self.reset_page_number_input)
+        self.page_spin.installEventFilter(self)
         self.page_count_label = QLabel("/ 0")
         self.page_count_label.setObjectName("BottomPageLabel")
         self.zoom_spin = QDoubleSpinBox()
@@ -2516,10 +2519,10 @@ class MainWindow(QMainWindow):
         self.outline_toggle_button.setChecked(True)
         self.outline_toggle_button.clicked.connect(self.set_outline_visible)
 
-        self.document_title_label = QLabel(APP_TITLE)
-        self.document_title_label.setObjectName("DocumentTitleLabel")
-        self.document_title_label.setAlignment(Qt.AlignCenter)
-        self.document_title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.document_title_combo = QComboBox()
+        self.document_title_combo.setObjectName("DocumentTitleCombo")
+        self.document_title_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.document_title_combo.activated.connect(self.switch_to_document_title_index)
 
         title_bar = QWidget()
         title_bar.setObjectName("DocumentTitleBar")
@@ -2528,7 +2531,7 @@ class MainWindow(QMainWindow):
         title_bar_layout.setContentsMargins(4, 2, 8, 2)
         title_bar_layout.setSpacing(8)
         title_bar_layout.addWidget(self.outline_toggle_button, 0)
-        title_bar_layout.addWidget(self.document_title_label, 1)
+        title_bar_layout.addWidget(self.document_title_combo, 1)
 
         window_content = QWidget()
         window_content.setObjectName("WindowContent")
@@ -2750,6 +2753,13 @@ class MainWindow(QMainWindow):
         if pdf_key:
             self._activate_pdf_tab(pdf_key)
 
+    def switch_to_document_title_index(self, index: int) -> None:
+        if self._updating_document_title_combo:
+            return
+        pdf_key = str(self.document_title_combo.itemData(index) or "")
+        if pdf_key:
+            self._activate_pdf_tab(pdf_key)
+
     def _handle_document_tab_changed(self, index: int) -> None:
         if self._updating_pdf_tabs:
             return
@@ -2841,20 +2851,44 @@ class MainWindow(QMainWindow):
 
     def _refresh_document_chrome(self) -> None:
         has_document = self.document is not None and self.pdf_path is not None
+        self._refresh_document_title_combo()
         if self.main_stack.currentWidget() is self.history_panel:
             self.document_title_bar.setVisible(False)
-            self.document_title_label.setText(APP_TITLE)
             self.outline_toggle_button.setEnabled(False)
             self._set_current_document_tab(0)
             return
 
         self.document_title_bar.setVisible(True)
-        self.document_title_label.setText(self.pdf_path.name if has_document and self.pdf_path is not None else APP_TITLE)
         self.outline_toggle_button.setEnabled(has_document)
         self.outline_toggle_button.setChecked(self.outline_panel.isVisible())
         if self.active_pdf_key is not None:
             index = self._pdf_tab_index(self.active_pdf_key)
             self._set_current_document_tab(index)
+
+    def _refresh_document_title_combo(self) -> None:
+        self._updating_document_title_combo = True
+        try:
+            self.document_title_combo.clear()
+            current_index = -1
+            for tab_index in range(1, self.document_tab_bar.count()):
+                pdf_key = str(self.document_tab_bar.tabData(tab_index) or "")
+                state = self.pdf_tabs.get(pdf_key)
+                if state is None:
+                    continue
+                combo_index = self.document_title_combo.count()
+                self.document_title_combo.addItem(state.pdf_path.name, pdf_key)
+                self.document_title_combo.setItemData(combo_index, str(state.pdf_path), Qt.ToolTipRole)
+                if pdf_key == self.active_pdf_key:
+                    current_index = combo_index
+            if self.document_title_combo.count() == 0:
+                self.document_title_combo.addItem(APP_TITLE, "")
+                self.document_title_combo.setEnabled(False)
+            else:
+                self.document_title_combo.setEnabled(True)
+                if current_index >= 0:
+                    self.document_title_combo.setCurrentIndex(current_index)
+        finally:
+            self._updating_document_title_combo = False
 
     def open_settings(self) -> None:
         old_data_dir = default_data_dir()
@@ -4107,10 +4141,27 @@ class MainWindow(QMainWindow):
             self._restore_scroll_position(page_offset, self.page_index)
 
     def go_to_page_number(self, page_number: int) -> None:
-        if self.document is None or page_number < 1:
+        if self.document is None or page_number < 1 or page_number > self.document.page_count:
             return
         self._push_reader_return_position()
         self._go_to_page_offset(page_number - 1, 0)
+
+    def commit_page_number_input(self) -> None:
+        if self.document is None:
+            self.page_spin.setText("")
+            return
+        text = self.page_spin.text().strip()
+        if not text.isdigit():
+            self._refresh_actions()
+            return
+        page_number = int(text)
+        if page_number < 1 or page_number > self.document.page_count:
+            self._refresh_actions()
+            return
+        self.go_to_page_number(page_number)
+
+    def reset_page_number_input(self) -> None:
+        self._refresh_actions()
 
     def _scroll_to_page(self, page_index: int, *, center: bool = False) -> None:
         if not self._has_page_geometry(page_index):
@@ -4306,6 +4357,8 @@ class MainWindow(QMainWindow):
         self._schedule_fit_refresh(anchor_page=self.page_index)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        if hasattr(self, "page_spin") and watched is self.page_spin and event.type() == QEvent.FocusOut:
+            self.reset_page_number_input()
         if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport():
             if event.type() == QEvent.Resize:
                 self._schedule_fit_refresh(anchor_page=self.page_index)
@@ -4384,13 +4437,11 @@ class MainWindow(QMainWindow):
 
         if has_document:
             with QSignalBlocker(self.page_spin):
-                self.page_spin.setRange(1, page_count)
-                self.page_spin.setValue(self.page_index + 1)
+                self.page_spin.setText(str(self.page_index + 1))
             self.page_count_label.setText(f"/ {page_count}")
         else:
             with QSignalBlocker(self.page_spin):
-                self.page_spin.setRange(0, 0)
-                self.page_spin.setValue(0)
+                self.page_spin.setText("")
             self.page_count_label.setText("/ 0")
         with QSignalBlocker(self.zoom_spin):
             self.zoom_spin.setValue(round(self.zoom * 100))
@@ -4483,7 +4534,7 @@ class MainWindow(QMainWindow):
                 background: {colors["panel"]};
                 border-bottom: 1px solid {colors["border"]};
             }
-            #DocumentTitleLabel {
+            #DocumentTitleCombo {
                 background: {colors["editor"]};
                 border: 1px solid {colors["border"]};
                 border-radius: 3px;
@@ -4491,6 +4542,16 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 min-height: 22px;
                 padding: 0 8px;
+            }
+            #DocumentTitleCombo::drop-down {
+                background: {colors["button"]};
+                border-left: 1px solid {colors["border"]};
+                width: 24px;
+            }
+            #DocumentTitleCombo::down-arrow {
+                image: url("{down_arrow_icon}");
+                width: 9px;
+                height: 9px;
             }
             #OutlineToggleButton {
                 padding: 3px 8px;
@@ -4669,7 +4730,7 @@ class MainWindow(QMainWindow):
                 background: {colors["border"]};
                 color: {colors["muted"]};
             }
-            QComboBox, QSpinBox, QDoubleSpinBox {
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
                 background: {colors["editor"]};
                 border: 1px solid {colors["border"]};
                 border-radius: 4px;

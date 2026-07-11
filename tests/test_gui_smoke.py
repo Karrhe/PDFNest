@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import fitz
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt
-from PySide6.QtGui import QColor, QContextMenuEvent, QFont, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
+from PySide6.QtGui import QColor, QContextMenuEvent, QFocusEvent, QFont, QImage, QKeyEvent, QKeySequence, QPainter, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QComboBox, QDialog, QPushButton, QSplitter, QTabBar, QToolBar, QToolButton, QWidget
 from PySide6.QtWidgets import QMessageBox
@@ -163,12 +163,22 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.document_tab_bar.count(), 3)
                 self.assertEqual(set(window.pdf_tabs), {pdf_key_for_path(first_pdf), pdf_key_for_path(second_pdf)})
                 self.assertEqual(window.pdf_path, second_pdf)
+                self.assertEqual(window.document_title_combo.count(), 2)
+                self.assertEqual(window.document_title_combo.currentText(), second_pdf.name)
+                self.assertEqual(
+                    [window.document_title_combo.itemData(index) for index in range(window.document_title_combo.count())],
+                    [pdf_key_for_path(first_pdf), pdf_key_for_path(second_pdf)],
+                )
                 close_button = window.document_tab_bar.tabButton(1, QTabBar.RightSide)
                 self.assertIsInstance(close_button, QToolButton)
                 assert isinstance(close_button, QToolButton)
                 self.assertFalse(close_button.icon().isNull())
                 self.assertEqual(close_button.iconSize(), QSize(9, 9))
                 self.assertEqual(close_button.size(), QSize(18, 18))
+
+                window.switch_to_document_title_index(0)
+                self.assertEqual(window.pdf_path, first_pdf)
+                self.assertEqual(window.document_title_combo.currentText(), first_pdf.name)
 
                 window.tab_switch_shortcuts[0].activated.emit()
                 self.assertEqual(window.pdf_path, first_pdf)
@@ -849,17 +859,33 @@ class GuiSmokeTest(unittest.TestCase):
             window = MainWindow()
             try:
                 window.load_pdf(pdf_path)
-                self.assertEqual(window.page_spin.value(), 1)
+                window.show()
+                QTest.qWait(80)
+                self.app.processEvents()
+                self.assertEqual(window.page_spin.text(), "1")
                 self.assertEqual(window.page_count_label.text(), "/ 3")
                 self.assertFalse(window.prev_page_button.isEnabled())
                 self.assertTrue(window.next_page_button.isEnabled())
 
                 window.next_page_button.click()
                 self.assertEqual(window.page_index, 1)
-                self.assertEqual(window.page_spin.value(), 2)
+                self.assertEqual(window.page_spin.text(), "2")
 
-                window.page_spin.setValue(3)
+                window.page_spin.setText("3")
+                QTest.keyClick(window.page_spin, Qt.Key_Return)
                 self.assertEqual(window.page_index, 2)
+
+                window.page_spin.setText("4")
+                QTest.keyClick(window.page_spin, Qt.Key_Return)
+                self.assertEqual(window.page_index, 2)
+                self.assertEqual(window.page_spin.text(), "3")
+
+                window.page_spin.setFocus()
+                window.page_spin.setText("1")
+                QApplication.sendEvent(window.page_spin, QFocusEvent(QEvent.FocusOut))
+                self.app.processEvents()
+                self.assertEqual(window.page_index, 2)
+                self.assertEqual(window.page_spin.text(), "3")
 
                 window.set_reading_mode("single")
                 self.assertFalse(window.continuous_scroll)
@@ -1173,7 +1199,8 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.reader_return_stack, [])
 
                 before_page_number_jump = window._current_view_snapshot()
-                window.page_spin.setValue(4)
+                window.page_spin.setText("4")
+                QTest.keyClick(window.page_spin, Qt.Key_Return)
                 QTest.qWait(120)
                 self.app.processEvents()
                 self.assertEqual(window.page_index, 3)
