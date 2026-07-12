@@ -32,6 +32,8 @@ class Note:
     rects_norm: list[list[float]] = field(default_factory=list)
     selected_text: str = ""
     color: str = ""
+    linked_note_id: str = ""
+    marker_style: str = "dashed_underline"
     note_number: int = 0
     exported_markdown_path: str = ""
 
@@ -48,6 +50,8 @@ class Note:
         rects_norm: list[list[float]] | None = None,
         selected_text: str = "",
         color: str = "",
+        linked_note_id: str = "",
+        marker_style: str = "dashed_underline",
         note_number: int = 0,
         exported_markdown_path: str = "",
     ) -> "Note":
@@ -65,6 +69,8 @@ class Note:
             rects_norm=rects_norm or [],
             selected_text=selected_text,
             color=str(color),
+            linked_note_id=str(linked_note_id),
+            marker_style=str(marker_style or "dashed_underline"),
             note_number=max(0, int(note_number)),
             exported_markdown_path=str(exported_markdown_path),
         )
@@ -84,6 +90,8 @@ class Note:
             rects_norm=normalize_rects(data.get("rects_norm", [])),
             selected_text=str(data.get("selected_text", "")),
             color=str(data.get("color", "")),
+            linked_note_id=str(data.get("linked_note_id", "")),
+            marker_style=str(data.get("marker_style") or "dashed_underline"),
             note_number=normalize_nonnegative_int(data.get("note_number"), default=0),
             exported_markdown_path=str(data.get("exported_markdown_path", "")),
         )

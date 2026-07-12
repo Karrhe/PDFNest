@@ -173,6 +173,25 @@ ANNOTATION_COLORS = [
     ("Red", "#fca5a5"),
     ("Purple", "#c4b5fd"),
 ]
+EXCERPT_MARKER_COLOR = "#2563eb"
+EXCERPT_MARKER_STYLES = {
+    "dashed_underline": "Dashed underline",
+    "highlight": "Highlight",
+    "underline": "Underline",
+}
+SELECTION_SHORTCUTS = {
+    "highlight_selection_shortcut": ("Highlight selection", "Ctrl+H"),
+    "underline_selection_shortcut": ("Underline selection", "Ctrl+U"),
+    "append_highlight_selection_shortcut": ("Add selection to note as highlight", "Ctrl+Shift+H"),
+    "append_underline_selection_shortcut": ("Add selection to note as underline", "Ctrl+Shift+U"),
+}
+SELECTION_COLOR_SETTINGS = {
+    "append_selection_color": ("Add selection to current note", "#93c5fd"),
+    "highlight_selection_color": ("Highlight selection", "#fca5a5"),
+    "underline_selection_color": ("Underline selection", "#fca5a5"),
+    "append_highlight_selection_color": ("Add to note as highlight", "#93c5fd"),
+    "append_underline_selection_color": ("Add to note as underline", "#93c5fd"),
+}
 
 
 def app_resource_path(*parts: str) -> Path:
@@ -482,13 +501,14 @@ def render_markdown_preview(text: str) -> str:
 
 class PdfCanvas(QWidget):
     add_note_requested = Signal(int, float, float)
-    append_selection_requested = Signal(str)
+    append_selection_requested = Signal(int, list, str)
     annotation_requested = Signal(int, str, list, str, str)
     bookmark_requested = Signal(int)
     fit_requested = Signal(str)
     mode_requested = Signal(str)
     note_selected = Signal(str)
     note_color_requested = Signal(str, str)
+    note_style_requested = Signal(str, str)
     note_delete_requested = Signal(str)
     reset_note_counters_requested = Signal()
     settings_requested = Signal()
@@ -537,6 +557,11 @@ class PdfCanvas(QWidget):
         self.setFixedSize(self._page_size)
         self.update()
 
+    def set_notes(self, notes: list[Note]) -> None:
+        """Refresh annotation overlays without recreating or rerasterizing the page."""
+        self._notes = notes
+        self.update()
+
     def clear_selection(self) -> None:
         self._selection_start = None
         self._selection_end = None
@@ -576,16 +601,29 @@ class PdfCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         for note in self._notes:
-            if note.note_type not in {"highlight", "underline"}:
+            if note.note_type not in {"highlight", "underline", "excerpt"}:
                 continue
             for rect in note.rects_norm:
                 page_rect = self._norm_rect_to_page(rect)
                 if note.note_type == "highlight":
                     color = QColor(note.color or self._theme_colors.get("highlight", "#fde68a"))
-                    color.setAlpha(105)
-                    painter.fillRect(page_rect, color)
-                else:
+                    self._fill_highlight(painter, page_rect, color)
+                elif note.note_type == "underline":
                     pen = QPen(QColor(note.color or self._theme_colors.get("underline", "#2563eb")), 2)
+                    painter.setPen(pen)
+                    y = page_rect.bottom() - 1
+                    painter.drawLine(page_rect.left(), y, page_rect.right(), y)
+                elif note.marker_style == "highlight":
+                    color = QColor(note.color or EXCERPT_MARKER_COLOR)
+                    self._fill_highlight(painter, page_rect, color)
+                elif note.marker_style == "underline":
+                    pen = QPen(QColor(note.color or EXCERPT_MARKER_COLOR), 2)
+                    painter.setPen(pen)
+                    y = page_rect.bottom() - 1
+                    painter.drawLine(page_rect.left(), y, page_rect.right(), y)
+                else:
+                    # A dashed underline identifies text copied into the current note.
+                    pen = QPen(QColor(note.color or EXCERPT_MARKER_COLOR), 2, Qt.DashLine)
                     painter.setPen(pen)
                     y = page_rect.bottom() - 1
                     painter.drawLine(page_rect.left(), y, page_rect.right(), y)
@@ -627,8 +665,24 @@ class PdfCanvas(QWidget):
         single_page_action.setChecked(not self._continuous_scroll)
 
         note_color_actions: dict[QAction, str] = {}
+        note_style_actions: dict[QAction, str] = {}
         highlight_actions: dict[QAction, str] = {}
         underline_actions: dict[QAction, str] = {}
+
+        if self._selected_text:
+            highlight_menu = menu.addMenu("Highlight selection")
+            underline_menu = menu.addMenu("Underline selection")
+            for label, color in ANNOTATION_COLORS:
+                highlight_action = QAction(label, self)
+                underline_action = QAction(label, self)
+                highlight_menu.addAction(highlight_action)
+                underline_menu.addAction(underline_action)
+                highlight_actions[highlight_action] = color
+                underline_actions[underline_action] = color
+            menu.addSeparator()
+            menu.addAction(copy_action)
+            menu.addAction(append_selection_action)
+            menu.addSeparator()
 
         if target_note is not None:
             menu.addAction(open_note_action)
@@ -640,24 +694,25 @@ class PdfCanvas(QWidget):
             custom_action = QAction("Custom color...", self)
             color_menu.addAction(custom_action)
             note_color_actions[custom_action] = ""
+            if target_note.note_type in {"excerpt", "highlight", "underline"}:
+                style_menu = menu.addMenu("Change marker style" if target_note.note_type == "excerpt" else "Change annotation style")
+                available_styles = EXCERPT_MARKER_STYLES if target_note.note_type == "excerpt" else {
+                    "highlight": "Highlight",
+                    "underline": "Underline",
+                }
+                current_style = target_note.marker_style if target_note.note_type == "excerpt" else target_note.note_type
+                for style, label in available_styles.items():
+                    action = QAction(label, self)
+                    action.setCheckable(True)
+                    action.setChecked(current_style == style)
+                    style_menu.addAction(action)
+                    note_style_actions[action] = style
             menu.addAction(delete_note_action)
             menu.addSeparator()
 
         menu.addAction(add_action)
         menu.addAction(add_bookmark_action)
         menu.addAction(reset_note_numbers_action)
-        if self._selected_text:
-            menu.addAction(copy_action)
-            menu.addAction(append_selection_action)
-            highlight_menu = menu.addMenu("Highlight selection")
-            underline_menu = menu.addMenu("Underline selection")
-            for label, color in ANNOTATION_COLORS:
-                highlight_action = QAction(label, self)
-                underline_action = QAction(label, self)
-                highlight_menu.addAction(highlight_action)
-                underline_menu.addAction(underline_action)
-                highlight_actions[highlight_action] = color
-                underline_actions[underline_action] = color
         menu.addSeparator()
         menu.addAction(fit_width_action)
         menu.addAction(fit_height_action)
@@ -670,7 +725,7 @@ class PdfCanvas(QWidget):
         if chosen is None:
             return
         if chosen == open_note_action and target_note is not None:
-            self.note_selected.emit(target_note.id)
+            self.note_selected.emit(target_note.linked_note_id or target_note.id)
         elif chosen == delete_note_action and target_note is not None:
             self.note_delete_requested.emit(target_note.id)
         elif chosen in note_color_actions and target_note is not None:
@@ -681,6 +736,8 @@ class PdfCanvas(QWidget):
                     return
                 color = picked.name()
             self.note_color_requested.emit(target_note.id, color)
+        elif chosen in note_style_actions and target_note is not None:
+            self.note_style_requested.emit(target_note.id, note_style_actions[chosen])
         elif chosen == add_action:
             x_norm, y_norm = self._point_to_norm(event.pos())
             self.add_note_requested.emit(self.page_index, x_norm, y_norm)
@@ -691,8 +748,9 @@ class PdfCanvas(QWidget):
         elif chosen == copy_action:
             self.copy_selected_text()
         elif chosen == append_selection_action:
+            selected_rects = [list(rect) for rect in self._selected_rects_norm]
             selected_text = self._selected_text
-            self.append_selection_requested.emit(selected_text)
+            self.append_selection_requested.emit(self.page_index, selected_rects, selected_text)
             self.clear_selection()
             self.update()
         elif chosen in highlight_actions:
@@ -724,7 +782,7 @@ class PdfCanvas(QWidget):
 
         note = self._note_at(event.pos())
         if note is not None:
-            self.note_selected.emit(note.id)
+            self.note_selected.emit(note.linked_note_id or note.id)
             event.accept()
             return
 
@@ -783,6 +841,16 @@ class PdfCanvas(QWidget):
         if self._pixmap is None:
             return False
         return 0 <= point.x() < self._page_size.width() and 0 <= point.y() < self._page_size.height()
+
+    @staticmethod
+    def _fill_highlight(painter: QPainter, rect, color: QColor) -> None:
+        """Tint the page while preserving dark glyph contrast beneath the fill."""
+        fill = QColor(color)
+        fill.setAlpha(105)
+        painter.save()
+        painter.setCompositionMode(QPainter.CompositionMode_Multiply)
+        painter.fillRect(rect, fill)
+        painter.restore()
 
     def _point_to_norm(self, point: QPoint) -> tuple[float, float]:
         if self._pixmap is None or self._page_size.width() == 0 or self._page_size.height() == 0:
@@ -967,7 +1035,7 @@ class PdfCanvas(QWidget):
                 delta = center - point
                 if delta.x() * delta.x() + delta.y() * delta.y() <= (self._marker_radius + 5) ** 2:
                     return note
-            elif note.note_type in {"highlight", "underline"}:
+            elif note.note_type in {"highlight", "underline", "excerpt"}:
                 for rect in note.rects_norm:
                     if self._norm_rect_to_page(rect).contains(point):
                         return note
@@ -1058,7 +1126,7 @@ class NotePanel(QWidget):
         self._update_preview()
 
     def set_notes(self, notes: list[Note], current_note_id: str | None = None) -> None:
-        self._notes = sorted(notes, key=lambda item: (item.page_index, item.created_at))
+        self._notes = sorted((note for note in notes if note.note_type != "excerpt"), key=lambda item: (item.page_index, item.created_at))
         if current_note_id is not None:
             self._current_note_id = current_note_id
 
@@ -2176,7 +2244,7 @@ class SettingsDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("PDFNest Settings")
-        self.resize(680, 460)
+        self.resize(760, 560)
         self.setMinimumWidth(720)
 
         self.theme_combo = QComboBox()
@@ -2201,6 +2269,33 @@ class SettingsDialog(QDialog):
         self.append_selection_shortcut_edit = QKeySequenceEdit()
         shortcut_text = str(settings.get("append_selection_shortcut") or "Ctrl+Shift+C")
         self.append_selection_shortcut_edit.setKeySequence(QKeySequence(shortcut_text))
+        self.selection_shortcut_edits: dict[str, QKeySequenceEdit] = {}
+        for setting_key, (_label, default_shortcut) in SELECTION_SHORTCUTS.items():
+            edit = QKeySequenceEdit()
+            edit.setKeySequence(QKeySequence(str(settings.get(setting_key) or default_shortcut)))
+            self.selection_shortcut_edits[setting_key] = edit
+
+        self.selection_color_combos: dict[str, QComboBox] = {}
+        for setting_key, (_label, default_color) in SELECTION_COLOR_SETTINGS.items():
+            color = QColor(str(settings.get(setting_key) or default_color))
+            if not color.isValid():
+                color = QColor(default_color)
+            combo = QComboBox()
+            combo.setMinimumWidth(180)
+            for label, preset_color in ANNOTATION_COLORS:
+                combo.addItem(label, preset_color)
+            combo.addItem("Custom color...", "")
+            normalized = color.name()
+            index = combo.findData(normalized)
+            if index < 0:
+                index = combo.count() - 1
+                combo.setItemText(index, f"Custom color... ({normalized})")
+                combo.setItemData(index, normalized)
+            combo.setCurrentIndex(index)
+            combo.setProperty("selectedColor", normalized)
+            combo.currentIndexChanged.connect(lambda selected, key=setting_key: self._selection_color_changed(key, selected))
+            combo.activated.connect(lambda selected, key=setting_key: self._choose_selection_color(key, selected))
+            self.selection_color_combos[setting_key] = combo
 
         self.storage_dir_edit = QLineEdit(str(settings.get("storage_dir") or data_dir))
         self.storage_dir_edit.setAlignment(Qt.AlignLeft)
@@ -2258,7 +2353,13 @@ class SettingsDialog(QDialog):
         display_form.addRow("Mouse wheel scroll lines", self.wheel_scroll_lines_spin)
 
         shortcuts_form = QFormLayout()
-        shortcuts_form.addRow("Add selection shortcut", self.append_selection_shortcut_edit)
+        shortcuts_form.addRow("Add selection to current note", self.append_selection_shortcut_edit)
+        for setting_key, (label, _default_shortcut) in SELECTION_SHORTCUTS.items():
+            shortcuts_form.addRow(label, self.selection_shortcut_edits[setting_key])
+
+        annotation_colors_form = QFormLayout()
+        for setting_key, (label, _default_color) in SELECTION_COLOR_SETTINGS.items():
+            annotation_colors_form.addRow(label, self.selection_color_combos[setting_key])
 
         storage_form = QGridLayout()
         self._add_storage_row(storage_form, 0, "PDFNest data folder", storage_row)
@@ -2272,6 +2373,7 @@ class SettingsDialog(QDialog):
 
         self._add_settings_page("Basic", basic_form)
         self._add_settings_page("Notes", note_form)
+        self._add_settings_page("Annotation colors", annotation_colors_form)
         self._add_settings_page("Page display", display_form)
         self._add_settings_page("Storage", storage_form)
         self._add_settings_page("Shortcuts", shortcuts_form)
@@ -2361,6 +2463,32 @@ class SettingsDialog(QDialog):
             self.markdown_dir_edit.setText(path)
             self.markdown_dir_edit.setCursorPosition(0)
 
+    def _selection_color_changed(self, setting_key: str, index: int) -> None:
+        combo = self.selection_color_combos[setting_key]
+        if index == combo.count() - 1:
+            return
+        color = QColor(str(combo.itemData(index) or ""))
+        if color.isValid():
+            combo.setProperty("selectedColor", color.name())
+
+    def _choose_selection_color(self, setting_key: str, index: int) -> None:
+        combo = self.selection_color_combos[setting_key]
+        if index != combo.count() - 1:
+            return
+        current = QColor(str(combo.property("selectedColor") or SELECTION_COLOR_SETTINGS[setting_key][1]))
+        color = QColorDialog.getColor(current, self, "Choose default annotation color")
+        if color.isValid():
+            normalized = color.name()
+            combo.setItemText(index, f"Custom color... ({normalized})")
+            combo.setItemData(index, normalized)
+            combo.setProperty("selectedColor", normalized)
+            return
+        previous = str(combo.property("selectedColor") or SELECTION_COLOR_SETTINGS[setting_key][1])
+        previous_index = combo.findData(previous)
+        if previous_index >= 0:
+            with QSignalBlocker(combo):
+                combo.setCurrentIndex(previous_index)
+
     @property
     def selected_theme(self) -> str:
         return str(self.theme_combo.currentData())
@@ -2373,6 +2501,21 @@ class SettingsDialog(QDialog):
     def append_selection_shortcut(self) -> str:
         sequence = self.append_selection_shortcut_edit.keySequence().toString(QKeySequence.PortableText)
         return sequence or "Ctrl+Shift+C"
+
+    @property
+    def selection_shortcuts(self) -> dict[str, str]:
+        values: dict[str, str] = {}
+        for setting_key, (_label, default_shortcut) in SELECTION_SHORTCUTS.items():
+            sequence = self.selection_shortcut_edits[setting_key].keySequence().toString(QKeySequence.PortableText)
+            values[setting_key] = sequence or default_shortcut
+        return values
+
+    @property
+    def selection_colors(self) -> dict[str, str]:
+        return {
+            setting_key: str(combo.property("selectedColor"))
+            for setting_key, combo in self.selection_color_combos.items()
+        }
 
     @property
     def storage_dir(self) -> Path:
@@ -2656,6 +2799,19 @@ class MainWindow(QMainWindow):
         self.append_selection_shortcut.setContext(Qt.ApplicationShortcut)
         self.append_selection_shortcut.activated.connect(self.append_selected_text_to_current_note_from_shortcut)
 
+        self.selection_action_shortcuts: dict[str, QShortcut] = {}
+        shortcut_handlers = {
+            "highlight_selection_shortcut": lambda: self.annotate_selected_text_from_shortcut("highlight"),
+            "underline_selection_shortcut": lambda: self.annotate_selected_text_from_shortcut("underline"),
+            "append_highlight_selection_shortcut": lambda: self.append_selected_text_with_style_from_shortcut("highlight"),
+            "append_underline_selection_shortcut": lambda: self.append_selected_text_with_style_from_shortcut("underline"),
+        }
+        for setting_key, handler in shortcut_handlers.items():
+            shortcut = QShortcut(self._selection_key_sequence(setting_key), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(handler)
+            self.selection_action_shortcuts[setting_key] = shortcut
+
         self.close_tab_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
         self.close_tab_shortcut.setContext(Qt.ApplicationShortcut)
         self.close_tab_shortcut.activated.connect(self.close_current_pdf_tab)
@@ -2674,8 +2830,15 @@ class MainWindow(QMainWindow):
             sequence = QKeySequence("Ctrl+Shift+C")
         return sequence
 
+    def _selection_key_sequence(self, setting_key: str) -> QKeySequence:
+        default_shortcut = SELECTION_SHORTCUTS[setting_key][1]
+        sequence = QKeySequence(str(self.settings.get(setting_key) or default_shortcut))
+        return sequence if not sequence.isEmpty() else QKeySequence(default_shortcut)
+
     def _refresh_append_selection_shortcut(self) -> None:
         self.append_selection_shortcut.setKey(self._append_selection_key_sequence())
+        for setting_key, shortcut in self.selection_action_shortcuts.items():
+            shortcut.setKey(self._selection_key_sequence(setting_key))
 
     def _apply_wheel_scroll_lines(self) -> None:
         lines = clamp_wheel_scroll_lines(self.wheel_scroll_lines)
@@ -2995,6 +3158,8 @@ class MainWindow(QMainWindow):
         self.auto_save_current_note = dialog.auto_save_current_note
         self.settings["auto_save_current_note"] = self.auto_save_current_note
         self.settings["append_selection_shortcut"] = dialog.append_selection_shortcut
+        self.settings.update(dialog.selection_shortcuts)
+        self.settings.update(dialog.selection_colors)
         self.settings["storage_dir"] = str(dialog.storage_dir)
         self.note_export_dir = dialog.markdown_dir
         self.settings["markdown_export_dir"] = str(self.note_export_dir)
@@ -3008,7 +3173,7 @@ class MainWindow(QMainWindow):
             self.history_panel.set_entries(self.history_entries)
         self.themes = load_theme_files()
         self.apply_theme()
-        self.render_page_preserving_view(render_neighbors=False)
+        self._refresh_canvas_appearance()
 
     def open_pdf(self) -> None:
         filename = self._choose_pdf_file("Open PDF")
@@ -3241,7 +3406,8 @@ class MainWindow(QMainWindow):
         if entry is None:
             return
         notes, counters, bookmarks = load_notes_data(pdf_key)
-        if not notes:
+        exportable_notes = [note for note in notes if note.note_type != "excerpt"]
+        if not exportable_notes:
             self.statusBar().showMessage("No notes to export.", 3000)
             return
 
@@ -3255,7 +3421,7 @@ class MainWindow(QMainWindow):
 
         exported = 0
         try:
-            for note in sorted(notes, key=lambda item: (item.page_index, item.note_number, item.created_at)):
+            for note in sorted(exportable_notes, key=lambda item: (item.page_index, item.note_number, item.created_at)):
                 exported_path = self.export_markdown_note_for_pdf(
                     pdf_path=path,
                     note=note,
@@ -3592,13 +3758,14 @@ class MainWindow(QMainWindow):
         canvas.set_theme_colors(self._theme_colors())
         canvas.set_marker_radius(self.note_marker_radius)
         canvas.add_note_requested.connect(self.add_note)
-        canvas.append_selection_requested.connect(self.append_selected_text_to_current_note)
+        canvas.append_selection_requested.connect(self.append_selected_text_to_current_note_from_canvas)
         canvas.annotation_requested.connect(self.add_text_annotation)
         canvas.bookmark_requested.connect(self.add_bookmark_for_page)
         canvas.fit_requested.connect(self.fit_page)
         canvas.mode_requested.connect(self.set_reading_mode)
         canvas.note_selected.connect(self.select_note)
         canvas.note_color_requested.connect(self.set_note_color)
+        canvas.note_style_requested.connect(self.set_note_style)
         canvas.note_delete_requested.connect(self.delete_note_by_id)
         canvas.reset_note_counters_requested.connect(self.reset_note_counters_to_current_notes)
         canvas.settings_requested.connect(self.open_settings)
@@ -3613,6 +3780,23 @@ class MainWindow(QMainWindow):
         self.page_canvases[0] = self.canvas
         self.page_widgets[0] = self.canvas
         self._lock_pages_container_to_layout()
+
+    def _refresh_page_notes(self, *page_indexes: int) -> bool:
+        """Repaint note overlays in place, preserving page widgets and scroll state."""
+        refreshed = False
+        for page_index in set(page_indexes):
+            canvas = self.page_canvases.get(page_index)
+            if canvas is None:
+                continue
+            canvas.set_notes([note for note in self.notes if note.page_index == page_index])
+            refreshed = True
+        return refreshed
+
+    def _refresh_canvas_appearance(self) -> None:
+        colors = self._theme_colors()
+        for canvas in self.page_canvases.values():
+            canvas.set_theme_colors(colors)
+            canvas.set_marker_radius(self.note_marker_radius)
 
     def _clear_page_widgets(self) -> None:
         while self.pages_layout.count():
@@ -3672,7 +3856,8 @@ class MainWindow(QMainWindow):
         self.page_index = page_index
         self.notes.append(note)
         self.persist_notes()
-        self.render_page_preserving_view()
+        if not self._refresh_page_notes(page_index):
+            self.render_page_preserving_view()
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id)
 
@@ -3706,7 +3891,8 @@ class MainWindow(QMainWindow):
         self.page_index = page_index
         self.notes.append(note)
         self.persist_notes()
-        self.render_page_preserving_view()
+        if not self._refresh_page_notes(page_index):
+            self.render_page_preserving_view()
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id)
 
@@ -3763,18 +3949,39 @@ class MainWindow(QMainWindow):
         self._refresh_note_selector(note.id)
 
     def set_note_color(self, note_id: str, color: str) -> None:
+        current_note_id = self.note_panel.current_note_id
+        self._auto_save_current_note()
         note = find_note(self.notes, note_id)
         if note is None:
-            self.note_panel.set_note(None)
             return
         if not QColor(color).isValid():
             return
         note.color = QColor(color).name()
         note.update_markdown(note.markdown)
         self.persist_notes()
-        self.render_page_preserving_view(render_neighbors=False)
-        self.note_panel.set_note(note)
-        self._refresh_note_selector(note.id)
+        self._refresh_page_notes(note.page_index)
+        self._refresh_note_selector(current_note_id)
+
+    def set_note_style(self, note_id: str, marker_style: str) -> None:
+        if marker_style not in EXCERPT_MARKER_STYLES:
+            return
+        current_note_id = self.note_panel.current_note_id
+        self._auto_save_current_note()
+        note = find_note(self.notes, note_id)
+        if note is None or note.note_type not in {"excerpt", "highlight", "underline"}:
+            return
+        if note.note_type == "excerpt":
+            if note.marker_style == marker_style:
+                return
+            note.marker_style = marker_style
+        else:
+            if marker_style not in {"highlight", "underline"} or note.note_type == marker_style:
+                return
+            note.note_type = marker_style
+        note.update_markdown(note.markdown)
+        self.persist_notes()
+        self._refresh_page_notes(note.page_index)
+        self._refresh_note_selector(current_note_id)
 
     def save_current_note(self, markdown_text: str) -> None:
         note_id = self.note_panel.current_note_id
@@ -3823,6 +4030,38 @@ class MainWindow(QMainWindow):
             self.export_current_note(self.note_panel.editor.toPlainText())
 
     def append_selected_text_to_current_note_from_shortcut(self) -> None:
+        selected_canvas, text, rects_norm = self._current_text_selection()
+        page_index = selected_canvas.page_index if selected_canvas is not None else None
+        self.append_selected_text_to_current_note(
+            text,
+            page_index=page_index,
+            rects_norm=rects_norm,
+            marker_color=self._selection_color("append_selection_color"),
+        )
+        self._clear_canvas_selection(selected_canvas)
+
+    def annotate_selected_text_from_shortcut(self, note_type: str) -> None:
+        selected_canvas, text, rects_norm = self._current_text_selection()
+        if selected_canvas is None or not text or not rects_norm:
+            return
+        color_key = "highlight_selection_color" if note_type == "highlight" else "underline_selection_color"
+        self.add_text_annotation(selected_canvas.page_index, note_type, rects_norm, text, self._selection_color(color_key))
+        self._clear_canvas_selection(selected_canvas)
+
+    def append_selected_text_with_style_from_shortcut(self, marker_style: str) -> None:
+        selected_canvas, text, rects_norm = self._current_text_selection()
+        page_index = selected_canvas.page_index if selected_canvas is not None else None
+        color_key = "append_highlight_selection_color" if marker_style == "highlight" else "append_underline_selection_color"
+        self.append_selected_text_to_current_note(
+            text,
+            page_index=page_index,
+            rects_norm=rects_norm,
+            marker_style=marker_style,
+            marker_color=self._selection_color(color_key),
+        )
+        self._clear_canvas_selection(selected_canvas)
+
+    def _current_text_selection(self) -> tuple[PdfCanvas | None, str, list[list[float]]]:
         text = ""
         selected_canvas: PdfCanvas | None = None
         if self.canvas is not None:
@@ -3835,12 +4074,32 @@ class MainWindow(QMainWindow):
                 if text:
                     selected_canvas = canvas
                     break
-        self.append_selected_text_to_current_note(text)
+        rects_norm = [list(rect) for rect in selected_canvas._selected_rects_norm] if selected_canvas is not None else None
+        return selected_canvas, text, rects_norm or []
+
+    @staticmethod
+    def _clear_canvas_selection(selected_canvas: PdfCanvas | None) -> None:
         if selected_canvas is not None:
             selected_canvas.clear_selection()
             selected_canvas.update()
 
-    def append_selected_text_to_current_note(self, selected_text: str) -> None:
+    def _selection_color(self, setting_key: str) -> str:
+        default_color = SELECTION_COLOR_SETTINGS[setting_key][1]
+        color = QColor(str(self.settings.get(setting_key) or default_color))
+        return color.name() if color.isValid() else default_color
+
+    def append_selected_text_to_current_note_from_canvas(self, page_index: int, rects_norm: list, selected_text: str) -> None:
+        self.append_selected_text_to_current_note(selected_text, page_index=page_index, rects_norm=rects_norm)
+
+    def append_selected_text_to_current_note(
+        self,
+        selected_text: str,
+        *,
+        page_index: int | None = None,
+        rects_norm: list | None = None,
+        marker_style: str = "dashed_underline",
+        marker_color: str | None = None,
+    ) -> None:
         cleaned = selected_text.strip()
         if not cleaned:
             return
@@ -3853,7 +4112,52 @@ class MainWindow(QMainWindow):
         updated = f"{current}\n\n{quote}\n" if current else f"{quote}\n"
         self.note_panel.editor.setPlainText(updated)
         self.save_current_note(updated)
+        if page_index is not None and rects_norm:
+            self._add_excerpt_marker(
+                page_index,
+                rects_norm,
+                cleaned,
+                self.note_panel.current_note_id,
+                marker_style=marker_style,
+                color=marker_color or self._selection_color("append_selection_color"),
+            )
         self.statusBar().showMessage("Added selected text to current note.", 3000)
+
+    def _add_excerpt_marker(
+        self,
+        page_index: int,
+        rects_norm: list,
+        selected_text: str,
+        linked_note_id: str | None,
+        *,
+        marker_style: str = "dashed_underline",
+        color: str = EXCERPT_MARKER_COLOR,
+    ) -> None:
+        if self.document is None or self.pdf_key is None or not linked_note_id:
+            return
+        cleaned_rects: list[list[float]] = []
+        for rect in rects_norm:
+            if isinstance(rect, list | tuple) and len(rect) == 4:
+                cleaned_rects.append([max(0.0, min(1.0, float(value))) for value in rect])
+        if not cleaned_rects:
+            return
+        first_rect = cleaned_rects[0]
+        marker = Note.create(
+            pdf_key=self.pdf_key,
+            page_index=max(0, min(int(page_index), self.document.page_count - 1)),
+            x_norm=(first_rect[0] + first_rect[2]) / 2,
+            y_norm=(first_rect[1] + first_rect[3]) / 2,
+            note_type="excerpt",
+            rects_norm=cleaned_rects,
+            selected_text=selected_text,
+            color=color,
+            linked_note_id=linked_note_id,
+            marker_style=marker_style,
+        )
+        self.notes.append(marker)
+        self.persist_notes()
+        if not self._refresh_page_notes(marker.page_index):
+            self.render_page_preserving_view()
 
     def delete_current_note(self) -> None:
         note_id = self.note_panel.current_note_id
@@ -3863,9 +4167,10 @@ class MainWindow(QMainWindow):
         self.delete_note_by_id(note_id, confirm=True)
 
     def delete_note_by_id(self, note_id: str, *, confirm: bool = False) -> None:
+        current_note_id = self.note_panel.current_note_id
+        self._auto_save_current_note()
         note = find_note(self.notes, note_id)
         if note is None:
-            self.note_panel.set_note(None)
             return
 
         if confirm:
@@ -3881,11 +4186,24 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 return
 
-        self.notes = [item for item in self.notes if item.id != note_id]
+        if note.note_type == "excerpt":
+            current_note_id = current_note_id or note.linked_note_id
+            affected_page = note.page_index
+            self.notes = [item for item in self.notes if item.id != note_id]
+            self.persist_notes()
+            current_note = find_note(self.notes, current_note_id) if current_note_id else None
+            self.note_panel.set_note(current_note)
+            self._refresh_note_selector(current_note.id if current_note is not None else None)
+            self._refresh_page_notes(affected_page)
+            return
+
+        affected_pages = {item.page_index for item in self.notes if item.id == note_id or item.linked_note_id == note_id}
+        self.notes = [item for item in self.notes if item.id != note_id and item.linked_note_id != note_id]
         self.persist_notes()
-        self.note_panel.set_note(None)
-        self._refresh_note_selector()
-        self.render_page_preserving_view()
+        surviving_current = find_note(self.notes, current_note_id) if current_note_id and current_note_id != note_id else None
+        self.note_panel.set_note(surviving_current)
+        self._refresh_note_selector(surviving_current.id if surviving_current is not None else None)
+        self._refresh_page_notes(*affected_pages)
 
     def reset_note_counters_to_current_notes(self) -> None:
         view = self._current_view_snapshot()
@@ -3896,7 +4214,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_note_selector(self, current_note_id: str | None = None) -> None:
         current = current_note_id if current_note_id is not None else self.note_panel.current_note_id
-        self.note_panel.set_notes(self.notes, current)
+        self.note_panel.set_notes([note for note in self.notes if note.note_type != "excerpt"], current)
 
     def persist_notes(self) -> None:
         if self.pdf_path is None or self.pdf_key is None:
@@ -3990,14 +4308,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Saved contents to PDF and refreshed note numbering counters.", 5000)
 
     def export_all_notes(self) -> None:
-        if not self.notes:
+        exportable_notes = [note for note in self.notes if note.note_type != "excerpt"]
+        if not exportable_notes:
             self.statusBar().showMessage("No notes to export.", 3000)
             return
         if self.note_panel.current_note_id is not None:
             self.save_current_note_from_panel()
 
         exported = 0
-        for note in sorted(self.notes, key=lambda item: (item.page_index, self._note_number(item), item.created_at)):
+        for note in sorted(exportable_notes, key=lambda item: (item.page_index, self._note_number(item), item.created_at)):
             path = self.export_markdown_note(note, replace_existing=bool(note.exported_markdown_path))
             if path is not None:
                 exported += 1
@@ -4096,6 +4415,8 @@ class MainWindow(QMainWindow):
             return
         max_by_key: dict[str, int] = {}
         for note in self.notes:
+            if note.note_type == "excerpt":
+                continue
             key = self._counter_key(note.page_index)
             old_page_key = str(max(0, int(note.page_index)))
             for existing_key in (key, old_page_key):
@@ -4114,6 +4435,8 @@ class MainWindow(QMainWindow):
     def _rebuild_note_counters_from_current_note_counts(self) -> None:
         counts_by_key: dict[str, int] = {}
         for note in self.notes:
+            if note.note_type == "excerpt":
+                continue
             key = self._counter_key(note.page_index)
             counts_by_key[key] = counts_by_key.get(key, 0) + 1
         self.note_counters = {key: count + 1 for key, count in counts_by_key.items() if count > 0}
@@ -4128,7 +4451,7 @@ class MainWindow(QMainWindow):
         if note.note_number > 0:
             return note.note_number
         key = self._counter_key(note.page_index)
-        page_notes = [item for item in self.notes if self._counter_key(item.page_index) == key]
+        page_notes = [item for item in self.notes if item.note_type != "excerpt" and self._counter_key(item.page_index) == key]
         page_notes.sort(key=lambda item: item.created_at)
         for index, item in enumerate(page_notes, start=1):
             if item.id == note.id:

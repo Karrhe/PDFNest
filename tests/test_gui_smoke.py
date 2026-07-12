@@ -20,7 +20,7 @@ from pdf_notes_reader.history import PdfHistoryEntry, load_history, save_history
 from pdf_notes_reader.library import LibraryFolder, UNFILED_FOLDER_ID, load_library, save_library
 from pdf_notes_reader.main import MainWindow, PdfCanvas, SettingsDialog
 from pdf_notes_reader.main import render_markdown_preview
-from pdf_notes_reader.notes import default_data_dir
+from pdf_notes_reader.notes import Note, default_data_dir
 from pdf_notes_reader.notes import load_notes, load_notes_data
 from pdf_notes_reader.notes import pdf_key_for_path
 from pdf_notes_reader.settings import load_settings, load_theme_files, save_settings, themes_dir
@@ -495,8 +495,8 @@ class GuiSmokeTest(unittest.TestCase):
         canvas.set_page(pixmap, [])
         canvas._selected_text = "selected excerpt"
         canvas._selected_rects_norm = [[0.1, 0.1, 0.2, 0.2]]
-        emitted: list[str] = []
-        canvas.append_selection_requested.connect(emitted.append)
+        emitted: list[tuple[int, list, str]] = []
+        canvas.append_selection_requested.connect(lambda page, rects, text: emitted.append((page, rects, text)))
         saw_append_action: list[bool] = []
 
         class FakeMenu:
@@ -524,9 +524,110 @@ class GuiSmokeTest(unittest.TestCase):
             canvas.contextMenuEvent(event)
 
         self.assertEqual(saw_append_action, [True])
-        self.assertEqual(emitted, ["selected excerpt"])
+        self.assertEqual(emitted, [(0, [[0.1, 0.1, 0.2, 0.2]], "selected excerpt")])
         self.assertEqual(canvas._selected_text, "")
         self.assertEqual(canvas._selected_rects_norm, [])
+
+    def test_pdf_canvas_context_menu_can_change_excerpt_marker_style(self) -> None:
+        pixmap = QPixmap(100, 100)
+        pixmap.fill(QColor("#ffffff"))
+        marker = Note.create(
+            pdf_key="pdf",
+            page_index=0,
+            x_norm=0.25,
+            y_norm=0.15,
+            note_type="excerpt",
+            rects_norm=[[0.1, 0.1, 0.4, 0.2]],
+            linked_note_id="note-id",
+        )
+        canvas = PdfCanvas()
+        canvas.set_page(pixmap, [marker])
+        emitted: list[tuple[str, str]] = []
+        canvas.note_style_requested.connect(lambda note_id, style: emitted.append((note_id, style)))
+
+        class FakeMenu:
+            def __init__(self, *_args):
+                self._actions = []
+
+            def addAction(self, action):
+                self._actions.append(action)
+
+            def addMenu(self, _label: str):
+                return self
+
+            def addSeparator(self) -> None:
+                pass
+
+            def exec(self, _pos: QPoint):
+                return next((action for action in self._actions if action.text() == "Highlight"), None)
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(20, 19), QPoint(20, 19))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(emitted, [(marker.id, "highlight")])
+
+    def test_pdf_canvas_context_menu_can_convert_highlight_to_underline(self) -> None:
+        pixmap = QPixmap(100, 100)
+        pixmap.fill(QColor("#ffffff"))
+        annotation = Note.create(
+            pdf_key="pdf",
+            page_index=0,
+            x_norm=0.25,
+            y_norm=0.15,
+            note_type="highlight",
+            rects_norm=[[0.1, 0.1, 0.4, 0.2]],
+        )
+        canvas = PdfCanvas()
+        canvas.set_page(pixmap, [annotation])
+        emitted: list[tuple[str, str]] = []
+        canvas.note_style_requested.connect(lambda note_id, style: emitted.append((note_id, style)))
+
+        class FakeMenu:
+            def __init__(self, *_args):
+                self._actions = []
+
+            def addAction(self, action):
+                self._actions.append(action)
+
+            def addMenu(self, _label: str):
+                return self
+
+            def addSeparator(self) -> None:
+                pass
+
+            def exec(self, _pos: QPoint):
+                return next((action for action in self._actions if action.text() == "Underline"), None)
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(20, 19), QPoint(20, 19))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(emitted, [(annotation.id, "underline")])
+
+    def test_highlight_multiply_blend_preserves_black_text(self) -> None:
+        pixmap = QPixmap(100, 60)
+        pixmap.fill(QColor("#ffffff"))
+        source_painter = QPainter(pixmap)
+        source_painter.fillRect(30, 20, 10, 20, QColor("#000000"))
+        source_painter.end()
+        annotation = Note.create(
+            pdf_key="pdf",
+            page_index=0,
+            x_norm=0.5,
+            y_norm=0.5,
+            note_type="highlight",
+            rects_norm=[[0.2, 0.2, 0.8, 0.8]],
+            color="#fca5a5",
+        )
+        canvas = PdfCanvas()
+        canvas.set_theme_colors({"pdf_tint": "#ffffff"})
+        canvas.set_page(pixmap, [annotation])
+        rendered = QImage(canvas.size(), QImage.Format_ARGB32)
+        canvas.render(rendered)
+
+        self.assertEqual(rendered.pixelColor(35, 30).name(), "#000000")
+        self.assertNotEqual(rendered.pixelColor(25, 30).name(), "#ffffff")
 
     def test_pdf_canvas_context_menu_can_request_bookmark(self) -> None:
         pixmap = QPixmap(80, 80)
@@ -600,6 +701,41 @@ class GuiSmokeTest(unittest.TestCase):
         self.assertEqual(emitted, [(1, "highlight", [[0.1, 0.1, 0.2, 0.2]], "selected excerpt", "#fde047")])
         self.assertEqual(canvas._selected_text, "")
         self.assertEqual(canvas._selected_rects_norm, [])
+
+    def test_pdf_canvas_context_menu_puts_highlight_and_underline_first(self) -> None:
+        pixmap = QPixmap(80, 80)
+        pixmap.fill(QColor("#ffffff"))
+        canvas = PdfCanvas()
+        canvas.set_page(pixmap, [])
+        canvas._selected_text = "selected excerpt"
+        canvas._selected_rects_norm = [[0.1, 0.1, 0.2, 0.2]]
+        root_entries: list[str] = []
+
+        class FakeMenu:
+            def __init__(self, *_args, is_root: bool = True):
+                self.is_root = is_root
+
+            def addAction(self, action):
+                if self.is_root:
+                    root_entries.append(action.text())
+
+            def addMenu(self, label: str):
+                if self.is_root:
+                    root_entries.append(label)
+                return FakeMenu(is_root=False)
+
+            def addSeparator(self) -> None:
+                if self.is_root:
+                    root_entries.append("---")
+
+            def exec(self, _pos: QPoint):
+                return None
+
+        event = QContextMenuEvent(QContextMenuEvent.Mouse, QPoint(10, 10), QPoint(10, 10))
+        with patch("pdf_notes_reader.main.QMenu", FakeMenu):
+            canvas.contextMenuEvent(event)
+
+        self.assertEqual(root_entries[:2], ["Highlight selection", "Underline selection"])
 
     def test_pdf_canvas_selects_and_copies_text(self) -> None:
         pixmap = QPixmap(200, 100)
@@ -1354,6 +1490,33 @@ class GuiSmokeTest(unittest.TestCase):
                 window.canvas = canvas
                 window.append_selection_shortcut.activated.emit()
                 self.assertIn("> shortcut selected text", note.markdown)
+                excerpt_markers = [item for item in window.notes if item.note_type == "excerpt"]
+                self.assertEqual(len(excerpt_markers), 1)
+                self.assertEqual(excerpt_markers[0].color, "#93c5fd")
+                self.assertEqual(excerpt_markers[0].linked_note_id, note.id)
+                self.assertEqual(excerpt_markers[0].rects_norm, [[0.1, 0.1, 0.2, 0.2]])
+                live_canvas = window.page_canvases[0]
+                live_pixmap = live_canvas._pixmap
+                window.set_note_color(excerpt_markers[0].id, "#86efac")
+                self.assertEqual(excerpt_markers[0].color, "#86efac")
+                self.assertEqual(window.note_panel.current_note_id, note.id)
+                self.assertIs(window.page_canvases[0], live_canvas)
+                self.assertIs(window.page_canvases[0]._pixmap, live_pixmap)
+                window.set_note_style(excerpt_markers[0].id, "highlight")
+                self.assertEqual(excerpt_markers[0].marker_style, "highlight")
+                self.assertIs(window.page_canvases[0], live_canvas)
+                self.assertIs(window.page_canvases[0]._pixmap, live_pixmap)
+                window.set_note_style(excerpt_markers[0].id, "underline")
+                self.assertEqual(excerpt_markers[0].marker_style, "underline")
+                self.assertEqual(
+                    next(item for item in load_notes(window.pdf_key) if item.note_type == "excerpt").marker_style,
+                    "underline",
+                )
+                window.delete_note_by_id(excerpt_markers[0].id)
+                self.assertFalse(any(item.note_type == "excerpt" for item in window.notes))
+                self.assertEqual(window.note_panel.current_note_id, note.id)
+                self.assertIs(window.page_canvases[0], live_canvas)
+                self.assertIs(window.page_canvases[0]._pixmap, live_pixmap)
                 self.assertEqual(canvas._selected_text, "")
                 self.assertEqual(canvas._selected_rects_norm, [])
 
@@ -1361,6 +1524,65 @@ class GuiSmokeTest(unittest.TestCase):
                 exported_path = Path(note.exported_markdown_path)
                 self.assertTrue(exported_path.exists())
                 self.assertIn("> chosen text", exported_path.read_text(encoding="utf-8"))
+            finally:
+                window.close()
+
+    def test_annotation_shortcuts_use_configured_default_styles_and_colors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "annotation-shortcuts.pdf"
+            self._create_sample_pdf(pdf_path)
+
+            window = MainWindow()
+            try:
+                window.load_pdf(pdf_path)
+                window.add_note(0, 0.8, 0.8)
+                target_note = window.notes[0]
+                canvas = window.page_canvases[0]
+                window.canvas = canvas
+
+                expected_keys = {
+                    "highlight_selection_shortcut": "Ctrl+H",
+                    "underline_selection_shortcut": "Ctrl+U",
+                    "append_highlight_selection_shortcut": "Ctrl+Shift+H",
+                    "append_underline_selection_shortcut": "Ctrl+Shift+U",
+                }
+                for setting_key, expected in expected_keys.items():
+                    self.assertEqual(
+                        window.selection_action_shortcuts[setting_key].key().toString(QKeySequence.PortableText),
+                        expected,
+                    )
+
+                canvas._selected_text = "red highlight"
+                canvas._selected_rects_norm = [[0.1, 0.1, 0.3, 0.2]]
+                window.selection_action_shortcuts["highlight_selection_shortcut"].activated.emit()
+                regular_highlight = next(item for item in window.notes if item.note_type == "highlight")
+                self.assertEqual(regular_highlight.color, "#fca5a5")
+
+                window.select_note(target_note.id)
+                canvas._selected_text = "red underline"
+                canvas._selected_rects_norm = [[0.1, 0.3, 0.3, 0.4]]
+                window.selection_action_shortcuts["underline_selection_shortcut"].activated.emit()
+                regular_underline = next(item for item in window.notes if item.note_type == "underline")
+                self.assertEqual(regular_underline.color, "#fca5a5")
+
+                window.select_note(target_note.id)
+                canvas._selected_text = "blue copied highlight"
+                canvas._selected_rects_norm = [[0.4, 0.1, 0.7, 0.2]]
+                window.selection_action_shortcuts["append_highlight_selection_shortcut"].activated.emit()
+                copied_highlight = next(item for item in window.notes if item.note_type == "excerpt")
+                self.assertEqual(copied_highlight.marker_style, "highlight")
+                self.assertEqual(copied_highlight.color, "#93c5fd")
+
+                canvas._selected_text = "blue copied underline"
+                canvas._selected_rects_norm = [[0.4, 0.3, 0.7, 0.4]]
+                window.selection_action_shortcuts["append_underline_selection_shortcut"].activated.emit()
+                copied_underline = [item for item in window.notes if item.note_type == "excerpt"][-1]
+                self.assertEqual(copied_underline.marker_style, "underline")
+                self.assertEqual(copied_underline.color, "#93c5fd")
+                self.assertIn("> blue copied highlight", target_note.markdown)
+                self.assertIn("> blue copied underline", target_note.markdown)
             finally:
                 window.close()
 
@@ -1496,6 +1718,7 @@ class GuiSmokeTest(unittest.TestCase):
                 window.delete_note_by_id(first_id)
                 key = window._counter_key(3)
                 self.assertEqual(window.note_counters.get(key), 3)
+                self.assertEqual(window.note_panel.current_note_id, second_id)
 
                 index = window.note_panel.note_selector.findData(first_id)
                 self.assertEqual(index, -1)
@@ -1565,6 +1788,8 @@ class GuiSmokeTest(unittest.TestCase):
                 before = page_signature()
                 before_scroll = window.scroll_area.verticalScrollBar().value()
                 before_words_object = window.page_text_words_cache[3]
+                before_canvas = window.page_canvases[3]
+                before_pixmap = before_canvas._pixmap
 
                 window.add_note(3, 0.25, 0.30)
                 self.app.processEvents()
@@ -1572,6 +1797,8 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(after_add, before)
                 self.assertLessEqual(abs(window.scroll_area.verticalScrollBar().value() - before_scroll), 2)
                 self.assertIs(window.page_text_words_cache[3], before_words_object)
+                self.assertIs(window.page_canvases[3], before_canvas)
+                self.assertIs(window.page_canvases[3]._pixmap, before_pixmap)
 
                 window.reset_note_counters_to_current_notes()
                 self.app.processEvents()
@@ -1606,6 +1833,14 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.note_panel.current_note_id, note_id)
                 window.set_note_color(note_id, "#93c5fd")
                 self.assertEqual(window.notes[0].color, "#93c5fd")
+                live_canvas = window.page_canvases[0]
+                live_pixmap = live_canvas._pixmap
+                window.set_note_style(note_id, "underline")
+                self.assertEqual(window.notes[0].note_type, "underline")
+                self.assertIs(window.page_canvases[0], live_canvas)
+                self.assertIs(window.page_canvases[0]._pixmap, live_pixmap)
+                window.set_note_style(note_id, "highlight")
+                self.assertEqual(window.notes[0].note_type, "highlight")
 
                 loaded = load_notes(window.pdf_key)
                 self.assertEqual(loaded[0].note_type, "highlight")
@@ -1670,6 +1905,12 @@ class GuiSmokeTest(unittest.TestCase):
             try:
                 dialog.setStyleSheet(window.styleSheet())
                 dialog.append_selection_shortcut_edit.setKeySequence(QKeySequence("Alt+C"))
+                dialog.selection_shortcut_edits["highlight_selection_shortcut"].setKeySequence(QKeySequence("Alt+H"))
+                color_combo = dialog.selection_color_combos["highlight_selection_color"]
+                custom_index = color_combo.count() - 1
+                color_combo.setCurrentIndex(custom_index)
+                with patch("pdf_notes_reader.main.QColorDialog.getColor", return_value=QColor("#123456")):
+                    dialog._choose_selection_color("highlight_selection_color", custom_index)
                 dialog.wheel_scroll_lines_spin.setValue(11)
                 dialog.auto_save_note_checkbox.setChecked(False)
                 dialog.markdown_dir_edit.setText(str(data_dir / "custom-md"))
@@ -1683,7 +1924,14 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertIn("Theme folder", labels)
                 self.assertIn("Page display", categories)
                 self.assertIn("Storage", categories)
+                self.assertIn("Annotation colors", categories)
                 self.assertEqual(dialog.append_selection_shortcut, "Alt+C")
+                self.assertEqual(dialog.selection_shortcuts["highlight_selection_shortcut"], "Alt+H")
+                self.assertEqual(dialog.selection_colors["highlight_selection_color"], "#123456")
+                self.assertEqual(
+                    [color_combo.itemText(index).split(" (")[0] for index in range(color_combo.count())],
+                    ["Yellow", "Green", "Blue", "Pink", "Red", "Purple", "Custom color..."],
+                )
                 self.assertEqual(dialog.wheel_scroll_lines, 11)
                 self.assertEqual(dialog.markdown_dir, data_dir / "custom-md")
                 self.assertLessEqual(dialog.storage_dir_edit.maximumWidth(), 420)
