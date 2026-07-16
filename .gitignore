@@ -8,3 +8,5 @@ dist/
 release/
 release_assets/
 *.egg-info/
+*.txt
+.agents/
