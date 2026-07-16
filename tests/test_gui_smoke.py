@@ -1210,6 +1210,53 @@ class GuiSmokeTest(unittest.TestCase):
             finally:
                 window.close()
 
+    def test_fit_preserves_content_anchor_selection_and_render_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "fit-stability.pdf"
+            self._create_sample_pdf(pdf_path, page_count=6)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                window.go_to_page(3)
+                self.app.processEvents()
+                reference_offset = min(80, max(1, window.scroll_area.viewport().height() // 4))
+                target_scroll = window.page_tops[3] + round(window.page_heights[3] * 0.35) - reference_offset
+                window.scroll_area.verticalScrollBar().setValue(target_scroll)
+                window.page_index = 3
+                canvas = window.page_canvases[3]
+                canvas._selected_text = "selection survives fit"
+                canvas._selected_rects_norm = [[0.1, 0.2, 0.4, 0.25]]
+                anchor_before = window._fit_view_anchor(3)
+
+                render_calls: list[tuple[int, float]] = []
+                original_render = window._render_page_pixmap
+
+                def tracked_render(page_index: int):
+                    render_calls.append((page_index, round(window.zoom, 6)))
+                    return original_render(page_index)
+
+                window._render_page_pixmap = tracked_render
+                window.fit_page("width")
+                QTest.qWait(220)
+                self.app.processEvents()
+
+                anchor_after = window._fit_view_anchor(3)
+                self.assertEqual(anchor_after[0], anchor_before[0])
+                self.assertAlmostEqual(anchor_after[1], anchor_before[1], delta=0.015)
+                self.assertTrue(set(window._visible_page_indexes()).issubset(window.page_canvases))
+                restored_canvas = window.page_canvases[3]
+                self.assertEqual(restored_canvas._selected_text, "selection survives fit")
+                self.assertEqual(restored_canvas._selected_rects_norm, [[0.1, 0.2, 0.4, 0.25]])
+                self.assertEqual(len(render_calls), len(set(render_calls)))
+            finally:
+                window.close()
+
     def test_continuous_scroll_uses_full_document_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1291,7 +1338,8 @@ class GuiSmokeTest(unittest.TestCase):
                 ):
                     window.choose_note_export_dir()
                 self.assertEqual(window.note_export_dir, tmp_path / "markdown")
-                self.assertIn(str(tmp_path / "markdown"), window.note_panel.folder_label.text())
+                self.assertFalse(hasattr(window.note_panel, "folder_label"))
+                self.assertFalse(hasattr(window.note_panel, "title"))
 
                 window.add_note(0, 0.25, 0.75)
                 self.assertEqual(window.notes[0].markdown, "# Chapter One-1\n")
@@ -1324,7 +1372,6 @@ class GuiSmokeTest(unittest.TestCase):
             try:
                 window.load_pdf(pdf_path)
                 window.note_export_dir = tmp_path / "markdown"
-                window.note_panel.set_folder_path(window.note_export_dir)
                 window.add_note(0, 0.25, 0.75)
                 path = window.export_markdown_note(window.notes[0])
 
@@ -1705,6 +1752,10 @@ class GuiSmokeTest(unittest.TestCase):
                 self.assertEqual(window.page_index, 3)
                 first_id = window.notes[0].id
                 self.assertEqual(window.notes[0].markdown, "# page-4-1\n")
+                self.assertNotIn(
+                    "Select note...",
+                    [window.note_panel.note_selector.itemText(i) for i in range(window.note_panel.note_selector.count())],
+                )
 
                 window.note_panel.editor.setPlainText("# First note title\nBody")
                 window.save_current_note(window.note_panel.editor.toPlainText())

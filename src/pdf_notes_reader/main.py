@@ -1054,8 +1054,6 @@ class NotePanel(QWidget):
         self._current_note_id: str | None = None
         self._notes: list[Note] = []
 
-        self.title = QLabel("No note selected")
-        self.title.setStyleSheet("font-weight: 600;")
         self.note_selector = QComboBox()
         self.note_selector.setMinimumWidth(150)
         self.note_selector.activated.connect(self._emit_selected_note)
@@ -1076,9 +1074,6 @@ class NotePanel(QWidget):
         self.delete_button = QPushButton("Delete")
         self.folder_button = QPushButton("Go to note")
         self.folder_button.setToolTip("Jump to this note in the PDF")
-        self.folder_label = QLabel("")
-        self.folder_label.setObjectName("NoteFolderLabel")
-        self.folder_label.setWordWrap(True)
         self.save_button.clicked.connect(self._emit_save)
         self.export_button.clicked.connect(self._emit_export)
         self.delete_button.clicked.connect(self.delete_requested.emit)
@@ -1090,13 +1085,8 @@ class NotePanel(QWidget):
         buttons.addWidget(self.delete_button)
         buttons.addWidget(self.folder_button)
 
-        header = QHBoxLayout()
-        header.addWidget(self.title)
-        header.addWidget(self.note_selector, 1)
-
         layout = QVBoxLayout(self)
-        layout.addLayout(header)
-        layout.addWidget(self.folder_label)
+        layout.addWidget(self.note_selector)
         layout.addWidget(tabs, 1)
         layout.addLayout(buttons)
 
@@ -1112,14 +1102,12 @@ class NotePanel(QWidget):
         self._sync_selector_current()
 
         if note is None:
-            self.title.setText("No note selected")
             self.editor.blockSignals(True)
             self.editor.clear()
             self.editor.blockSignals(False)
             self.preview.clear()
             return
 
-        self.title.setText(f"Page {note.page_index + 1} note")
         self.editor.blockSignals(True)
         self.editor.setPlainText(note.markdown)
         self.editor.blockSignals(False)
@@ -1132,9 +1120,11 @@ class NotePanel(QWidget):
 
         with QSignalBlocker(self.note_selector):
             self.note_selector.clear()
-            self.note_selector.addItem("Select note...", "")
-            for note in self._notes:
-                self.note_selector.addItem(self.note_label(note), note.id)
+            if self._notes:
+                for note in self._notes:
+                    self.note_selector.addItem(self.note_label(note), note.id)
+            else:
+                self.note_selector.addItem("Select note...", "")
         self._sync_selector_current()
 
     @staticmethod
@@ -1153,9 +1143,6 @@ class NotePanel(QWidget):
         self.delete_button.setEnabled(enabled)
         self.note_selector.setEnabled(bool(self._notes))
 
-    def set_folder_path(self, path: Path) -> None:
-        self.folder_label.setText(f"Markdown folder: {path}")
-
     def _emit_save(self) -> None:
         if self._current_note_id is not None:
             self.save_requested.emit(self.editor.toPlainText())
@@ -1173,11 +1160,9 @@ class NotePanel(QWidget):
         self.note_selector.setEnabled(bool(self._notes))
         if self._current_note_id is None:
             with QSignalBlocker(self.note_selector):
-                if self.note_selector.count() == 0:
+                if not self._notes and self.note_selector.count() == 0:
                     self.note_selector.addItem("Select note...", "")
-                elif self.note_selector.itemData(0) != "":
-                    self.note_selector.insertItem(0, "Select note...", "")
-                self.note_selector.setCurrentIndex(0)
+                self.note_selector.setCurrentIndex(0 if not self._notes else -1)
             return
 
         index = self.note_selector.findData(self._current_note_id)
@@ -2619,7 +2604,6 @@ class MainWindow(QMainWindow):
         self.note_panel.export_requested.connect(self.export_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
         self.note_panel.note_selected_requested.connect(self.select_note)
-        self.note_panel.set_folder_path(self.note_export_dir)
 
         self.prev_page_button = QPushButton("-")
         self.prev_page_button.setObjectName("PageNavButton")
@@ -2977,7 +2961,7 @@ class MainWindow(QMainWindow):
         if self.fit_mode is None:
             self.render_page()
         else:
-            self._apply_fit_mode(anchor_page=self.page_index)
+            self._apply_fit_mode(anchor_page=self.page_index, force=True)
             self._schedule_fit_refresh(anchor_page=self.page_index)
         self._refresh_document_chrome()
         self._refresh_actions()
@@ -3163,7 +3147,6 @@ class MainWindow(QMainWindow):
         self.settings["storage_dir"] = str(dialog.storage_dir)
         self.note_export_dir = dialog.markdown_dir
         self.settings["markdown_export_dir"] = str(self.note_export_dir)
-        self.note_panel.set_folder_path(self.note_export_dir)
         save_settings(self.settings)
         migrate_storage(dialog.storage_dir)
         self._refresh_append_selection_shortcut()
@@ -3257,7 +3240,7 @@ class MainWindow(QMainWindow):
         if self.fit_mode is None:
             self.render_page()
         else:
-            self._apply_fit_mode(anchor_page=self.page_index)
+            self._apply_fit_mode(anchor_page=self.page_index, force=True)
             self._schedule_fit_refresh(anchor_page=self.page_index)
         if restored_note is not None:
             self.note_panel.set_note(restored_note)
@@ -4234,7 +4217,6 @@ class MainWindow(QMainWindow):
         self.note_export_dir = Path(path)
         self.settings["markdown_export_dir"] = str(self.note_export_dir)
         save_settings(self.settings)
-        self.note_panel.set_folder_path(self.note_export_dir)
 
     def add_bookmark(self) -> None:
         self.add_bookmark_for_page(self.page_index)
@@ -4711,16 +4693,26 @@ class MainWindow(QMainWindow):
             return
         anchor_page = self.page_index
         self.fit_mode = mode
-        self._apply_fit_mode(anchor_page=anchor_page)
+        self._page_window_render_token += 1
+        self._apply_fit_mode(anchor_page=anchor_page, force=True)
         self._schedule_fit_refresh(anchor_page=anchor_page)
 
-    def _apply_fit_mode(self, *, anchor_page: int | None = None, token: int | None = None) -> None:
+    def _apply_fit_mode(
+        self,
+        *,
+        anchor_page: int | None = None,
+        token: int | None = None,
+        force: bool = False,
+    ) -> None:
         if token is not None and token != self._fit_refresh_token:
             return
         if self.document is None or self.fit_mode is None:
             return
         if anchor_page is not None:
             self.page_index = max(0, min(anchor_page, self.document.page_count - 1))
+
+        view_anchor = self._fit_view_anchor(self.page_index)
+        selection = self._capture_canvas_selection()
 
         self.reader_splitter.updateGeometry()
         self.reader_area.updateGeometry()
@@ -4735,13 +4727,52 @@ class MainWindow(QMainWindow):
         if self.fit_mode == "width":
             widest_page_width = max((size[0] for size in self.page_base_sizes), default=float(rect.width))
             available = measured_viewport.width() - margins.left() - margins.right()
-            self.zoom = max(0.3, min(4.0, available / widest_page_width))
+            next_zoom = max(0.3, min(4.0, available / widest_page_width))
         elif self.fit_mode == "height":
             available = measured_viewport.height() - margins.top() - margins.bottom()
-            self.zoom = max(0.3, min(4.0, available / rect.height))
+            next_zoom = max(0.3, min(4.0, available / rect.height))
         else:
             return
-        self.render_page(render_neighbors=False)
+        if not force and self.page_canvases and abs(next_zoom - self.zoom) < 0.0001:
+            return
+
+        self.zoom = next_zoom
+        self._page_window_render_token += 1
+        self.render_page(center_current=False, render_neighbors=True)
+        self._restore_fit_view_anchor(view_anchor)
+        self._restore_canvas_selection(selection)
+
+    def _fit_view_anchor(self, page_index: int) -> tuple[int, float, int]:
+        viewport_offset = min(80, max(1, self.scroll_area.viewport().height() // 4))
+        if not self._has_page_geometry(page_index) or self.page_heights[page_index] <= 0:
+            return page_index, 0.0, viewport_offset
+        content_y = self.scroll_area.verticalScrollBar().value() + viewport_offset
+        relative = (content_y - self.page_tops[page_index]) / self.page_heights[page_index]
+        return page_index, max(0.0, min(1.0, relative)), viewport_offset
+
+    def _restore_fit_view_anchor(self, anchor: tuple[int, float, int]) -> None:
+        page_index, relative, viewport_offset = anchor
+        if not self._has_page_geometry(page_index):
+            return
+        target = self.page_tops[page_index] + round(relative * self.page_heights[page_index]) - viewport_offset
+        self._restore_scroll_position(target, page_index)
+
+    def _capture_canvas_selection(self) -> tuple[int, str, list[list[float]]] | None:
+        for page_index, canvas in self.page_canvases.items():
+            if canvas._selected_text and canvas._selected_rects_norm:
+                return page_index, canvas._selected_text, [list(rect) for rect in canvas._selected_rects_norm]
+        return None
+
+    def _restore_canvas_selection(self, selection: tuple[int, str, list[list[float]]] | None) -> None:
+        if selection is None:
+            return
+        page_index, selected_text, rects_norm = selection
+        canvas = self.page_canvases.get(page_index)
+        if canvas is None:
+            return
+        canvas._selected_text = selected_text
+        canvas._selected_rects_norm = [list(rect) for rect in rects_norm]
+        canvas.update()
 
     def _update_page_layout_margins(self) -> None:
         if self.fit_mode == "width":
@@ -4768,8 +4799,7 @@ class MainWindow(QMainWindow):
             self._fit_refresh_token += 1
             token = self._fit_refresh_token
             page = self.page_index if anchor_page is None else anchor_page
-            for delay in (0, 50, 150, 300):
-                QTimer.singleShot(delay, lambda page=page, token=token: self._apply_fit_mode(anchor_page=page, token=token))
+            QTimer.singleShot(120, lambda page=page, token=token: self._apply_fit_mode(anchor_page=page, token=token))
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
