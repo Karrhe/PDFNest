@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pdf_notes_reader.notes import default_data_dir, utc_now
+from pdf_notes_reader.notes import _atomic_write_json, default_data_dir, read_json_checked, utc_now
 
 
 ROOT_FOLDER_ID = "root"
@@ -60,12 +59,7 @@ def load_library(data_dir: Path | None = None) -> LibraryState:
     if not path.exists():
         return LibraryState(folders=default_folders(), assignments={}, aliases={}, archived={})
 
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return LibraryState(folders=default_folders(), assignments={}, aliases={}, archived={})
-
+    payload = read_json_checked(path)
     if not isinstance(payload, dict):
         return LibraryState(folders=default_folders(), assignments={}, aliases={}, archived={})
 
@@ -92,7 +86,6 @@ def load_library(data_dir: Path | None = None) -> LibraryState:
 
 def save_library(state: LibraryState, data_dir: Path | None = None) -> Path:
     path = library_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": 1,
         "app": "PDFNest",
@@ -101,9 +94,5 @@ def save_library(state: LibraryState, data_dir: Path | None = None) -> Path:
         "aliases": dict(sorted(state.aliases.items())),
         "archived": dict(sorted(state.archived.items())),
     }
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    tmp_path.replace(path)
+    _atomic_write_json(path, payload)
     return path

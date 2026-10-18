@@ -6,7 +6,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from pdf_notes_reader.notes import default_data_dir, set_configured_data_dir
+from pdf_notes_reader.notes import _atomic_write_json, default_data_dir, read_json_checked, set_configured_data_dir
 
 
 DEFAULT_THEMES: dict[str, dict[str, str]] = {
@@ -108,9 +108,7 @@ def ensure_default_themes(data_dir: Path | None = None) -> Path:
     for name, colors in DEFAULT_THEMES.items():
         path = directory / f"{name}.json"
         if not path.exists():
-            with path.open("w", encoding="utf-8") as handle:
-                json.dump(colors, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
+            _atomic_write_json(path, colors)
     return directory
 
 
@@ -142,9 +140,9 @@ def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
         settings["storage_dir"] = str(data_dir or default_data_dir())
         return settings
 
-    with path.open("r", encoding="utf-8") as handle:
-        loaded = json.load(handle)
+    loaded = read_json_checked(path)
     if not isinstance(loaded, dict):
+        settings["storage_dir"] = str(data_dir or default_data_dir())
         return settings
 
     settings.update({key: value for key, value in loaded.items() if key in DEFAULT_SETTINGS})
@@ -173,9 +171,5 @@ def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Pat
     payload["window_height"] = clamp_window_dimension(payload.get("window_height"), 820)
     payload["window_maximized"] = bool(payload.get("window_maximized"))
     payload["storage_dir"] = str(storage_dir)
-    tmp_path = path.with_suffix(".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    tmp_path.replace(path)
+    _atomic_write_json(path, payload)
     return path
