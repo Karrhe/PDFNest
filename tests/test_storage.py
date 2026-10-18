@@ -5,13 +5,16 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from gui_helpers import StorageIsolationMixin  # noqa: E402
 
 from pdf_notes_reader.notes import Bookmark, Note, load_notes, load_notes_data, load_notes_with_counters, pdf_key_for_path, save_notes
 from pdf_notes_reader.storage_migration import migrate_storage
 from pdf_notes_reader.history import load_history
 
 
-class NotesStorageTest(unittest.TestCase):
+class NotesStorageTest(StorageIsolationMixin, unittest.TestCase):
     def test_save_and_load_notes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)

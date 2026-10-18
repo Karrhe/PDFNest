@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from pdf_notes_reader.notes import default_data_dir, notebook_dir_for_pdf, pdf_key_for_path, root_sync_lock_path, utc_now
-from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock
+from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock, read_json_checked
 
 
 @dataclass
@@ -74,10 +73,11 @@ def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
     if not path.exists():
         return []
 
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = read_json_checked(path)
+    if payload is None:
+        return []
 
-    raw_entries = payload if isinstance(payload, list) else payload.get("entries", [])
+    raw_entries = payload if isinstance(payload, list) else payload.get("entries", []) if isinstance(payload, dict) else []
     if not isinstance(raw_entries, list):
         return []
 

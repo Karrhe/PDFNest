@@ -9,10 +9,12 @@ from pdf_notes_reader.history import PdfHistoryEntry, history_path, legacy_histo
 from pdf_notes_reader.notes import (
     Bookmark,
     Note,
+    _atomic_write_json,
     app_local_data_dir,
     default_data_dir,
     notes_path_for_key,
     rebuild_notebook_index,
+    record_storage_issue,
     save_notes,
     utc_now,
 )
@@ -60,14 +62,11 @@ def _migration_complete(path: Path) -> bool:
 
 
 def _write_migration_state(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": MIGRATION_VERSION,
         "migrated_at": utc_now(),
     }
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    _atomic_write_json(path, payload)
 
 
 def _legacy_roots(target_dir: Path) -> list[Path]:
@@ -119,6 +118,11 @@ def _migrate_history(target_dir: Path, legacy_roots: list[Path]) -> bool:
         legacy = legacy_history_path(root)
         if not legacy.exists():
             continue
+        try:
+            _read_json(legacy)  # validate first: load_history would quarantine (rename) a corrupt file
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            record_storage_issue(f"Old history file {legacy.name} could not be read and was not migrated ({exc}).", legacy)
+            continue
         entries.extend(load_history(root))
     entries = _dedupe_history(entries)
     if not entries:
@@ -148,18 +152,26 @@ def _migrate_notes(target_dir: Path, legacy_roots: list[Path]) -> bool:
 
 
 def _migrate_note_file(path: Path, target_dir: Path) -> bool:
+    # Legacy files are never modified or deleted; problems are reported instead of skipped silently.
     try:
         payload = _read_json(path)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        record_storage_issue(f"Old notes file {path.name} could not be read and was not migrated ({exc}).", path)
         return False
     if not isinstance(payload, dict):
+        record_storage_issue(f"Old notes file {path.name} has an unknown format and was not migrated.", path)
         return False
     pdf_key = str(payload.get("pdf_key") or path.stem)
-    pdf_path = str(payload.get("pdf_path") or "")
-    if not pdf_path:
-        return False
     if notes_path_for_key(pdf_key, target_dir).exists():
         return False
+    pdf_path = str(payload.get("pdf_path") or "") or _history_path_for_key(pdf_key, target_dir)
+    if not pdf_path:
+        # Still migrate: notes are found by pdf_key, so they reappear when that PDF is opened again.
+        pdf_path = str(path.with_suffix(".pdf"))
+        record_storage_issue(
+            f"Old notes file {path.name} did not record its PDF; its notes were migrated and appear when the PDF is opened from its original location.",
+            path,
+        )
     notes = _notes_from_payload(payload)
     bookmarks = _bookmarks_from_payload(payload)
     counters = payload.get("note_counters", {})
@@ -172,6 +184,13 @@ def _migrate_note_file(path: Path, target_dir: Path) -> bool:
         data_dir=target_dir,
     )
     return True
+
+
+def _history_path_for_key(pdf_key: str, target_dir: Path) -> str:
+    for entry in load_history(target_dir):
+        if entry.pdf_key == pdf_key:
+            return entry.path
+    return ""
 
 
 def _notes_from_payload(payload: dict[str, Any]) -> list[Note]:
