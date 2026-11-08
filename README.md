@@ -85,13 +85,13 @@ For end-user distribution on Windows, build the executable package with PyInstal
 .\scripts\build_windows_exe.ps1
 ```
 
-Pushing a tag such as `v0.3.3` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
+Pushing a tag such as `v0.3.4` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
 
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.3.3-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.3.3-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.3.4-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.3.4-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
@@ -100,14 +100,14 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 
 PyInstaller cannot cross-compile, so the Mac app is built on a Mac or by GitHub Actions.
 
-**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.3` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
+**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.4` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
 
 **On a Mac** (Python 3.10+, with the Xcode command line tools for `codesign`):
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt pyinstaller
-bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.3
+bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.4
 ```
 
 The outputs are written under `release/`:
@@ -446,8 +446,10 @@ The first time PDFNest starts with a data folder, it records the relative path a
 
 When both computers are in use:
 
-- Saving notes or history merges with the copy on disk instead of replacing it. A note or book added on the other computer is kept. A note deleted here stays deleted. When the same note was edited on both, the later edit wins.
-- Sync clients sometimes make conflict copies: `notes 2.json` (iCloud), `notes (… conflicted copy …).json` (Dropbox), `notes-PCNAME.json` (OneDrive). For `notes.json`, a bookmarks file or `recentnotes.json`, PDFNest merges the copy in, moves it to a `conflicts/` folder and shows a warning. `notebooks/index.json` is only a cache: if the other computer's copy is missing a notebook, PDFNest finds it again from the `manifest.json` files.
+- No file is written by both computers. A cloud drive keeps whichever copy of a file was saved last, so when both computers rewrote `library.json`, the one whose copy was out of date threw away the other's new folders (and books in `recentnotes.json`). Now each computer writes only its own replica next to the file: `library.json.sync/<computer id>.json`, `recentnotes.json.sync/…`, `notebooks/<book>/note/notes.json.sync/…` and `bookmarks/<key>_bookmark.json.sync/…`. A replica holds every folder, book, note and bookmark that computer knows, each with the time it last changed, plus an explicit marker for anything deleted there. PDFNest reads all replicas and, per item, the newest change wins. Something disappears only when it was deleted on one of the computers, never because a copy lacked it.
+- `library.json`, `recentnotes.json`, `notes.json` and the bookmark files are still written, as readable copies of the merged result for backups and older PDFNest versions. PDFNest reads them only for items no replica knows, such as data from before 0.3.4. Use the same PDFNest version on both computers: an older version on the other computer can still add books and folders, but its renames, moves and deletions are not seen.
+- A damaged plain file (for example a half-synced `notes.json`) is set aside as before, and its contents come back from the replicas.
+- Sync clients sometimes make conflict copies: `notes 2.json` (iCloud), `notes (… conflicted copy …).json` (Dropbox), `notes-PCNAME.json` (OneDrive). For `library.json`, `recentnotes.json`, `notes.json` or a bookmarks file, PDFNest merges everything the copy has into the file, moves the copy to a `conflicts/` folder and shows a warning. Folders or books that went missing under 0.3.3 and earlier come back this way when iCloud kept such a copy. `notebooks/index.json` is only a cache: if the other computer's copy is missing a notebook, PDFNest finds it again from the `manifest.json` files.
 - When macOS has evicted a file to a `.<name>.icloud` placeholder, PDFNest asks iCloud to download it (`brctl download`) and waits up to 10 seconds. If the file is still missing, PDFNest shows a warning and treats the notebook as empty without overwriting the real file. The next save merges with the file once it arrives. Files that are only in the cloud on Windows or on newer macOS download when PDFNest reads them. Library covers are not made for books that are only in the cloud.
 - Settings for one computer stay in `.local-data/machine_settings.json` (see above). A folder setting that the other operating system wrote into the shared `user_config.json` (`C:\...` on a Mac, `/Users/...` on Windows) is ignored.
 

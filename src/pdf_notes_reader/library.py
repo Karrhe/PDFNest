@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from pdf_notes_reader.notes import _absorb_conflicts, _atomic_write_json, default_data_dir, read_json_checked, utc_now
-from pdf_notes_reader.portable import ensure_local, merge_records
+from pdf_notes_reader import sync_store
+from pdf_notes_reader.notes import _absorb_conflicts, default_data_dir, read_json_checked, utc_now
+from pdf_notes_reader.portable import ensure_local
 
 
 ROOT_FOLDER_ID = "root"
@@ -83,13 +84,67 @@ def default_folders() -> list[LibraryFolder]:
 
 
 def load_library(data_dir: Path | None = None) -> LibraryState:
+    """Every computer's folders, filing, renames and archive, merged (see ``sync_store``)."""
     path = library_path(data_dir)
-    if ensure_local(path):
-        _absorb_conflicts(path, _merge_library_payloads, path.parent / "conflicts")
-    payload = read_json_checked(path) if path.exists() else None
-    state = _state_from_payload(payload)
-    state.base = _payload(state)
+    records = sync_store.load_records(path, _legacy_records(path))
+    state = _state_from_records(records)
+    state.base = _records(state)
     return state
+
+
+def _legacy_records(path: Path) -> dict[str, Any]:
+    """Records from the plain ``library.json``: data from before per-computer replicas, or written by
+    an older PDFNest on the other computer."""
+    if not ensure_local(path):
+        return {}
+    # Conflict copies the cloud client made (library 2.json...) may hold folders the plain file
+    # lost when two computers wrote it; fold them in before anything else reads it.
+    _absorb_conflicts(path, _union_library_payloads, path.parent / "conflicts")
+    payload = read_json_checked(path)
+    return _records(_state_from_payload(payload)) if isinstance(payload, dict) else {}
+
+
+def _union_library_payloads(ours: dict[str, Any], theirs: dict[str, Any], _base: Any = None) -> dict[str, Any]:
+    """Everything either copy has: used for conflict copies, where dropping something loses it."""
+    folders = {str(item.get("id")): item for item in theirs.get("folders", []) if isinstance(item, dict)}
+    folders.update({str(item.get("id")): item for item in ours.get("folders", []) if isinstance(item, dict)})
+    merged: dict[str, Any] = {"schema_version": 1, "app": "PDFNest", "folders": list(folders.values())}
+    for name in ("assignments", "aliases", "archived"):
+        combined = dict(theirs.get(name) or {}) if isinstance(theirs.get(name), dict) else {}
+        if isinstance(ours.get(name), dict):
+            combined.update(ours[name])
+        merged[name] = combined
+    return merged
+
+
+# One record per folder and per book setting, so two computers changing different things never
+# collide: "folder:<id>", "assign:<pdf key>", "alias:<pdf key>", "archived:<pdf key>".
+_RECORD_MAPS = (("assign:", "assignments"), ("alias:", "aliases"), ("archived:", "archived"))
+
+
+def _records(state: LibraryState) -> dict[str, Any]:
+    records: dict[str, Any] = {}
+    for folder in state.folders:
+        if folder.id != UNFILED_FOLDER_ID:  # built in, the same everywhere
+            records[f"folder:{folder.id}"] = folder.to_dict()
+    for prefix, name in _RECORD_MAPS:
+        for key, value in getattr(state, name).items():
+            records[f"{prefix}{key}"] = value
+    return records
+
+
+def _state_from_records(records: dict[str, Any]) -> LibraryState:
+    payload: dict[str, Any] = {"folders": [], "assignments": {}, "aliases": {}, "archived": {}}
+    for key, value in records.items():
+        if key.startswith("folder:") and isinstance(value, dict):
+            payload["folders"].append(value)
+            continue
+        for prefix, name in _RECORD_MAPS:
+            if key.startswith(prefix):
+                payload[name][key[len(prefix):]] = value
+                break
+    payload["folders"].sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("id", ""))))
+    return _state_from_payload(payload)
 
 
 def _state_from_payload(payload: Any) -> LibraryState:
@@ -128,68 +183,26 @@ def _payload(state: LibraryState) -> dict[str, Any]:
     }
 
 
-def _merge_mapping(ours: dict, theirs: dict, base: dict | None) -> dict:
-    """Three-way merge of a key -> value map: a change made here wins, otherwise the other computer's
-    value (or removal) is taken. Without a base, the two are combined and this computer's values win."""
-    if base is None:
-        merged = dict(theirs)
-        merged.update(ours)
-        return merged
-    merged: dict = {}
-    for key in set(ours) | set(theirs):
-        changed_here = ours.get(key) != base.get(key)
-        source = ours if changed_here else theirs
-        if key in source:
-            merged[key] = source[key]
-    return dict(sorted(merged.items()))
-
-
-def _merge_library_payloads(ours: dict[str, Any], theirs: dict[str, Any], base: dict[str, Any] | None = None) -> dict[str, Any]:
-    def mapping(payload: dict[str, Any] | None, name: str) -> dict | None:
-        if payload is None:
-            return None
-        value = payload.get(name)
-        return dict(value) if isinstance(value, dict) else {}
-
-    base_folders = None
-    if base is not None:
-        base_folders = {str(item.get("id")): str(item.get("created_at", "")) for item in base.get("folders", []) if isinstance(item, dict)}
-    merged = {
-        "schema_version": 1,
-        "app": "PDFNest",
-        "folders": merge_records(
-            [item for item in ours.get("folders", []) if isinstance(item, dict)],
-            [item for item in theirs.get("folders", []) if isinstance(item, dict)],
-            base=base_folders,
-            stamp="created_at",
-        ),
-    }
-    for name in ("assignments", "aliases", "archived"):
-        merged[name] = _merge_mapping(mapping(ours, name) or {}, mapping(theirs, name) or {}, mapping(base, name))
-    return merged
-
-
 def save_library(state: LibraryState, data_dir: Path | None = None) -> Path:
-    """Writes the library, merged with the copy on disk.
+    """Records this computer's library changes and updates ``state`` to the merged library.
 
-    With the data folder in iCloud Drive (or OneDrive / Dropbox), the other computer may have added
-    folders, filed books or archived some since this state was loaded; those changes are kept, and the
-    merged result is applied to ``state`` too.
+    Only what changed here since ``state`` was loaded is written, into this computer's own replica,
+    so a state that is out of date never removes a folder, filing or archive change made on the other
+    computer. ``library.json`` is rewritten as a readable copy of the merged library.
     """
     path = library_path(data_dir)
-    payload = _payload(state)
-    if ensure_local(path):
-        _absorb_conflicts(path, _merge_library_payloads, path.parent / "conflicts")
-    on_disk = read_json_checked(path) if path.exists() else None
-    if isinstance(on_disk, dict):
-        payload = _merge_library_payloads(payload, on_disk, state.base)
-        merged = _state_from_payload(payload)
-        state.folders[:] = merged.folders
-        for name in ("assignments", "aliases", "archived"):
-            target = getattr(state, name)
-            target.clear()
-            target.update(getattr(merged, name))
-        payload = _payload(state)
-    _atomic_write_json(path, payload)
-    state.base = payload
+    merged_records = sync_store.save_records(
+        path,
+        _records(state),
+        state.base,
+        legacy=_legacy_records(path),
+        materialize=lambda records: _payload(_state_from_records(records)),
+    )
+    merged = _state_from_records(merged_records)
+    state.folders[:] = merged.folders
+    for name in ("assignments", "aliases", "archived"):
+        target = getattr(state, name)
+        target.clear()
+        target.update(getattr(merged, name))
+    state.base = _records(state)
     return path

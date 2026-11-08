@@ -2,6 +2,21 @@
 
 All notable changes to PDFNest. Issue IDs refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
+## 0.3.4 — 2026-11-08
+
+### Fixed
+- Folders made on one computer disappeared after the other computer filed books (“Mac's folder missed after
+  I add files in Win”), and books disappeared while their folders stayed (“Win shows folders with no books”).
+  Both computers rewrote the same `library.json` / `recentnotes.json`; the cloud kept the last one, and
+  PDFNest then took “missing from the other copy” for “deleted there”. Each computer now writes only its own
+  replica (`*.json.sync/<computer id>.json`) with a change time per folder, book, note and bookmark and an
+  explicit marker for deletions; the newest change per item wins. The plain files are still written as
+  readable copies.
+- Folders and books kept only in iCloud conflict copies (`library 2.json`, `recentnotes 2.json`) are merged
+  back in.
+- A save is refused, with a warning, while this computer's own replica is only in the cloud and has not
+  downloaded, instead of replacing it.
+
 ## 0.3.3 — 2026-11-08
 
 ### Added

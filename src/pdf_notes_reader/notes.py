@@ -769,18 +769,61 @@ def load_notes_data(
     return notes, normalize_note_counters(payload.get("note_counters", {})), bookmarks
 
 
-# What this process last loaded or saved per file: record id -> timestamp. Saving merges with the copy
-# on disk, and these tell a record another machine added apart from one deleted here.
-_SYNC_BASES: dict[str, dict[str, str]] = {}
+# The records this process last loaded per notebook file, or the caller's list it last saved: a
+# record that differs changed here, one missing was deleted here (see sync_store.save_records).
+_SYNC_BASES: dict[str, dict[str, Any]] = {}
 
 
 def _sync_base_key(path: Path) -> str:
     return os.path.normcase(str(path))
 
 
+def _note_records(payload: dict[str, Any]) -> dict[str, Any]:
+    records: dict[str, Any] = {f"note:{item['id']}": item for item in _dict_list(payload.get("notes")) if item.get("id")}
+    for page, counter in normalize_note_counters(payload.get("note_counters", {})).items():
+        records[f"counter:{page}"] = counter
+    return records
+
+
+def _bookmark_records(payload: dict[str, Any]) -> dict[str, Any]:
+    return {f"bookmark:{item['id']}": item for item in _dict_list(payload.get("bookmarks")) if item.get("id")}
+
+
+def _keep_highest_counter(winner: Any, versions: list[tuple[str, Any]]) -> Any:
+    """Note counters only grow; keep the highest any computer reached so numbers are never reused."""
+    if isinstance(winner, int) and not isinstance(winner, bool):
+        return max([winner] + [data for _stamp, data in versions if isinstance(data, int) and not isinstance(data, bool)])
+    return winner
+
+
+def _payload_from_records(records: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(template)
+    # Records keep the order the notes were saved in; notes from another computer follow.
+    payload["notes"] = [data for key, data in records.items() if key.startswith("note:") and isinstance(data, dict)]
+    payload["note_counters"] = {key[len("counter:"):]: data for key, data in records.items() if key.startswith("counter:")}
+    return payload
+
+
+def _bookmarks_from_records(records: dict[str, Any]) -> list[dict[str, Any]]:
+    return [data for key, data in records.items() if key.startswith("bookmark:") and isinstance(data, dict)]
+
+
 def load_notes_payload(pdf_key: str, data_dir: Path | None = None, *, track: bool = True) -> dict[str, Any]:
+    """The notebook as every computer sharing the data folder saved it (see ``sync_store``)."""
+    from pdf_notes_reader import sync_store
+
     notes_path = notes_path_for_key(pdf_key, data_dir)
-    path = notes_path
+    payload = _legacy_notes_payload(pdf_key, data_dir)
+    records = sync_store.load_records(notes_path, _note_records(payload), combine=_keep_highest_counter)
+    payload = _payload_from_records(records, payload)
+    if track:
+        _SYNC_BASES[_sync_base_key(notes_path)] = records
+    return payload
+
+
+def _legacy_notes_payload(pdf_key: str, data_dir: Path | None) -> dict[str, Any]:
+    """The plain notes.json (or an older notes file): data from before per-computer replicas."""
+    path = notes_path_for_key(pdf_key, data_dir)
     if ensure_local(path):
         _absorb_notes_conflicts(path)
     elif is_cloud_placeholder(path):
@@ -789,21 +832,24 @@ def load_notes_payload(pdf_key: str, data_dir: Path | None = None, *, track: boo
         legacy_notebook_path = legacy_notebook_note_file_for_key(pdf_key, data_dir)
         path = legacy_notebook_path or legacy_notes_path_for_key(pdf_key, data_dir)
     payload = read_json_checked(path)
-    payload = payload if isinstance(payload, dict) else {}
-    if track:
-        _SYNC_BASES[_sync_base_key(notes_path)] = record_stamps(_dict_list(payload.get("notes")))
-    return payload
+    return payload if isinstance(payload, dict) else {}
 
 
 def load_bookmarks_payload(pdf_key: str, data_dir: Path | None = None, *, track: bool = True) -> dict[str, Any]:
+    from pdf_notes_reader import sync_store
+
     path = bookmark_path_for_key(pdf_key, data_dir)
+    records = sync_store.load_records(path, _bookmark_records(_legacy_bookmarks_payload(path)))
+    if track:
+        _SYNC_BASES[_sync_base_key(path)] = records
+    return {"schema_version": 1, "app": APP_NAME, "bookmarks": _bookmarks_from_records(records)}
+
+
+def _legacy_bookmarks_payload(path: Path) -> dict[str, Any]:
     if ensure_local(path):
         _absorb_conflicts(path, _merge_bookmark_payloads, path.parent / "conflicts")
     payload = read_json_checked(path)
-    payload = payload if isinstance(payload, dict) else {}
-    if track:
-        _SYNC_BASES[_sync_base_key(path)] = record_stamps(_dict_list(payload.get("bookmarks")), stamp="created_at")
-    return payload
+    return payload if isinstance(payload, dict) else {}
 
 
 def _merge_notes_payloads(ours: dict[str, Any], theirs: dict[str, Any], base: dict[str, str] | None = None) -> dict[str, Any]:
@@ -1022,27 +1068,38 @@ def save_notes(
         "notes": [note.to_dict() for note in notes],
     }
     notebook_dir.mkdir(parents=True, exist_ok=True)
-    # Another machine may have saved this notebook since it was loaded here (cloud-synced data
-    # folder). Merge with the file on disk instead of overwriting it.
-    if ensure_local(path):
-        _absorb_notes_conflicts(path)
-    on_disk = read_json_checked(path)
-    written = _merge_notes_payloads(payload, on_disk, _SYNC_BASES.get(_sync_base_key(path))) if isinstance(on_disk, dict) else payload
-    bookmark_payload: dict[str, Any] = {"schema_version": 1, "app": APP_NAME, "bookmarks": payload["bookmarks"]}
-    if ensure_local(bookmark_path):
-        _absorb_conflicts(bookmark_path, _merge_bookmark_payloads, bookmark_path.parent / "conflicts")
-    bookmarks_on_disk = read_json_checked(bookmark_path)
-    if isinstance(bookmarks_on_disk, dict):
-        bookmark_payload = _merge_bookmark_payloads(
-            bookmark_payload, bookmarks_on_disk, _SYNC_BASES.get(_sync_base_key(bookmark_path))
+    # Each computer sharing the data folder records only its own changes, in its own replica (see
+    # sync_store): a note added on the other computer is never overwritten by a stale save here,
+    # and a note disappears only when it was deleted, never because a copy lacked it.
+    from pdf_notes_reader import sync_store
+
+    current = _note_records(payload)
+    current_bookmarks_records = _bookmark_records(payload)
+    try:
+        merged = sync_store.save_records(
+            path,
+            current,
+            _SYNC_BASES.get(_sync_base_key(path)),
+            legacy=_note_records(_legacy_notes_payload(pdf_key, data_dir)) if path.exists() else None,
+            combine=_keep_highest_counter,
         )
-    written["bookmarks"] = bookmark_payload["bookmarks"]
-    _atomic_write_json(path, written)
-    _atomic_write_json(bookmark_path, bookmark_payload)
-    # The base is what this machine holds, not the merged result: a record merged in from the other
-    # machine but absent from the caller's list stays an addition next time, not a deletion.
-    _SYNC_BASES[_sync_base_key(path)] = record_stamps(payload["notes"])
-    _SYNC_BASES[_sync_base_key(bookmark_path)] = record_stamps(payload["bookmarks"], stamp="created_at")
+        merged_bookmarks = sync_store.save_records(
+            bookmark_path,
+            current_bookmarks_records,
+            _SYNC_BASES.get(_sync_base_key(bookmark_path)),
+            legacy=_bookmark_records(_legacy_bookmarks_payload(bookmark_path)) if bookmark_path.exists() else None,
+        )
+    except sync_store.ReplicaUnavailable as exc:
+        record_storage_issue(f"Notes were not saved: {exc}. Save again once it has downloaded.", path)
+        return path
+    written = _payload_from_records(merged, payload)
+    written["bookmarks"] = _bookmarks_from_records(merged_bookmarks)
+    _atomic_write_json(path, written)  # plain readable copy of the merged notebook
+    _atomic_write_json(bookmark_path, {"schema_version": 1, "app": APP_NAME, "bookmarks": written["bookmarks"]})
+    # The base is what this computer's caller holds, not the merged result: a note merged in from the
+    # other computer but missing from the caller's list is not one deleted here.
+    _SYNC_BASES[_sync_base_key(path)] = current
+    _SYNC_BASES[_sync_base_key(bookmark_path)] = current_bookmarks_records
     manifest_path = notebook_dir / "manifest.json"
     _atomic_write_json(
         manifest_path,

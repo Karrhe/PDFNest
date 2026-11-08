@@ -72,7 +72,8 @@ def test_corrupt_notes_file_is_quarantined_not_overwritten(tmp_path):
     notes_file.write_text(original[: len(original) // 2], encoding="utf-8")  # truncated write
 
     loaded, _counters, _bookmarks = load_notes_data(key)
-    assert loaded == []
+    # The damaged notes.json is set aside; the note itself survives in this computer's replica.
+    assert [note.markdown for note in loaded] == ["# keep me"]
     issues = drain_storage_issues()
     assert len(issues) == 1 and "notes.json" in issues[0].message
 
@@ -171,7 +172,8 @@ def test_corrupt_library_is_quarantined_before_reset(isolated_storage):
     path.write_text(good[:20], encoding="utf-8")
 
     reset = load_library()
-    assert all(folder.name != "Physics" for folder in reset.folders)
+    # The damaged library.json is set aside; the folder survives in this computer's replica.
+    assert any(folder.name == "Physics" for folder in reset.folders)
     issues = drain_storage_issues()
     assert issues and issues[0].quarantined_path.read_text(encoding="utf-8") == good[:20]
 
@@ -203,7 +205,8 @@ def test_window_reports_corrupt_notes_without_blocking(tmp_path, window):
 
     window.load_pdf(pdf_path)
 
-    assert window.notes == []
+    # The damaged file is reported and set aside; the note survives in this computer's replica.
+    assert [note.markdown for note in window.notes] == ["# keep me"]
     box = window.last_storage_issue_box
     assert box.isVisible() and not box.isModal()
     assert "notes.json" in box.detailedText()

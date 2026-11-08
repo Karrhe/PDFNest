@@ -328,27 +328,28 @@ def test_storage_page_shows_each_path_once(tmp_path, window) -> None:
         dialog.close()
 
 
-def test_adding_the_pdf_on_a_second_computer_attaches_it_to_the_book(tmp_path, window) -> None:
+def test_adding_the_pdf_on_a_second_computer_attaches_it_to_the_book(tmp_path, window, monkeypatch) -> None:
+    import pdf_notes_reader.history as history_module
+    import pdf_notes_reader.notes as notes_module
     from pdf_notes_reader.notes import machine_id
 
+    this_computer = machine_id()
     # The book was added on another computer, from a path that does not exist here.
+    for module in (history_module, notes_module):
+        monkeypatch.setattr(module, "machine_id", lambda: "other-computer")
     elsewhere = tmp_path / "other-computer" / "a.pdf"
     elsewhere.parent.mkdir()
     pdf_factory.create_sample_pdf(elsewhere, page_count=3)
     key = resolve_pdf_key(elsewhere)
     entries = []
     upsert_history_entry(entries, pdf_key=key, path=elsewhere, page_count=3, last_page_index=2)
-    save_history(entries, touched_pdf_keys={key})  # writes the notebook (manifest, cover) as the other computer did
-    payload = [entry.to_dict() for entry in entries]
-    payload[0]["machine_paths"] = {"other-computer": str(elsewhere)}
+    save_history(entries, touched_pdf_keys={key})  # with the notebook (manifest, cover), as that computer did
+    for module in (history_module, notes_module):
+        monkeypatch.setattr(module, "machine_id", lambda: this_computer)
     here = tmp_path / "here" / "a copy.pdf"
     here.parent.mkdir()
     shutil.copy2(elsewhere, here)
     shutil.rmtree(elsewhere.parent)
-    (default_data_dir() / "recentnotes.json").write_text(json.dumps({"schema_version": 1, "entries": payload}), encoding="utf-8")
-    import pdf_notes_reader.history as history_module
-
-    history_module._HISTORY_BASES.clear()  # that save was the other computer's process, not this one
     window.refresh_library_from_disk(force=True)
     [entry] = window.history_entries
     assert not entry.exists and not entry.located_here

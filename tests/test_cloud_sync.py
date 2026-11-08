@@ -58,8 +58,21 @@ def machines(tmp_path):
 
 
 def sync(source: Path, target: Path) -> None:
-    """Copies the cloud drive from one computer to the other (newest file wins, like iCloud)."""
-    shutil.copytree(source, target, dirs_exist_ok=True)
+    """Delivers one computer's changed files to the other, like iCloud: a file is copied when it is
+    newer there (whole files, last writer wins). Files the source did not change are left alone."""
+    for item in source.rglob("*"):
+        if not item.is_file():
+            continue
+        destination = target / item.relative_to(source)
+        if destination.exists() and destination.stat().st_mtime_ns >= item.stat().st_mtime_ns:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, destination)
+
+
+def sync_both(a: Path, b: Path) -> None:
+    sync(a, b)
+    sync(b, a)
 
 
 def note(pdf_key: str, text: str, page: int = 0) -> Note:
@@ -226,6 +239,7 @@ def as_computer(monkeypatch, name: str) -> None:
     import pdf_notes_reader.history as history_module
 
     monkeypatch.setattr(history_module, "machine_id", lambda: name)
+    monkeypatch.setattr(notes_module, "machine_id", lambda: name)
 
 
 def test_history_entry_resolves_on_the_other_machine(machines, monkeypatch) -> None:
@@ -306,18 +320,23 @@ def test_stale_save_on_one_machine_keeps_the_other_machines_notes(machines) -> N
     assert "added on the PC" in {item.markdown for item in load_notes(key, mac_data)}
 
 
-def test_note_deleted_on_the_other_machine_stays_deleted(machines) -> None:
+def test_note_deleted_on_the_other_machine_stays_deleted(machines, monkeypatch) -> None:
     pc, mac = machines
     pc_data, mac_data = pc / "PDFNest", mac / "PDFNest"
+    as_computer(monkeypatch, "pc")
     key = resolve_pdf_key(pc / "Books" / "a.pdf", pc_data)
     keep, doomed = note(key, "keep"), note(key, "doomed")
     save_notes(pdf_key=key, pdf_path=pc / "Books" / "a.pdf", notes=[keep, doomed], data_dir=pc_data)
     sync(pc, mac)
-    mac_notes, _c, _b = load_notes_data(key, mac_data)
-    save_notes(pdf_key=key, pdf_path=pc / "Books" / "a.pdf", notes=[keep], data_dir=pc_data)
-    shutil.copy2(notebooks_dir(pc_data) / "a" / "note" / "notes.json", notebooks_dir(mac_data) / "a" / "note" / "notes.json")
+    as_computer(monkeypatch, "mac")
+    mac_notes, _c, _b = load_notes_data(key, mac_data)  # the Mac has the book open
+    as_computer(monkeypatch, "pc")
+    save_notes(pdf_key=key, pdf_path=pc / "Books" / "a.pdf", notes=[keep], data_dir=pc_data)  # deleted on the PC
+    sync(pc, mac)
+    as_computer(monkeypatch, "mac")
+    mac_notes.append(note(key, "mac"))  # the Mac, still showing the deleted note, adds one
     save_notes(pdf_key=key, pdf_path=mac / "Books" / "a.pdf", notes=mac_notes, data_dir=mac_data)
-    assert [item.markdown for item in load_notes(key, mac_data)] == ["keep"]
+    assert sorted(item.markdown for item in load_notes(key, mac_data)) == ["keep", "mac"]
 
 
 def test_newer_edit_wins_per_note() -> None:
@@ -404,9 +423,11 @@ def test_evicted_notes_file_that_does_not_download_is_not_overwritten(machines, 
     key = resolve_pdf_key(pc / "Books" / "a.pdf", data)
     save_notes(pdf_key=key, pdf_path=pc / "Books" / "a.pdf", notes=[note(key, "precious")], data_dir=data)
     notes_file = notebooks_dir(data) / "a" / "note" / "notes.json"
-    cloud_copy = notes_file.read_bytes()
-    notes_file.unlink()
-    icloud_stub_for(notes_file).write_text("stub", encoding="utf-8")
+    [replica] = list((notes_file.parent / "notes.json.sync").glob("*.json"))
+    evicted = {path: path.read_bytes() for path in (notes_file, replica)}
+    for path in evicted:  # macOS evicted the whole notebook to .icloud placeholders
+        path.unlink()
+        icloud_stub_for(path).write_text("stub", encoding="utf-8")
     monkeypatch.setattr(portable, "CLOUD_DOWNLOAD_TIMEOUT", 0.0)
     monkeypatch.setattr(portable, "request_cloud_download", lambda path: True)
     drain_storage_issues()
@@ -414,9 +435,13 @@ def test_evicted_notes_file_that_does_not_download_is_not_overwritten(machines, 
     opened, _counters, _bookmarks = load_notes_data(key, data)  # the reader opens the PDF meanwhile
     assert opened == []
     assert any("downloading from iCloud" in issue.message for issue in drain_storage_issues())
-    # The cloud later delivers the file; the next save merges with it instead of replacing it.
-    icloud_stub_for(notes_file).unlink()
-    notes_file.write_bytes(cloud_copy)
+    # Saving now would replace this computer's replica with one missing "precious": refused.
+    save_notes(pdf_key=key, pdf_path=pc / "Books" / "a.pdf", notes=[note(key, "new")], data_dir=data)
+    assert any("not saved" in issue.message for issue in drain_storage_issues())
+    # The cloud later delivers the files; the next save merges with them instead of replacing them.
+    for path, content in evicted.items():
+        icloud_stub_for(path).unlink()
+        path.write_bytes(content)
     save_notes(pdf_key=key, pdf_path=pc / "Books" / "a.pdf", notes=[note(key, "new")], data_dir=data)
     assert sorted(item.markdown for item in load_notes(key, data)) == ["new", "precious"]
 
@@ -484,13 +509,13 @@ def test_each_computer_keeps_its_own_pdf_path(tmp_path, monkeypatch) -> None:
     pdf_factory.create_sample_pdf(pc_pdf, page_count=3)
     shutil.copy2(pc_pdf, mac_pdf)
 
-    monkeypatch.setattr(history_module, "machine_id", lambda: "pc")
+    as_computer(monkeypatch, "pc")
     key = resolve_pdf_key(pc_pdf, shared)
     pc_entries = []
     upsert_history_entry(pc_entries, pdf_key=key, path=pc_pdf, page_count=3, last_page_index=1)
     save_history(pc_entries, shared)
 
-    monkeypatch.setattr(history_module, "machine_id", lambda: "mac")
+    as_computer(monkeypatch, "mac")
     shutil.move(str(tmp_path / "pc-disk"), str(tmp_path / "pc-disk-hidden"))  # the Mac cannot see the PC's disk
     [entry] = load_history(shared)
     assert not entry.exists and not entry.located_here  # shown as "locate it", with notes and cover
@@ -501,7 +526,7 @@ def test_each_computer_keeps_its_own_pdf_path(tmp_path, monkeypatch) -> None:
     save_history(mac_entries, shared)
 
     shutil.move(str(tmp_path / "pc-disk-hidden"), str(tmp_path / "pc-disk"))
-    monkeypatch.setattr(history_module, "machine_id", lambda: "pc")
+    as_computer(monkeypatch, "pc")
     [on_pc] = load_history(shared)
     assert Path(on_pc.path) == pc_pdf.resolve()  # the Mac's relocation did not break the PC
     assert on_pc.last_page_index == 2  # but its reading position came along
@@ -510,6 +535,155 @@ def test_each_computer_keeps_its_own_pdf_path(tmp_path, monkeypatch) -> None:
     # The PC saves its stale list again: the Mac's path survives the merge.
     upsert_history_entry(pc_entries, pdf_key=key, path=pc_pdf, page_count=3, last_page_index=2)
     save_history(pc_entries, shared)
-    monkeypatch.setattr(history_module, "machine_id", lambda: "mac")
+    as_computer(monkeypatch, "mac")
     [on_mac] = load_history(shared)
     assert Path(on_mac.path) == mac_pdf.resolve()
+
+
+# --- The reported problems: folders and books lost between two computers ---------------------------
+
+
+def test_folder_made_on_the_mac_survives_the_pc_filing_books_from_a_stale_copy(machines, monkeypatch) -> None:
+    """Reported: "Mac's folder missed after I add files in Win empty folder"."""
+    from pdf_notes_reader.library import LibraryFolder, load_library, save_library
+
+    pc, mac = machines
+    pc_data, mac_data = pc / "PDFNest", mac / "PDFNest"
+    as_computer(monkeypatch, "pc")
+    pc_library = load_library(pc_data)
+    reading = LibraryFolder.create("Reading")
+    pc_library.folders.append(reading)
+    save_library(pc_library, pc_data)
+    sync_both(pc, mac)
+
+    as_computer(monkeypatch, "mac")
+    mac_library = load_library(mac_data)
+    papers = LibraryFolder.create("Papers")
+    mac_library.folders.append(papers)
+    save_library(mac_library, mac_data)
+
+    # The PC has not received the Mac's change yet and files a book into its (empty) folder.
+    as_computer(monkeypatch, "pc")
+    pc_library = load_library(pc_data)
+    pc_library.assignments["book-1"] = reading.id
+    save_library(pc_library, pc_data)
+    sync_both(pc, mac)  # the PC's library.json is newer and replaces the Mac's copy
+
+    for name, data in (("mac", mac_data), ("pc", pc_data)):
+        as_computer(monkeypatch, name)
+        library = load_library(data)
+        assert {folder.name for folder in library.folders} >= {"Reading", "Papers"}, name
+        assert library.assignments["book-1"] == reading.id, name
+
+    # The Mac saves again from its (now merged) state: nothing is dropped as "deleted elsewhere".
+    as_computer(monkeypatch, "mac")
+    library = load_library(mac_data)
+    library.aliases["book-1"] = "Renamed on the Mac"
+    save_library(library, mac_data)
+    sync_both(pc, mac)
+    as_computer(monkeypatch, "pc")
+    library = load_library(pc_data)
+    assert {folder.name for folder in library.folders} >= {"Reading", "Papers"}
+    assert library.aliases["book-1"] == "Renamed on the Mac"
+
+
+def test_books_added_on_the_pc_survive_a_stale_save_on_the_mac(machines, monkeypatch) -> None:
+    """Reported: "Win shows folders with no books in them" after the Mac saved its older list."""
+    pc, mac = machines
+    pc_data, mac_data = pc / "PDFNest", mac / "PDFNest"
+    pdf_factory.create_sample_pdf(pc / "Books" / "b.pdf", page_count=2)
+    as_computer(monkeypatch, "mac")
+    mac_entries = load_history(mac_data)  # the Mac app is running with an empty library
+    key_a = resolve_pdf_key(mac / "Books" / "a.pdf", mac_data)
+
+    as_computer(monkeypatch, "pc")
+    pc_entries = load_history(pc_data)
+    for name in ("a", "b"):
+        path = pc / "Books" / f"{name}.pdf"
+        upsert_history_entry(pc_entries, pdf_key=resolve_pdf_key(path, pc_data), path=path, page_count=2, last_page_index=0)
+    save_history(pc_entries, pc_data)
+
+    # Before those books reach the Mac, the Mac records reading a.pdf from its old list.
+    as_computer(monkeypatch, "mac")
+    upsert_history_entry(mac_entries, pdf_key=key_a, path=mac / "Books" / "a.pdf", page_count=3, last_page_index=2)
+    save_history(mac_entries, mac_data)
+    sync_both(pc, mac)  # the Mac's recentnotes.json is newer and replaces the PC's copy
+
+    as_computer(monkeypatch, "pc")
+    from pdf_notes_reader.history import reload_history_into
+
+    reload_history_into(pc_entries, pc_data)  # the PC window refreshes
+    by_key = {entry.pdf_key: entry for entry in pc_entries}
+    assert len(by_key) == 2  # both books are still on the PC
+    assert by_key[key_a].last_page_index == 2  # with the Mac's reading position
+    as_computer(monkeypatch, "mac")
+    assert len(load_history(mac_data)) == 2  # and the Mac sees both
+
+
+def test_book_removed_on_one_computer_stays_removed(machines, monkeypatch) -> None:
+    from pdf_notes_reader.history import remove_history_entry
+
+    pc, mac = machines
+    pc_data, mac_data = pc / "PDFNest", mac / "PDFNest"
+    as_computer(monkeypatch, "pc")
+    entries = load_history(pc_data)
+    key = resolve_pdf_key(pc / "Books" / "a.pdf", pc_data)
+    upsert_history_entry(entries, pdf_key=key, path=pc / "Books" / "a.pdf", page_count=3, last_page_index=0)
+    save_history(entries, pc_data)
+    sync_both(pc, mac)
+    as_computer(monkeypatch, "mac")
+    mac_entries = load_history(mac_data)
+    as_computer(monkeypatch, "pc")
+    save_history(remove_history_entry(entries, key), pc_data)
+    sync_both(pc, mac)
+    as_computer(monkeypatch, "mac")
+    save_history(mac_entries, mac_data)  # a stale list that still has it does not bring it back
+    sync_both(pc, mac)
+    assert load_history(mac_data) == []
+    as_computer(monkeypatch, "pc")
+    assert load_history(pc_data) == []
+
+
+def test_library_from_an_older_pdfnest_is_still_read(tmp_path) -> None:
+    """A library.json written before per-computer replicas (or by PDFNest 0.3.3 and older)."""
+    from pdf_notes_reader.library import load_library
+
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "library.json").write_text(
+        json.dumps(
+            {
+                "folders": [{"id": "f1", "name": "Old folder", "created_at": "2026-01-01T00:00:00+00:00", "parent_id": ""}],
+                "assignments": {"book": "f1"},
+                "aliases": {},
+                "archived": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    library = load_library(data)
+    assert [folder.name for folder in library.folders if folder.id == "f1"] == ["Old folder"]
+    assert library.assignments == {"book": "f1"}
+
+
+def test_folders_and_books_in_icloud_conflict_copies_are_recovered(tmp_path) -> None:
+    """iCloud keeps "library 2.json" when two computers wrote library.json at once: what only that copy
+    has (the folder that went missing) comes back on the next start."""
+    from pdf_notes_reader.library import load_library
+
+    data = tmp_path / "data"
+    data.mkdir()
+    folder = {"id": "f-pc", "name": "From the PC", "created_at": "2026-11-08T10:00:00+00:00", "parent_id": ""}
+    lost = {"id": "f-mac", "name": "Made on the Mac", "created_at": "2026-11-08T11:00:00+00:00", "parent_id": ""}
+    (data / "library.json").write_text(json.dumps({"folders": [folder], "assignments": {"b1": "f-pc"}}), encoding="utf-8")
+    (data / "library 2.json").write_text(json.dumps({"folders": [folder, lost], "assignments": {"b2": "f-mac"}}), encoding="utf-8")
+    entry = {"pdf_key": "b2", "path": "/Users/x/b2.pdf", "title": "b2.pdf", "last_page_index": 0, "page_count": 1,
+             "opened_at": "2026-11-08T11:00:00+00:00", "updated_at": "2026-11-08T11:00:00+00:00"}
+    (data / "recentnotes.json").write_text(json.dumps({"entries": []}), encoding="utf-8")
+    (data / "recentnotes 2.json").write_text(json.dumps({"entries": [entry]}), encoding="utf-8")
+
+    library = load_library(data)
+    assert {f.name for f in library.folders} >= {"From the PC", "Made on the Mac"}
+    assert library.assignments == {"b1": "f-pc", "b2": "f-mac"}
+    assert [e.pdf_key for e in load_history(data)] == ["b2"]
+    assert not (data / "library 2.json").exists() and list((data / "conflicts").glob("library 2.*.json"))

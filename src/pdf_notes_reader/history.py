@@ -8,7 +8,8 @@ from typing import Any
 from pdf_notes_reader.notes import default_data_dir, notebook_dir_for_pdf, pdf_key_for_path, root_sync_lock_path, utc_now
 from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock, read_json_checked
 from pdf_notes_reader.notes import _LOCATOR_CACHE, _absorb_conflicts, _dict_list, machine_id, read_manifest
-from pdf_notes_reader.portable import ensure_local, icloud_stub_for, merge_records, portable_relpath, record_stamps
+from pdf_notes_reader import sync_store
+from pdf_notes_reader.portable import ensure_local, icloud_stub_for, portable_relpath
 
 
 @dataclass
@@ -72,22 +73,15 @@ def _clean_machine_paths(value: Any) -> dict[str, str]:
     return {str(key): str(path) for key, path in value.items() if str(key) and str(path)}
 
 
-def _combine_machine_paths(merged: list[dict[str, Any]], *sources: list[dict[str, Any]]) -> None:
-    """Each computer's path survives a merge, whichever computer's copy of the entry won:
-    this computer's own path comes from ``sources[0]`` (ours), the others' from the rest."""
-    me = machine_id()
-    by_key: dict[str, dict[str, str]] = {}
-    for source in reversed(sources):  # ours last, so it wins
-        for item in source:
-            paths = by_key.setdefault(str(item.get("pdf_key")), {})
-            paths.update(_clean_machine_paths(item.get("machine_paths")))
-    ours = {str(item.get("pdf_key")): _clean_machine_paths(item.get("machine_paths")) for item in sources[0]} if sources else {}
-    for item in merged:
-        key = str(item.get("pdf_key"))
-        paths = dict(by_key.get(key, {}))
-        if me in ours.get(key, {}):
-            paths[me] = ours[key][me]
-        item["machine_paths"] = dict(sorted(paths.items()))
+def _combine_machine_paths(winner: dict[str, Any], versions: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Each computer's path to the PDF survives, whichever computer's copy of the entry is newest."""
+    paths: dict[str, str] = {}
+    for _stamp, data in sorted(versions, key=lambda item: item[0]):
+        if isinstance(data, dict):
+            paths.update(_clean_machine_paths(data.get("machine_paths")))
+    combined = dict(winner)
+    combined["machine_paths"] = dict(sorted(paths.items()))
+    return combined
 
 
 def history_path(data_dir: Path | None = None) -> Path:
@@ -111,55 +105,93 @@ def normalize_fit_mode(value: Any) -> str:
     return mode if mode in {"width", "height"} else ""
 
 
-def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
+def _legacy_records(data_dir: Path | None) -> dict[str, dict[str, Any]]:
+    """Entries from the plain ``recentnotes.json`` (or the older ``pdf_history.json``)."""
     path = history_path(data_dir)
-    if not path.exists():
+    if not path.exists() and not ensure_local(path):
         path = legacy_history_path(data_dir)
     if not path.exists():
-        return []
-
+        return {}
+    # Conflict copies (recentnotes 2.json...) may hold books the plain file lost: fold them in.
+    _absorb_conflicts(path, _union_history_payloads, path.parent / "conflicts")
     payload = read_json_checked(path)
-    if payload is None:
-        return []
-
     raw_entries = payload if isinstance(payload, list) else payload.get("entries", []) if isinstance(payload, dict) else []
-    if not isinstance(raw_entries, list):
-        return []
+    records: dict[str, dict[str, Any]] = {}
+    for item in _dict_list(raw_entries):
+        try:
+            entry = PdfHistoryEntry.from_dict(item)
+        except (TypeError, ValueError):
+            continue
+        records[entry.pdf_key] = entry.to_dict()
+    return records
 
-    entries: list[PdfHistoryEntry] = []
-    for item in raw_entries:
-        if isinstance(item, dict):
-            entries.append(PdfHistoryEntry.from_dict(item))
+
+def _union_history_payloads(ours: Any, theirs: Any, _base: Any = None) -> dict[str, Any]:
+    """Every book either copy has, the more recently read version of each."""
+    books: dict[str, dict[str, Any]] = {}
+    for payload in (theirs, ours):
+        for item in _dict_list(payload.get("entries") if isinstance(payload, dict) else payload):
+            key = str(item.get("pdf_key") or "")
+            if key and (key not in books or str(item.get("updated_at", "")) >= str(books[key].get("updated_at", ""))):
+                books[key] = item
+    return {"schema_version": 1, "app": "PDFNest", "entries": list(books.values())}
+
+
+def _entries_from_records(records: dict[str, Any], data_dir: Path | None) -> list[PdfHistoryEntry]:
     root = data_dir or default_data_dir()
-    for entry in entries:
+    entries: list[PdfHistoryEntry] = []
+    for data in records.values():
+        if not isinstance(data, dict):
+            continue
+        try:
+            entry = PdfHistoryEntry.from_dict(data)
+        except (TypeError, ValueError):
+            continue
         resolve_entry_path(entry, root)
-    _HISTORY_BASES[str(history_path(data_dir))] = record_stamps([entry.to_dict() for entry in entries], key="pdf_key")
+        entries.append(entry)
     return sorted(entries, key=lambda entry: entry.updated_at, reverse=True)
 
 
-# pdf_key -> updated_at of the entries this process last loaded or saved; see notes._SYNC_BASES.
-_HISTORY_BASES: dict[str, dict[str, str]] = {}
+def _materialize(records: dict[str, Any]) -> dict[str, Any]:
+    entries = sorted((data for data in records.values() if isinstance(data, dict)), key=lambda item: str(item.get("updated_at", "")), reverse=True)
+    return {"schema_version": 1, "app": "PDFNest", "entries": entries}
+
+
+def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
+    """Every computer's books, merged (see ``sync_store``): newest change per book wins."""
+    path = history_path(data_dir)
+    records = sync_store.load_records(path, _legacy_records(data_dir), combine=_combine_machine_paths)
+    entries = _entries_from_records(records, data_dir)
+    _HISTORY_BASES[str(path)] = {entry.pdf_key: entry.to_dict() for entry in entries}
+    return entries
+
+
+# pdf_key -> entry as this process last loaded or saved it: a book that differs from it changed
+# here, one missing from the saved list was removed here. Nothing else is touched by a save.
+_HISTORY_BASES: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def reload_history_into(entries: list[PdfHistoryEntry], data_dir: Path | None = None) -> bool:
-    """Merges books the other computer added, removed or read further in into ``entries`` (in place),
-    without writing anything. Returns whether ``entries`` changed."""
+    """Shows books the other computer added, removed or read further, without writing anything.
+
+    Books changed here since the last save keep this computer's version. Returns whether
+    ``entries`` changed.
+    """
     path = history_path(data_dir)
-    if not path.exists():
+    base = _HISTORY_BASES.get(str(path))
+    merged = _entries_from_records(
+        sync_store.load_records(path, _legacy_records(data_dir), combine=_combine_machine_paths), data_dir
+    )
+    by_key = {entry.pdf_key: entry for entry in merged}
+    if base is not None:
+        for entry in entries:  # unsaved changes made here win
+            if base.get(entry.pdf_key) != entry.to_dict():
+                by_key[entry.pdf_key] = entry
+    _HISTORY_BASES[str(path)] = {key: entry.to_dict() for key, entry in by_key.items()}
+    updated = sorted(by_key.values(), key=lambda item: item.updated_at, reverse=True)
+    if [entry.to_dict() for entry in updated] == [entry.to_dict() for entry in entries]:
         return False
-    on_disk = read_json_checked(path)
-    disk_entries = _dict_list(on_disk.get("entries") if isinstance(on_disk, dict) else on_disk)
-    ours = [entry.to_dict() for entry in entries]
-    merged = merge_records(ours, disk_entries, base=_HISTORY_BASES.get(str(path)), key="pdf_key")
-    _combine_machine_paths(merged, ours, disk_entries)
-    _HISTORY_BASES[str(path)] = record_stamps(merged, key="pdf_key")
-    if merged == ours:
-        return False
-    root = data_dir or default_data_dir()
-    updated = [PdfHistoryEntry.from_dict(item) for item in merged]
-    for entry in updated:
-        resolve_entry_path(entry, root)
-    entries[:] = sorted(updated, key=lambda item: item.updated_at, reverse=True)
+    entries[:] = updated
     return True
 
 
@@ -188,36 +220,30 @@ def resolve_entry_path(entry: PdfHistoryEntry, data_dir: Path) -> None:
 
 
 def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *, touched_pdf_keys: set[str] | None = None) -> Path:
-    """Writes the library list, merged with the copy on disk.
+    """Records this computer's changes to the book list and updates ``entries`` (in place) to the
+    merged list of all computers sharing the data folder.
 
-    With the data folder in a cloud drive, the other computer may have added books or read further
-    since this list was loaded; those entries are merged into ``entries`` (in place) instead of lost.
+    Only books that changed here (or were removed here) are written as changes, into this computer's
+    own replica, so saving a list that is out of date never removes or rolls back what the other
+    computer did. ``recentnotes.json`` is rewritten as a readable copy of the merged list.
     """
     path = history_path(data_dir)
     root = data_dir or default_data_dir()
     for entry in entries:
         _refresh_rel_path(entry, root)
-    ours = [entry.to_dict() for entry in entries]
-    base_key = str(path)
-    if ensure_local(path):
-        _absorb_conflicts(path, _merge_history_payloads, root / "conflicts")
-    on_disk = read_json_checked(path)
-    disk_entries = _dict_list(on_disk.get("entries") if isinstance(on_disk, dict) else on_disk)
-    merged = merge_records(ours, disk_entries, base=_HISTORY_BASES.get(base_key), key="pdf_key") if disk_entries else ours
-    if disk_entries:
-        _combine_machine_paths(merged, ours, disk_entries)
-    _HISTORY_BASES[base_key] = record_stamps(ours, key="pdf_key")
-    if merged != ours:
-        updated = [PdfHistoryEntry.from_dict(item) for item in merged]
-        for entry in updated:
-            resolve_entry_path(entry, root)
-        entries[:] = sorted(updated, key=lambda item: item.updated_at, reverse=True)
-    payload = {
-        "schema_version": 1,
-        "app": "PDFNest",
-        "entries": merged,
-    }
-    _atomic_write_json(path, payload)
+    current = {entry.pdf_key: entry.to_dict() for entry in entries}
+    merged = sync_store.save_records(
+        path,
+        current,
+        _HISTORY_BASES.get(str(path)),
+        legacy=_legacy_records(data_dir),
+        combine=_combine_machine_paths,
+        materialize=_materialize,
+    )
+    updated = _entries_from_records(merged, data_dir)
+    _HISTORY_BASES[str(path)] = {entry.pdf_key: entry.to_dict() for entry in updated}
+    if [entry.to_dict() for entry in updated] != [entry.to_dict() for entry in entries]:
+        entries[:] = updated
     _write_sync_lock(root_sync_lock_path(data_dir))
     touched = touched_pdf_keys
     for entry in entries:
@@ -225,16 +251,6 @@ def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *
             continue
         _save_notebook_recent_file(entry, data_dir)
     return path
-
-
-def _merge_history_payloads(ours: Any, theirs: Any, base: dict[str, str] | None = None) -> dict[str, Any]:
-    ours_entries = _dict_list(ours.get("entries") if isinstance(ours, dict) else ours)
-    theirs_entries = _dict_list(theirs.get("entries") if isinstance(theirs, dict) else theirs)
-    return {
-        "schema_version": 1,
-        "app": "PDFNest",
-        "entries": merge_records(ours_entries, theirs_entries, base=base, key="pdf_key"),
-    }
 
 
 def _refresh_rel_path(entry: PdfHistoryEntry, data_dir: Path) -> None:
