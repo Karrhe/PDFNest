@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 
 from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QSignalBlocker, Signal
@@ -38,7 +39,9 @@ class HistoryPanel(QWidget):
     archive_requested = Signal(str)
     remove_requested = Signal(str)
     export_requested = Signal(str)
-    add_notebook_requested = Signal(str)
+    add_notebook_requested = Signal(str)  # folder id: pick PDF files to add
+    add_folder_requested = Signal(str)  # folder id: pick a disk folder whose PDFs are added
+    pdfs_dropped = Signal(list, str)  # dropped file/folder paths, library folder id
     rename_requested = Signal(str, str)
     restore_requested = Signal(str)
     settings_requested = Signal()
@@ -101,8 +104,18 @@ class HistoryPanel(QWidget):
         self.sort_combo.addItem("Name", "name")
         self.sort_combo.currentIndexChanged.connect(self._set_sort_from_combo)
 
-        self.new_notebook_button = self._icon_tool_button("new-notebook.png", "Add planned PDF", "LibraryNewNotebookButton")
-        self.new_notebook_button.clicked.connect(lambda: self.add_notebook_requested.emit(self.folder_filter if self.home_mode == "notebooks" else ""))
+        self.new_notebook_button = self._icon_tool_button(
+            "new-notebook.png", "Add PDFs to the library (or drop PDFs and folders here)", "LibraryNewNotebookButton"
+        )
+        add_menu = QMenu(self.new_notebook_button)
+        self.add_files_action = add_menu.addAction("Add PDF files…")
+        self.add_files_action.triggered.connect(lambda: self.add_notebook_requested.emit(self._target_folder_id()))
+        self.add_folder_action = add_menu.addAction("Add all PDFs in a folder…")
+        self.add_folder_action.triggered.connect(lambda: self.add_folder_requested.emit(self._target_folder_id()))
+        self.new_notebook_button.setMenu(add_menu)
+        self.new_notebook_button.setPopupMode(QToolButton.InstantPopup)
+        self.new_notebook_button.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        self.setAcceptDrops(True)
         self.new_folder_button = self._icon_tool_button("new-notegroup.png", "New folder", "LibraryNewFolderButton")
         self.new_folder_button.clicked.connect(lambda: self._create_virtual_folder(parent_id=self.folder_filter))
         self.view_toggle_button = self._icon_tool_button("iconmode.png", "Icon view", "LibraryViewToggleButton")
@@ -426,17 +439,65 @@ class HistoryPanel(QWidget):
         elif fallback_to_root:
             self.folder_tree.setCurrentItem(root)
 
+    def _target_folder_id(self) -> str:
+        """The library folder new PDFs go into: the open folder in Notebooks view, otherwise none."""
+        return self.folder_filter if self.home_mode == "notebooks" else ""
+
+    # --- dropping PDFs and folders from Explorer -----------------------------------------------
+
+    @staticmethod
+    def _dropped_paths(event) -> list[str]:
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return []
+        paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+        return [path for path in paths if path.lower().endswith(".pdf") or os.path.isdir(path)]
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._dropped_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._dropped_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        paths = self._dropped_paths(event)
+        if not paths:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        folder_id = self._target_folder_id()
+        # Dropped onto a folder in the folder tree: add into that folder.
+        tree_pos = self.folder_tree.viewport().mapFrom(self, event.position().toPoint())
+        if self.folder_tree.isVisible() and self.folder_tree.viewport().rect().contains(tree_pos):
+            item = self.folder_tree.itemAt(tree_pos)
+            if item is not None:
+                folder_id = str(item.data(0, Qt.UserRole) or "")
+        self.pdfs_dropped.emit(paths, folder_id)
+
     def _show_folder_context_menu(self, pos: QPoint) -> None:
         item = self.folder_tree.itemAt(pos)
         if item is None:
             return
         folder_id = str(item.data(0, Qt.UserRole) or "")
         menu = QMenu(self)
+        add_files_action = menu.addAction("Add PDF files here…")
+        add_folder_action = menu.addAction("Add all PDFs in a folder here…")
+        menu.addSeparator()
         new_child_action = menu.addAction("New subfolder" if folder_id else "New folder")
         rename_action = menu.addAction("Rename") if folder_id and folder_id != UNFILED_FOLDER_ID else None
         delete_action = menu.addAction("Delete") if folder_id and folder_id != UNFILED_FOLDER_ID else None
         chosen = menu.exec(self.folder_tree.viewport().mapToGlobal(pos))
-        if chosen == new_child_action:
+        if chosen == add_files_action:
+            self.add_notebook_requested.emit(folder_id)
+        elif chosen == add_folder_action:
+            self.add_folder_requested.emit(folder_id)
+        elif chosen == new_child_action:
             self._create_virtual_folder(parent_id=folder_id)
         elif rename_action is not None and chosen == rename_action:
             self._rename_folder(folder_id)

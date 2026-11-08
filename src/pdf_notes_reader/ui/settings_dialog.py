@@ -32,6 +32,9 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_notes_reader.notes import app_local_data_dir, default_data_dir
+from pdf_notes_reader.services.url_scheme import can_register as can_register_links
+from pdf_notes_reader.services.url_scheme import registration_hint as link_registration_hint
+from pdf_notes_reader.services.obsidian import VaultConfig, clean_subfolder
 from pdf_notes_reader.services.backup import create_backup, default_backup_name, verify_backup
 from pdf_notes_reader.settings import clamp_marker_radius, clamp_wheel_scroll_lines, settings_path
 from pdf_notes_reader.ui.constants import ANNOTATION_COLORS, SELECTION_COLOR_SETTINGS, SELECTION_SHORTCUTS
@@ -137,6 +140,38 @@ class SettingsDialog(QDialog):
         markdown_row_layout.addWidget(markdown_browse_button, 0)
         markdown_row_layout.addWidget(markdown_copy_button, 0)
 
+        self.obsidian_vault_edit = QLineEdit(str(settings.get("obsidian_vault_dir") or ""))
+        self.obsidian_vault_edit.setPlaceholderText("Not set: notes stay in PDFNest only")
+        self.obsidian_vault_edit.setMinimumWidth(260)
+        self.obsidian_vault_edit.textChanged.connect(lambda _text: self._update_vault_hint())
+        vault_browse_button = QPushButton("Browse")
+        vault_browse_button.clicked.connect(self._choose_obsidian_vault)
+        vault_clear_button = QPushButton("Turn off")
+        vault_clear_button.setToolTip("Stop syncing notes to Obsidian (files already in the vault stay there)")
+        vault_clear_button.clicked.connect(lambda: self.obsidian_vault_edit.setText(""))
+        vault_row = QWidget()
+        vault_row_layout = QHBoxLayout(vault_row)
+        vault_row_layout.setContentsMargins(0, 0, 0, 0)
+        vault_row_layout.setSpacing(8)
+        vault_row_layout.addWidget(self.obsidian_vault_edit, 1)
+        vault_row_layout.addWidget(vault_browse_button, 0)
+        vault_row_layout.addWidget(vault_clear_button, 0)
+        subfolder = settings.get("obsidian_subfolder")
+        self.obsidian_subfolder_edit = QLineEdit("PDFNest" if subfolder is None else str(subfolder))
+        self.obsidian_subfolder_edit.setPlaceholderText("Leave empty to use the vault's top folder")
+        self.obsidian_subfolder_edit.textChanged.connect(lambda _text: self._update_vault_hint())
+        self.register_links_checkbox = QCheckBox("Let pdfnest:// links in notes open PDFNest at that page")
+        self.register_links_checkbox.setToolTip("Registers PDFNest as the handler of pdfnest:// links for your Windows user")
+        self.register_links_checkbox.setChecked(bool(settings.get("register_pdfnest_links")))
+        if not can_register_links():
+            # macOS declares the scheme in the app bundle's Info.plist; nothing to register.
+            self.register_links_checkbox.setEnabled(False)
+            self.register_links_checkbox.setToolTip(link_registration_hint())
+        self.vault_hint = QLabel()
+        self.vault_hint.setWordWrap(True)
+        self.vault_hint.setObjectName("SettingsHint")
+        self._update_vault_hint()
+
         data_label = self._path_row(str(data_dir))
         note_label = self._path_row(str(note_json_path) if note_json_path is not None else "Open a PDF to see this path.")
         settings_label = self._path_row(str(settings_path(data_dir)))
@@ -189,7 +224,12 @@ class SettingsDialog(QDialog):
         self._add_settings_page("Page display", display_form)
         self._add_settings_page("Storage", storage_form)
         self._add_settings_page("Shortcuts", shortcuts_form)
-        self._add_settings_page("Other", QFormLayout())
+        obsidian_form = QFormLayout()
+        obsidian_form.addRow("Vault folder", vault_row)
+        obsidian_form.addRow("Folder in vault", self.obsidian_subfolder_edit)
+        obsidian_form.addRow("Links back", self.register_links_checkbox)
+        obsidian_form.addRow("", self.vault_hint)
+        self._add_settings_page("Obsidian", obsidian_form)
         self.category_list.setCurrentItem(self.category_list.topLevelItem(0))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -293,6 +333,24 @@ class SettingsDialog(QDialog):
             self.markdown_dir_edit.setText(path)
             self.markdown_dir_edit.setCursorPosition(0)
 
+    def _choose_obsidian_vault(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose your Obsidian vault folder", self.obsidian_vault_edit.text())
+        if path:
+            self.obsidian_vault_edit.setText(path)
+            self.obsidian_vault_edit.setCursorPosition(0)
+
+    def _update_vault_hint(self) -> None:
+        config = VaultConfig.from_settings({"obsidian_vault_dir": self.obsidian_vault, "obsidian_subfolder": self.obsidian_subfolder})
+        if config is None:
+            text = "Choose a vault to keep each note as a Markdown file there and edit it in Obsidian."
+        elif not config.vault_dir.is_dir():
+            text = "This folder does not exist yet. PDFNest will create it when it writes the first note."
+        elif not config.is_obsidian_vault():
+            text = "This folder is not an Obsidian vault yet: open it once in Obsidian (Open folder as vault)."
+        else:
+            text = f"Notes go to: {config.root}"
+        self.vault_hint.setText(text)
+
     def _selection_color_changed(self, setting_key: str, index: int) -> None:
         combo = self.selection_color_combos[setting_key]
         if index == combo.count() - 1:
@@ -360,6 +418,18 @@ class SettingsDialog(QDialog):
     @property
     def wheel_scroll_lines(self) -> int:
         return int(self.wheel_scroll_lines_spin.value())
+
+    @property
+    def obsidian_vault(self) -> str:
+        return self.obsidian_vault_edit.text().strip()
+
+    @property
+    def obsidian_subfolder(self) -> str:
+        return clean_subfolder(self.obsidian_subfolder_edit.text())
+
+    @property
+    def register_pdfnest_links(self) -> bool:
+        return self.register_links_checkbox.isChecked()
 
     @property
     def auto_save_current_note(self) -> bool:

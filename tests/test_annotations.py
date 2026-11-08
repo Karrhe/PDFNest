@@ -581,12 +581,19 @@ class AnnotationsTest(GuiTestCase):
                 self.assertEqual(len(window.notes), 1)
                 self.assertEqual(window.notes[0].note_type, "highlight")
                 self.assertEqual(window.notes[0].selected_text, "selected text")
-                self.assertTrue(window.notes[0].markdown.startswith("# page-1-1\n\n> selected text"))
+                # No note by default: the highlight is only listed in the Summary.
+                self.assertFalse(window.notes[0].has_note)
+                self.assertEqual(window.notes[0].markdown, "")
                 self.assertEqual(window.notes[0].color, "#86efac")
-                self.assertEqual(window.note_panel.current_note_id, window.notes[0].id)
+                self.assertIsNone(window.note_panel.current_note_id)
                 note_id = window.notes[0].id
+                self.assertEqual(window.note_panel.summary_annotation_ids(), [note_id])
 
                 window.select_note(note_id)
+                self.assertIsNone(window.note_panel.current_note_id)
+                window.add_annotation_note(note_id)
+                self.assertTrue(window.notes[0].has_note)
+                self.assertTrue(window.notes[0].markdown.startswith("# page-1-1\n\n> selected text"))
                 self.assertEqual(window.note_panel.current_note_id, note_id)
                 window.set_note_color(note_id, "#93c5fd")
                 self.assertEqual(window.notes[0].color, "#93c5fd")

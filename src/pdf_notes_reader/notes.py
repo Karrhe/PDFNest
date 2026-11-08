@@ -17,6 +17,8 @@ import fitz
 
 APP_NAME = "PDFNest"
 STORAGE_DIR_NAME = "Note_PDFNest"
+# Highlights and underlines: marked text that may carry one optional note of its own.
+ANNOTATION_TYPES = frozenset({"highlight", "underline"})
 
 
 @dataclass
@@ -37,6 +39,13 @@ class Note:
     marker_style: str = "dashed_underline"
     note_number: int = 0
     exported_markdown_path: str = ""
+    # Obsidian vault sync: the note's file relative to the vault, and the hash of the file text
+    # PDFNest last wrote or read (see services/obsidian.py).
+    vault_path: str = ""
+    vault_hash: str = ""
+    # Highlights and underlines start without a note; the user adds one (at most one) on request.
+    # Point notes always are notes.
+    has_note: bool = True
 
     @classmethod
     def create(
@@ -55,6 +64,7 @@ class Note:
         marker_style: str = "dashed_underline",
         note_number: int = 0,
         exported_markdown_path: str = "",
+        has_note: bool = True,
     ) -> "Note":
         now = utc_now()
         return cls(
@@ -74,20 +84,27 @@ class Note:
             marker_style=str(marker_style or "dashed_underline"),
             note_number=max(0, int(note_number)),
             exported_markdown_path=str(exported_markdown_path),
+            has_note=bool(has_note),
         )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Note":
+        note_type = str(data.get("note_type") or "point")
+        markdown = str(data.get("markdown", ""))
+        if "has_note" in data:
+            has_note = bool(data["has_note"])
+        else:
+            has_note = note_type not in ANNOTATION_TYPES or _legacy_annotation_has_note(markdown)
         return cls(
             id=str(data["id"]),
             pdf_key=str(data["pdf_key"]),
             page_index=int(data["page_index"]),
             x_norm=clamp01(float(data["x_norm"])),
             y_norm=clamp01(float(data["y_norm"])),
-            markdown=str(data.get("markdown", "")),
+            markdown=markdown,
             created_at=str(data.get("created_at") or utc_now()),
             updated_at=str(data.get("updated_at") or utc_now()),
-            note_type=str(data.get("note_type") or "point"),
+            note_type=note_type,
             rects_norm=normalize_rects(data.get("rects_norm", [])),
             selected_text=str(data.get("selected_text", "")),
             color=str(data.get("color", "")),
@@ -95,6 +112,9 @@ class Note:
             marker_style=str(data.get("marker_style") or "dashed_underline"),
             note_number=normalize_nonnegative_int(data.get("note_number"), default=0),
             exported_markdown_path=str(data.get("exported_markdown_path", "")),
+            vault_path=str(data.get("vault_path", "")),
+            vault_hash=str(data.get("vault_hash", "")),
+            has_note=has_note,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -137,6 +157,27 @@ class Bookmark:
         return asdict(self)
 
 
+def _legacy_annotation_has_note(markdown: str) -> bool:
+    """Older highlights were always given a note holding only a title and the quoted text. Those
+    count as having no note; any line the user wrote beyond the title and quote makes it a note."""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("#", ">")):
+            return True
+    return False
+
+
+def is_annotation(note: Note) -> bool:
+    return note.note_type in ANNOTATION_TYPES
+
+
+def shows_as_note(note: Note) -> bool:
+    """Whether the note is a note the user writes in: a point note, or an annotation's added note."""
+    if note.note_type == "point":
+        return True
+    return is_annotation(note) and note.has_note
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -163,8 +204,28 @@ def app_base_dir() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def macos_app_support_dir(home: Path | None = None) -> Path:
+    """``~/Library/Application Support/PDFNest``: where a Mac app keeps its data."""
+    return (home or Path.home()) / "Library" / "Application Support" / APP_NAME
+
+
+def app_data_root(*, platform: str | None = None, frozen: bool | None = None, home: Path | None = None) -> Path:
+    """The folder holding ``.local-data`` and the default note store.
+
+    Windows builds and source checkouts keep data next to the program (portable). A frozen macOS
+    ``PDFNest.app`` cannot: ``sys.executable`` lives in the signed, often read-only
+    ``PDFNest.app/Contents/MacOS``, and replacing the app would delete the notes. It uses
+    Application Support instead.
+    """
+    platform = sys.platform if platform is None else platform
+    frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    if frozen and platform == "darwin":
+        return macos_app_support_dir(home)
+    return app_base_dir()
+
+
 def app_local_data_dir() -> Path:
-    return app_base_dir() / ".local-data"
+    return app_data_root() / ".local-data"
 
 
 def storage_pointer_path() -> Path:
@@ -197,7 +258,7 @@ def default_data_dir() -> Path:
     if override:
         return Path(override).expanduser()
 
-    local = app_base_dir() / STORAGE_DIR_NAME
+    local = app_data_root() / STORAGE_DIR_NAME
     configured = _read_storage_pointer()
     if configured is not None:
         if configured.exists():

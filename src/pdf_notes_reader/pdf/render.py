@@ -8,7 +8,6 @@ of on every rebuild.
 from __future__ import annotations
 
 import logging
-import math
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -16,10 +15,12 @@ import fitz
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 
+from pdf_notes_reader.pdf.render_worker import MAX_PAGE_PIXELS, RenderResult, page_render_scale
+
+__all__ = ["MAX_PAGE_PIXELS", "PageRenderCache", "RenderedPage", "page_render_scale", "rasterize_page", "rendered_page_from_result"]
+
 logger = logging.getLogger(__name__)
 
-# One page never exceeds this many device pixels (about 64 MB as a 32-bit pixmap).
-MAX_PAGE_PIXELS = 16_000_000
 # Total device pixels kept in the cache (about 25 A4 pages at 125% zoom, 2x precision).
 DEFAULT_CACHE_PIXELS = 80_000_000
 
@@ -35,12 +36,14 @@ class RenderedPage:
         return self.pixmap.width() * self.pixmap.height()
 
 
-def page_render_scale(width_pt: float, height_pt: float, zoom: float, render_scale: float, *, max_pixels: int = MAX_PAGE_PIXELS) -> float:
-    """The render scale to use, lowered for huge pages so they stay under ``max_pixels``."""
-    pixels = width_pt * zoom * render_scale * height_pt * zoom * render_scale
-    if pixels <= max_pixels or pixels <= 0:
-        return render_scale
-    return max(0.05, render_scale * math.sqrt(max_pixels / pixels))
+def rendered_page_from_result(result: RenderResult, page_width_pt: float, page_height_pt: float, zoom: float) -> RenderedPage:
+    """Turns a worker's raw RGB samples into a pixmap (main thread only: QPixmap is GUI-bound)."""
+    image = QImage(result.samples, result.width, result.height, result.stride, QImage.Format_RGB888)
+    pixmap = QPixmap.fromImage(image)
+    del image
+    pixmap.setDevicePixelRatio(result.scale)
+    display_size = QSize(max(1, round(page_width_pt * zoom)), max(1, round(page_height_pt * zoom)))
+    return RenderedPage(pixmap=pixmap, display_size=display_size)
 
 
 def _zoom_key(value: float) -> int:
@@ -64,6 +67,31 @@ class PageRenderCache:
         if document is not self._document:
             self._document = document
             self.clear()
+
+    def has(self, document: fitz.Document | None, page_index: int, zoom: float, render_scale: float) -> bool:
+        """True when ``render`` would return a cached page without rasterizing."""
+        return document is self._document and (page_index, _zoom_key(zoom), _zoom_key(render_scale)) in self._entries
+
+    def preview(self, document: fitz.Document | None, page_index: int) -> RenderedPage | None:
+        """The most recent render of a page at any zoom, shown scaled while the exact one renders."""
+        if document is not self._document:
+            return None
+        for (cached_page, _zoom, _scale), rendered in reversed(self._entries.items()):
+            if cached_page == page_index:
+                return rendered
+        return None
+
+    def store(self, document: fitz.Document, page_index: int, zoom: float, render_scale: float, rendered: RenderedPage) -> None:
+        """Adds a page rasterized elsewhere (a render worker). Ignored for another document."""
+        if document is not self._document or rendered.error:
+            return
+        key = (page_index, _zoom_key(zoom), _zoom_key(render_scale))
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self._pixels -= old.device_pixels
+        self._entries[key] = rendered
+        self._pixels += rendered.device_pixels
+        self._evict()
 
     def render(self, document: fitz.Document, page_index: int, zoom: float, render_scale: float) -> RenderedPage:
         self.bind(document)
@@ -97,8 +125,11 @@ def rasterize_page(document: fitz.Document, page_index: int, zoom: float, render
         scale = page_render_scale(rect.width, rect.height, zoom, render_scale)
         render_zoom = zoom * scale
         pix = page.get_pixmap(matrix=fitz.Matrix(render_zoom, render_zoom), alpha=False, colorspace=fitz.csRGB)
-        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()
+        # The QImage wraps MuPDF's buffer without copying; fromImage makes the one copy we keep,
+        # while ``pix`` is still alive.
+        image = QImage(pix.samples_mv, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(image)
+        del image, pix
         pixmap.setDevicePixelRatio(scale)
         display_size = QSize(max(1, round(rect.width * zoom)), max(1, round(rect.height * zoom)))
         return RenderedPage(pixmap=pixmap, display_size=display_size)

@@ -1,18 +1,23 @@
 param(
-    [string]$Version = "0.3.0"
+    [string]$Version = "0.3.1"
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
-$PyInstaller = Join-Path $Root ".venv\Scripts\pyinstaller.exe"
+# Run PyInstaller as a module: the venv's pyinstaller.exe launcher breaks when the project folder moves.
+$PyInstaller = {
+    & $Python -m PyInstaller @args
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
+}
 
 if (-not (Test-Path $Python)) {
     throw "Missing virtual environment Python: $Python"
 }
 
-if (-not (Test-Path $PyInstaller)) {
+& $Python -m PyInstaller --version *> $null
+if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller is not installed. Run: .\.venv\Scripts\python.exe -m pip install pyinstaller"
 }
 

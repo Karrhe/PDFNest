@@ -173,49 +173,36 @@ class SettingsThemeTest(GuiTestCase):
         finally:
             window.close()
 
-    def test_pdf_file_picker_uses_non_native_dialog(self) -> None:
-        calls: dict[str, object] = {}
+    def test_pdf_file_picker_uses_system_dialog_and_remembers_folder(self) -> None:
+        calls: list[tuple[str, str, str, str]] = []
+        picked = Path(tempfile.gettempdir()) / "picked-books"
 
         class FakeFileDialog:
-            ExistingFile = 1
-            DontUseNativeDialog = 2
+            @staticmethod
+            def getOpenFileNames(parent, title, directory, name_filter):  # noqa: N802
+                calls.append(("many", title, directory, name_filter))
+                return [str(picked / "a.pdf"), str(picked / "b.pdf")], name_filter
 
-            def __init__(self, parent, title, directory, name_filter) -> None:
-                calls["parent"] = parent
-                calls["title"] = title
-                calls["directory"] = directory
-                calls["name_filter"] = name_filter
-                self.options: list[tuple[int, bool]] = []
+            @staticmethod
+            def getOpenFileName(parent, title, directory, name_filter):  # noqa: N802
+                calls.append(("one", title, directory, name_filter))
+                return str(picked / "chosen.pdf"), name_filter
 
-            def setFileMode(self, mode: int) -> None:
-                calls["file_mode"] = mode
-
-            def setNameFilter(self, name_filter: str) -> None:
-                calls["set_name_filter"] = name_filter
-
-            def setOption(self, option: int, enabled: bool) -> None:
-                self.options.append((option, enabled))
-                calls["options"] = self.options
-
-            def setWindowModality(self, modality) -> None:
-                calls["modality"] = modality
-
-            def exec(self) -> int:
-                return QDialog.Accepted
-
-            def selectedFiles(self) -> list[str]:
-                return ["chosen.pdf"]
-
-        window = MainWindow()
-        try:
-            with patch("pdf_notes_reader.ui.main_window.QFileDialog", FakeFileDialog):
-                self.assertEqual(window._choose_pdf_file("Open PDF"), "chosen.pdf")
-            self.assertEqual(calls["title"], "Open PDF")
-            self.assertEqual(calls["file_mode"], FakeFileDialog.ExistingFile)
-            self.assertIn((FakeFileDialog.DontUseNativeDialog, True), calls["options"])
-            self.assertEqual(calls["modality"], Qt.ApplicationModal)
-        finally:
-            window.close()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(Path(tmp) / "data")
+            books = Path(tmp) / "books"
+            books.mkdir()
+            window = MainWindow()
+            try:
+                window.settings["last_pdf_dir"] = str(books)
+                with patch("pdf_notes_reader.ui.main_window.QFileDialog", FakeFileDialog):
+                    self.assertEqual(len(window._choose_pdf_files("Open PDF")), 2)
+                    self.assertEqual(window._choose_pdf_file("Relocate PDF"), str(picked / "chosen.pdf"))
+                self.assertEqual(calls[0], ("many", "Open PDF", str(books), "PDF files (*.pdf)"))
+                self.assertEqual(calls[1][0], "one")
+                self.assertEqual(load_settings()["last_pdf_dir"], str(picked))
+            finally:
+                window.close()
 
 
 if __name__ == "__main__":

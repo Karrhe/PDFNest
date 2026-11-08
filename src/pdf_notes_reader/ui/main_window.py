@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import re
 import sys
+import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
-from PySide6.QtCore import QEvent, QSize, Qt, QSignalBlocker, QTimer
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPalette, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QSize, Qt, QSignalBlocker, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QDoubleSpinBox,
     QScrollArea,
@@ -42,10 +45,12 @@ from pdf_notes_reader.notes import (
     default_data_dir,
     drain_storage_issues,
     find_note,
+    is_annotation,
     load_notes_data,
     notes_path_for_key,
     pdf_key_for_path,
     save_notes,
+    shows_as_note,
     utc_now,
 )
 from pdf_notes_reader.pdf.document import DEFAULT_PAGE_SIZE, MAX_PASSWORD_ATTEMPTS, PdfOpenError, open_pdf, page_base_sizes, reopen_pdf
@@ -77,12 +82,35 @@ from pdf_notes_reader.ui.outline_panel import OutlinePanel
 from pdf_notes_reader.ui.resources import PACKAGE_DIR, PROJECT_DIR
 from pdf_notes_reader.ui.resources import app_resource_path, pic_icon
 from pdf_notes_reader.ui.settings_dialog import SettingsDialog
-from pdf_notes_reader.pdf.render import PageRenderCache
+from pdf_notes_reader.pdf.render import PageRenderCache, rendered_page_from_result
+from pdf_notes_reader.pdf.render_worker import RenderJob, RenderWorkerPool
 from pdf_notes_reader.pdf.search import DocumentSearch, SearchHit, SearchOptions
 from pdf_notes_reader.pdf.text import page_words
 from pdf_notes_reader.services.chapters import ChapterLookup, counter_key, location_label, single_line_title
-from pdf_notes_reader.services.export import ExportError, export_note_markdown
+from pdf_notes_reader.services.annotation_summary import group_annotations, summary_markdown
+from pdf_notes_reader.services.export import ExportError, export_note_markdown, safe_filename
+from pdf_notes_reader.services.library_import import expand_pdf_paths, pdf_page_count
+from pdf_notes_reader.services.url_scheme import set_registered as set_pdfnest_links_registered
+from pdf_notes_reader.services.obsidian import (
+    SyncReport,
+    VaultConfig,
+    note_file_for_opening,
+    obsidian_open_url,
+    parse_pdfnest_url,
+    pdfnest_url,
+    pull_notes,
+    push_notes,
+    trash_note_file,
+    write_conflict_copy,
+    write_text_atomic,
+)
 from pdf_notes_reader.ui.styles import build_app_stylesheet
+
+# A page slower than this to rasterize is rendered by a worker even when visible during scrolling.
+SLOW_PAGE_SECONDS = 0.06
+# Jobs sent to the render workers at once; few, so the nearest pages are always next in line.
+MAX_WORKER_JOBS = 3
+PDF_FILE_FILTER = "PDF files (*.pdf)"
 
 
 @dataclass
@@ -147,6 +175,8 @@ class MainWindow(QMainWindow):
         self.page_margin = 24
         self.continuous_scroll = True
         self.note_export_dir = Path(str(self.settings.get("markdown_export_dir") or app_local_data_dir() / "markdown_notes")).expanduser()
+        # Obsidian integration: off (None) until a vault folder is set in Settings.
+        self.vault: VaultConfig | None = VaultConfig.from_settings(self.settings)
         self.page_widgets: dict[int, QWidget] = {}
         self.page_base_sizes: list[tuple[float, float]] = []
         self.page_tops: list[int] = []
@@ -161,6 +191,25 @@ class MainWindow(QMainWindow):
         self._pending_scroll_id = 0
         self._fit_refresh_token = 0
         self._page_window_render_token = 0
+        self._page_window_render_scheduled = False
+        # Canvases are reused across page-window rebuilds while this key is unchanged.
+        self._page_widget_key: tuple | None = None
+        # Pages whose canvas exists but whose pixmap is rendered on idle ticks, one page per tick.
+        self._pending_page_renders: set[int] = set()
+        self._progressive_render_timer = QTimer(self)
+        self._progressive_render_timer.setSingleShot(True)
+        self._progressive_render_timer.setInterval(0)
+        self._progressive_render_timer.timeout.connect(self._render_next_pending_page)
+        # Pages are rasterized in worker processes when possible; the UI thread only polls results.
+        self.render_workers = RenderWorkerPool()
+        self._worker_jobs: dict[tuple, tuple[fitz.Document, Future, RenderJob]] = {}
+        self._worker_failed_pages: set[tuple] = set()
+        self._worker_poll_timer = QTimer(self)
+        self._worker_poll_timer.setInterval(15)
+        self._worker_poll_timer.timeout.connect(self._collect_worker_results)
+        # Running estimate of one page's rasterization time for the current document.
+        self._raster_seconds_estimate = 0.0
+        self._raster_estimate_document: fitz.Document | None = None
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.canvas = PdfCanvas()
@@ -189,6 +238,10 @@ class MainWindow(QMainWindow):
         self.note_panel.export_requested.connect(self.export_current_note)
         self.note_panel.delete_requested.connect(self.delete_current_note)
         self.note_panel.note_selected_requested.connect(self.select_note)
+        self.note_panel.annotation_activated.connect(self.go_to_annotation)
+        self.note_panel.annotation_note_requested.connect(self.add_annotation_note)
+        self.note_panel.annotation_note_remove_requested.connect(lambda note_id: self.remove_annotation_note(note_id, confirm=True))
+        self.note_panel.summary_export_requested.connect(self.export_annotation_summary)
 
         self.prev_page_button = QPushButton("-")
         self.prev_page_button.setObjectName("PageNavButton")
@@ -284,6 +337,8 @@ class MainWindow(QMainWindow):
         self.history_panel.remove_requested.connect(self.remove_history_entry)
         self.history_panel.export_requested.connect(self.export_history_entry_notes)
         self.history_panel.add_notebook_requested.connect(self.add_planned_notebook)
+        self.history_panel.add_folder_requested.connect(self.add_pdf_folder)
+        self.history_panel.pdfs_dropped.connect(self.add_pdfs_to_library)
         self.history_panel.rename_requested.connect(self.rename_history_entry)
         self.history_panel.restore_requested.connect(self.restore_history_entry)
         self.history_panel.settings_requested.connect(self.open_settings)
@@ -321,6 +376,14 @@ class MainWindow(QMainWindow):
         self.outline_toggle_button.setChecked(True)
         self.outline_toggle_button.clicked.connect(self.set_outline_visible)
 
+        self.notes_toggle_button = QToolButton()
+        self.notes_toggle_button.setObjectName("OutlineToggleButton")
+        self.notes_toggle_button.setText("Notes")
+        self.notes_toggle_button.setToolTip("Show or hide the notes panel")
+        self.notes_toggle_button.setCheckable(True)
+        self.notes_toggle_button.setChecked(True)
+        self.notes_toggle_button.clicked.connect(self.set_notes_visible)
+
         self.document_title_combo = QComboBox()
         self.document_title_combo.setObjectName("DocumentTitleCombo")
         self.document_title_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -334,6 +397,7 @@ class MainWindow(QMainWindow):
         title_bar_layout.setSpacing(8)
         title_bar_layout.addWidget(self.outline_toggle_button, 0)
         title_bar_layout.addWidget(self.document_title_combo, 1)
+        title_bar_layout.addWidget(self.notes_toggle_button, 0)
 
         window_content = QWidget()
         window_content.setObjectName("WindowContent")
@@ -351,6 +415,8 @@ class MainWindow(QMainWindow):
         self._render_empty_state()
         self._apply_wheel_scroll_lines()
         self.apply_theme()
+        self.note_panel.set_obsidian_mode(self.vault is not None)
+        self.note_panel.pdfnest_link_requested.connect(self.open_url)
         self.restore_last_session()
         self._refresh_actions()
         self.report_storage_issues()
@@ -395,6 +461,11 @@ class MainWindow(QMainWindow):
         self.outline_action.setCheckable(True)
         self.outline_action.setChecked(True)
         self.outline_action.triggered.connect(self.set_outline_visible)
+
+        self.notes_action = QAction("Notes", self)
+        self.notes_action.setCheckable(True)
+        self.notes_action.setChecked(True)
+        self.notes_action.triggered.connect(self.set_notes_visible)
 
     def _build_shortcuts(self) -> None:
         self.save_note_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
@@ -588,6 +659,8 @@ class MainWindow(QMainWindow):
         self._cache_page_base_sizes()
         self.note_panel.set_note(None)
         restored_note = find_note(self.notes, state.current_note_id) if state.current_note_id else None
+        if restored_note is not None and not shows_as_note(restored_note):
+            restored_note = None
         if restored_note is not None:
             self.note_panel.set_note(restored_note)
             self._refresh_note_selector(restored_note.id)
@@ -605,6 +678,7 @@ class MainWindow(QMainWindow):
             self._schedule_fit_refresh(anchor_page=self.page_index)
         self._refresh_document_chrome()
         self._refresh_actions()
+        self._sync_vault()
 
     def switch_to_document_tab(self, index: int) -> None:
         if index == 0:
@@ -718,12 +792,15 @@ class MainWindow(QMainWindow):
         if self.main_stack.currentWidget() is self.history_panel:
             self.document_title_bar.setVisible(False)
             self.outline_toggle_button.setEnabled(False)
+            self.notes_toggle_button.setEnabled(False)
             self._set_current_document_tab(0)
             return
 
         self.document_title_bar.setVisible(True)
         self.outline_toggle_button.setEnabled(has_document)
         self.outline_toggle_button.setChecked(self.outline_panel.isVisible())
+        self.notes_toggle_button.setEnabled(has_document)
+        self.notes_toggle_button.setChecked(not self.note_panel.isHidden())
         if self.active_pdf_key is not None:
             index = self._pdf_tab_index(self.active_pdf_key)
             self._set_current_document_tab(index)
@@ -787,6 +864,10 @@ class MainWindow(QMainWindow):
         self.settings["storage_dir"] = str(dialog.storage_dir)
         self.note_export_dir = dialog.markdown_dir
         self.settings["markdown_export_dir"] = str(self.note_export_dir)
+        self.settings["obsidian_vault_dir"] = dialog.obsidian_vault
+        self.settings["obsidian_subfolder"] = dialog.obsidian_subfolder
+        self.settings["register_pdfnest_links"] = dialog.register_pdfnest_links
+        self._apply_obsidian_settings()
         save_settings(self.settings)
         migrate_storage(dialog.storage_dir)
         self._refresh_append_selection_shortcut()
@@ -799,28 +880,39 @@ class MainWindow(QMainWindow):
         self._refresh_canvas_appearance()
 
     def open_pdf(self) -> None:
-        filename = self._choose_pdf_file("Open PDF")
-        if not filename:
-            return
-        QApplication.processEvents()
-        self.load_pdf(Path(filename))
+        filenames = self._choose_pdf_files("Open PDF")
+        for filename in filenames:  # each opens in its own tab
+            QApplication.processEvents()
+            self.load_pdf(Path(filename))
         self.repaint()
 
+    def _pdf_dialog_start_dir(self) -> str:
+        folder = str(self.settings.get("last_pdf_dir") or "")
+        return folder if folder and Path(folder).is_dir() else ""
+
+    def _remember_pdf_dir(self, folder: Path) -> None:
+        if str(folder) != self.settings.get("last_pdf_dir"):
+            self.settings["last_pdf_dir"] = str(folder)
+            save_settings(self.settings)
+
+    def _choose_pdf_files(self, title: str, *, multiple: bool = True) -> list[str]:
+        """The system file dialog; with ``multiple`` several PDFs can be picked at once (Ctrl/Shift+click)."""
+        self.repaint()
+        QApplication.processEvents()
+        start_dir = self._pdf_dialog_start_dir()
+        if multiple:
+            selected, _filter = QFileDialog.getOpenFileNames(self, title, start_dir, PDF_FILE_FILTER)
+        else:
+            filename, _filter = QFileDialog.getOpenFileName(self, title, start_dir, PDF_FILE_FILTER)
+            selected = [filename] if filename else []
+        QApplication.processEvents()
+        self.repaint()
+        if selected:
+            self._remember_pdf_dir(Path(selected[0]).parent)
+        return list(selected)
+
     def _choose_pdf_file(self, title: str) -> str:
-        self.repaint()
-        QApplication.processEvents()
-        dialog = QFileDialog(self, title, "", "PDF files (*.pdf)")
-        dialog.setFileMode(QFileDialog.ExistingFile)
-        dialog.setNameFilter("PDF files (*.pdf)")
-        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
-        dialog.setWindowModality(Qt.ApplicationModal)
-        if dialog.exec() != QDialog.Accepted:
-            QApplication.processEvents()
-            self.repaint()
-            return ""
-        selected = dialog.selectedFiles()
-        QApplication.processEvents()
-        self.repaint()
+        selected = self._choose_pdf_files(title, multiple=False)
         return selected[0] if selected else ""
 
     def load_pdf(self, path: Path, *, pdf_key: str | None = None, restore_last_page: bool = True) -> None:
@@ -864,6 +956,8 @@ class MainWindow(QMainWindow):
         self.outline_panel.set_outline(document.get_toc())
         self.outline_panel.set_bookmarks(self.bookmarks)
         restored_note = find_note(self.notes, entry.last_note_id) if restore_last_page and entry is not None else None
+        if restored_note is not None and not shows_as_note(restored_note):
+            restored_note = None
         state = PdfTabState(
             pdf_key=key,
             pdf_path=path,
@@ -893,6 +987,7 @@ class MainWindow(QMainWindow):
             self._refresh_note_selector(restored_note.id)
         self._record_current_pdf()
         self._refresh_document_chrome()
+        self._sync_vault()
         if opened.warnings:
             self.statusBar().showMessage(" ".join(opened.warnings), 10000)
 
@@ -994,39 +1089,73 @@ class MainWindow(QMainWindow):
         self.history_panel.set_entries(self.history_entries)
 
     def add_planned_notebook(self, folder_id: str = "") -> None:
-        filename = self._choose_pdf_file("Add planned PDF")
-        if not filename:
-            return
-        path = Path(filename)
-        pdf_key = pdf_key_for_path(path)
-        page_count = 0
-        try:
-            document = fitz.open(path)
-        except Exception:
-            document = None
-        if document is not None:
-            try:
-                page_count = document.page_count
-            finally:
-                document.close()
+        """Add PDF files to the library (several at once) without opening them."""
+        filenames = self._choose_pdf_files("Add PDFs to library")
+        if filenames:
+            self.add_pdfs_to_library(filenames, folder_id)
 
-        upsert_history_entry(
-            self.history_entries,
-            pdf_key=pdf_key,
-            path=path,
-            page_count=page_count,
-            last_page_index=0,
-            zoom=1.25,
-            fit_mode="",
-        )
-        save_history(self.history_entries, touched_pdf_keys={pdf_key})
-        if folder_id and folder_id != UNFILED_FOLDER_ID:
-            library = load_library()
-            folder_ids = {folder.id for folder in library.folders}
-            if folder_id in folder_ids:
-                library.assignments[pdf_key] = folder_id
+    def add_pdf_folder(self, folder_id: str = "") -> None:
+        """Add every PDF in a folder and its subfolders to the library."""
+        self.repaint()
+        QApplication.processEvents()
+        folder = QFileDialog.getExistingDirectory(self, "Add all PDFs in a folder", self._pdf_dialog_start_dir())
+        QApplication.processEvents()
+        self.repaint()
+        if not folder:
+            return
+        self._remember_pdf_dir(Path(folder))
+        self.add_pdfs_to_library([folder], folder_id)
+
+    def add_pdfs_to_library(self, paths: list[str] | list[Path], folder_id: str = "") -> tuple[int, int]:
+        """Add PDF files (folders are searched for PDFs) to the library, into ``folder_id`` when that is a
+        library folder. Books already in the library keep their reading position and folder.
+        Returns (added, already in the library)."""
+        pdf_paths = expand_pdf_paths(paths)
+        if not pdf_paths:
+            self.statusBar().showMessage("No PDF files found.", 4000)
+            return 0, 0
+
+        library = load_library()
+        target_folder = folder_id if folder_id and folder_id != UNFILED_FOLDER_ID and folder_id in {folder.id for folder in library.folders} else ""
+        progress = QProgressDialog("Adding PDFs to the library…", "Stop", 0, len(pdf_paths), self)
+        progress.setWindowTitle("Add PDFs")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(500)
+        added: set[str] = set()
+        existing = 0
+        for number, path in enumerate(pdf_paths):
+            progress.setValue(number)
+            if progress.wasCanceled():
+                break
+            pdf_key = pdf_key_for_path(path)
+            if pdf_key in added or find_history_entry(self.history_entries, pdf_key) is not None:
+                existing += 1
+                continue
+            upsert_history_entry(
+                self.history_entries,
+                pdf_key=pdf_key,
+                path=path,
+                page_count=pdf_page_count(path),
+                last_page_index=0,
+                zoom=1.25,
+                fit_mode="",
+            )
+            added.add(pdf_key)
+            if target_folder:
+                library.assignments[pdf_key] = target_folder
+        progress.setValue(len(pdf_paths))
+        progress.close()
+
+        if added:
+            save_history(self.history_entries, touched_pdf_keys=added)
+            if target_folder:
                 save_library(library)
-        self.history_panel.set_entries(self.history_entries)
+            self.history_panel.set_entries(self.history_entries)
+        message = f"Added {len(added)} PDF{'s' if len(added) != 1 else ''} to the library."
+        if existing:
+            message += f" {existing} {'was' if existing == 1 else 'were'} already there."
+        self.statusBar().showMessage(message, 6000)
+        return len(added), existing
 
     def export_history_entry_notes(self, pdf_key: str) -> None:
         if self.pdf_key == pdf_key:
@@ -1037,9 +1166,17 @@ class MainWindow(QMainWindow):
         if entry is None:
             return
         notes, counters, bookmarks = load_notes_data(pdf_key)
-        exportable_notes = [note for note in notes if note.note_type != "excerpt"]
+        exportable_notes = [note for note in notes if shows_as_note(note)]
         if not exportable_notes:
             self.statusBar().showMessage("No notes to export.", 3000)
+            return
+        if self.vault is not None:
+            path = Path(entry.path)
+            pull_notes(self.vault, path, notes)
+            report = push_notes(self.vault, path, notes, lambda note: f"page-{note.page_index + 1}-{max(1, note.note_number)}")
+            save_notes(pdf_key=pdf_key, pdf_path=path, notes=notes, note_counters=counters, bookmarks=bookmarks)
+            self._report_vault_problems(report)
+            self.statusBar().showMessage(f"Synced {len(exportable_notes)} notes to Obsidian: {self.vault.book_dir(path)}", 6000)
             return
 
         document = None
@@ -1111,6 +1248,36 @@ class MainWindow(QMainWindow):
         self.page_index = anchor_page
         self._schedule_fit_refresh(anchor_page=anchor_page)
 
+    def set_notes_visible(self, visible: bool) -> None:
+        """Shows or hides the notes panel (Note editor and highlights Summary), like Contents."""
+        anchor_page = self.page_index
+        with QSignalBlocker(self.notes_action):
+            self.notes_action.setChecked(visible)
+        with QSignalBlocker(self.notes_toggle_button):
+            self.notes_toggle_button.setChecked(visible)
+        if visible == (not self.note_panel.isHidden()):
+            return
+        if not visible:
+            self._auto_save_current_note()
+
+        was_suppressed = self._suppress_scroll_sync
+        self._suppress_scroll_sync = True
+        try:
+            self.note_panel.setVisible(visible)
+            self.reader_splitter.updateGeometry()
+            self.reader_area.updateGeometry()
+            if self.reader_area.layout() is not None:
+                self.reader_area.layout().activate()
+        finally:
+            self._suppress_scroll_sync = was_suppressed
+
+        self.page_index = anchor_page
+        self._schedule_fit_refresh(anchor_page=anchor_page)
+
+    def _ensure_notes_visible(self) -> None:
+        if self.note_panel.isHidden():
+            self.set_notes_visible(True)
+
     def restore_last_session(self) -> bool:
         for entry in self.history_entries:
             path = Path(entry.path)
@@ -1127,16 +1294,31 @@ class MainWindow(QMainWindow):
             return
 
         self._update_page_layout_margins()
+        self.render_scale = self._device_render_scale()
         was_suppressed = self._suppress_scroll_sync
         self._suppress_scroll_sync = True
         try:
-            self._clear_page_widgets()
+            reusable = self._take_reusable_canvases()
             self._recalculate_page_metrics()
             rendered_pages = set(self._page_indexes_to_render(render_neighbors=render_neighbors))
-            if self.continuous_scroll:
-                self._populate_continuous_pages(rendered_pages)
+            workers = self._worker_rendering_enabled()
+            if workers and self._raster_estimate_document is not self.document:
+                self._render_page_pixmap(self.page_index)  # first render of a document: measures its page cost
+            if workers and self._pages_render_slowly():
+                # Scanned books and other slow documents: even visible pages go to a worker (showing a
+                # scaled earlier render meanwhile, if any) so scrolling, zooming and jumping never freeze.
+                eager_pages: set[int] = set()
             else:
-                self._add_rendered_page(self.page_index)
+                eager_pages = self._pages_to_render_now(center_current=center_current)
+            if self.continuous_scroll:
+                self._populate_continuous_pages(rendered_pages, reusable, eager_pages)
+            else:
+                self._add_rendered_page(self.page_index, reusable, eager_pages)
+            for leftover in reusable.values():
+                leftover.setParent(None)
+            self._pending_page_renders = {page for page, canvas in self.page_canvases.items() if canvas.is_pending()}
+            if self._pending_page_renders:
+                self._progressive_render_timer.start()
 
             self._lock_pages_container_to_layout()
             self.canvas = self.page_canvases.get(self.page_index) or next(iter(self.page_canvases.values()))
@@ -1250,8 +1432,24 @@ class MainWindow(QMainWindow):
         if self.document is None:
             raise RuntimeError("No document loaded")
 
+        cached = self.render_cache.has(self.document, page_index, self.zoom, self.render_scale)
+        started = time.perf_counter()
         rendered = self.render_cache.render(self.document, page_index, self.zoom, self.render_scale)
+        if not cached:
+            self._note_raster_time(time.perf_counter() - started)
         return rendered.pixmap, rendered.display_size
+
+    def _note_raster_time(self, seconds: float) -> None:
+        if self._raster_estimate_document is not self.document:
+            self._raster_estimate_document = self.document
+            self._raster_seconds_estimate = seconds
+        else:
+            self._raster_seconds_estimate = 0.7 * self._raster_seconds_estimate + 0.3 * seconds
+
+    def _pages_render_slowly(self) -> bool:
+        """True when this document's pages take long enough that visible pages should also go to a
+        worker during scrolling instead of freezing the UI (scanned books, heavy drawings)."""
+        return self._raster_estimate_document is self.document and self._raster_seconds_estimate > SLOW_PAGE_SECONDS
 
     def _page_text_words(self, page_index: int) -> list[dict[str, object]]:
         if self.document is None:
@@ -1331,7 +1529,12 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         return spacer
 
-    def _populate_continuous_pages(self, rendered_pages: set[int]) -> None:
+    def _populate_continuous_pages(
+        self,
+        rendered_pages: set[int],
+        reusable: dict[int, PdfCanvas] | None = None,
+        eager_pages: set[int] | None = None,
+    ) -> None:
         if self.document is None:
             return
 
@@ -1340,22 +1543,187 @@ class MainWindow(QMainWindow):
             if page_index > next_page:
                 spacer = self._create_page_spacer(next_page, page_index - 1)
                 self.pages_layout.addWidget(spacer, 0, Qt.AlignHCenter)
-            self._add_rendered_page(page_index)
+            self._add_rendered_page(page_index, reusable, eager_pages)
             next_page = page_index + 1
 
         if next_page < self.document.page_count:
             spacer = self._create_page_spacer(next_page, self.document.page_count - 1)
             self.pages_layout.addWidget(spacer, 0, Qt.AlignHCenter)
 
-    def _add_rendered_page(self, page_index: int) -> None:
-        widget = self._create_canvas(page_index)
-        pixmap, display_size = self._render_page_pixmap(page_index)
+    def _add_rendered_page(
+        self,
+        page_index: int,
+        reusable: dict[int, PdfCanvas] | None = None,
+        eager_pages: set[int] | None = None,
+    ) -> None:
+        """Adds a page canvas: a reused one, one rendered now, or a pending one filled on an idle tick.
+
+        ``eager_pages`` None means every page is rendered now.
+        """
         page_notes = [note for note in self.notes if note.page_index == page_index]
-        widget.set_page(pixmap, page_notes, display_size, self._page_text_words(page_index))
+        widget = reusable.pop(page_index, None) if reusable is not None else None
+        if widget is None:
+            widget = self._create_canvas(page_index)
+            if eager_pages is None or page_index in eager_pages or self.render_cache.has(self.document, page_index, self.zoom, self.render_scale):
+                self._fill_canvas(page_index, widget, page_notes)
+            else:
+                preview = self.render_cache.preview(self.document, page_index)
+                widget.set_pending_page(self._page_display_size(page_index), page_notes, preview.pixmap if preview is not None else None)
+        elif widget.is_pending() and eager_pages is not None and page_index in eager_pages:
+            self._fill_canvas(page_index, widget, page_notes)
+        else:
+            widget.set_notes(page_notes)
         self._apply_search_hits(page_index, widget)
         self.pages_layout.addWidget(widget, 0, Qt.AlignHCenter)
         self.page_canvases[page_index] = widget
         self.page_widgets[page_index] = widget
+
+    def _fill_canvas(self, page_index: int, widget: PdfCanvas, page_notes: list[Note] | None = None) -> None:
+        pixmap, display_size = self._render_page_pixmap(page_index)
+        if page_notes is None:
+            page_notes = [note for note in self.notes if note.page_index == page_index]
+        widget.set_page(pixmap, page_notes, display_size, self._page_text_words(page_index))
+
+    def _render_next_pending_page(self) -> None:
+        """Fills pending pages, visible and nearest first.
+
+        Pages go to the render worker processes when they are available. Otherwise (or for a page a
+        worker could not render) one page is rendered in-process per event-loop pass, so input and
+        painting stay responsive between pages.
+        """
+        if self.document is None:
+            self._pending_page_renders.clear()
+            return
+        self._cancel_stale_worker_jobs()
+        pending = {page for page in self._pending_page_renders if (canvas := self.page_canvases.get(page)) is not None and canvas.is_pending()}
+        self._pending_page_renders = pending
+        if not pending:
+            return
+        visible = set(self._visible_page_indexes())
+        use_workers = self._worker_rendering_enabled()
+        for page_index in sorted(pending, key=lambda page: (page not in visible, abs(page - self.page_index), page)):
+            key = self._worker_job_key(page_index)
+            if use_workers and key not in self._worker_failed_pages:
+                if key in self._worker_jobs or len(self._worker_jobs) >= MAX_WORKER_JOBS:
+                    continue  # _collect_worker_results restarts this queue as results arrive
+                if self._submit_worker_job(page_index, key):
+                    continue
+                use_workers = False  # the pool just failed: render in-process from here on
+            pending.discard(page_index)
+            self._fill_canvas(page_index, self.page_canvases[page_index])
+            self._apply_search_hits(page_index, self.page_canvases[page_index])
+            if pending:
+                self._progressive_render_timer.start()
+            return
+
+    # --- render worker processes --------------------------------------------------------------
+
+    def _worker_rendering_enabled(self) -> bool:
+        if self.document is None or not self.render_workers.available:
+            return False
+        name = getattr(self.document, "name", "") or ""
+        return bool(name) and Path(name).is_file()
+
+    def _worker_job_key(self, page_index: int) -> tuple:
+        return (id(self.document), page_index, round(self.zoom * 10000), round(self.render_scale * 10000))
+
+    def _submit_worker_job(self, page_index: int, key: tuple) -> bool:
+        job = RenderJob(str(self.document.name), self.document_password, page_index, self.zoom, self.render_scale)
+        future = self.render_workers.submit(job)
+        if future is None:
+            return False
+        self._worker_jobs[key] = (self.document, future, job)
+        if not self._worker_poll_timer.isActive():
+            self._worker_poll_timer.start()
+        return True
+
+    def _cancel_stale_worker_jobs(self) -> None:
+        """Drops queued jobs for another document or zoom; jobs already running finish and are cached."""
+        current = (id(self.document), round(self.zoom * 10000), round(self.render_scale * 10000))
+        for key, (_document, future, _job) in list(self._worker_jobs.items()):
+            if (key[0], key[2], key[3]) != current and future.cancel():
+                del self._worker_jobs[key]
+
+    def _collect_worker_results(self) -> None:
+        finished = [(key, entry) for key, entry in self._worker_jobs.items() if entry[1].done()]
+        for key, (document, future, job) in finished:
+            del self._worker_jobs[key]
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:  # e.g. BrokenProcessPool: fall back to in-process rendering
+                self.render_workers.mark_failed(exc)
+                continue
+            if document is not self.document:
+                continue
+            if result.error:
+                self._worker_failed_pages.add(key)
+                continue
+            page_index = job.page_index
+            width, height = self.page_base_sizes[page_index] if 0 <= page_index < len(self.page_base_sizes) else DEFAULT_PAGE_SIZE
+            rendered = rendered_page_from_result(result, width, height, job.zoom)
+            self.render_cache.store(document, page_index, job.zoom, job.render_scale, rendered)
+            self._note_raster_time(result.seconds)
+            if result.words is not None:
+                self.page_text_words_cache.setdefault(page_index, result.words)
+            canvas = self.page_canvases.get(page_index)
+            if canvas is not None and canvas.is_pending() and key == self._worker_job_key(page_index):
+                self._pending_page_renders.discard(page_index)
+                self._fill_canvas(page_index, canvas)
+                self._apply_search_hits(page_index, canvas)
+        if not self._worker_jobs:
+            self._worker_poll_timer.stop()
+        if finished and self._pending_page_renders:
+            self._progressive_render_timer.start()
+
+    def _device_render_scale(self) -> float:
+        """Rasterize at the screen's device pixel ratio: 1:1 device pixels are sharp and cheapest."""
+        ratio = self.scroll_area.viewport().devicePixelRatioF() if hasattr(self, "scroll_area") else self.devicePixelRatioF()
+        return max(1.0, float(ratio or 1.0))
+
+    def _page_widget_reuse_key(self) -> tuple:
+        return (self.document, round(self.zoom * 10000), round(self.render_scale * 10000), self.continuous_scroll)
+
+    def _take_reusable_canvases(self) -> dict[int, PdfCanvas]:
+        """Empties the layout; returns the canvases that can be shown again unchanged."""
+        key = self._page_widget_reuse_key()
+        previous_key = self._page_widget_key
+        # Documents compare by identity: a reopened file is a new document and must re-render.
+        reuse = previous_key is not None and previous_key[0] is key[0] and previous_key[1:] == key[1:]
+        self._page_widget_key = key
+        previous = self.page_canvases
+        reusable: dict[int, PdfCanvas] = {}
+        while self.pages_layout.count():
+            item = self.pages_layout.takeAt(0)
+            widget = item.widget()
+            if widget is None:
+                continue
+            if reuse and isinstance(widget, PdfCanvas) and previous.get(widget.page_index) is widget and (widget.is_pending() or widget._pixmap is not None):
+                reusable[widget.page_index] = widget
+            else:
+                widget.setParent(None)
+        self.page_canvases = {}
+        self.page_widgets = {}
+        return reusable
+
+    def _pages_to_render_now(self, *, center_current: bool) -> set[int]:
+        """The current page plus every page that will be on screen once this render settles."""
+        pages = {self.page_index}
+        if not self.continuous_scroll or not self.page_tops:
+            return pages
+        viewport_height = self.scroll_area.viewport().height()
+        if center_current and self._has_page_geometry(self.page_index):
+            top = self.page_tops[self.page_index] + self.page_heights[self.page_index] // 2 - viewport_height // 2
+        else:
+            top = self.scroll_area.verticalScrollBar().value()
+        bottom = top + viewport_height
+        for page_index, page_top in enumerate(self.page_tops):
+            if page_top > bottom:
+                break
+            if page_top + self.page_heights[page_index] >= top:
+                pages.add(page_index)
+        return pages
 
     # --- find in PDF ------------------------------------------------------------------------
 
@@ -1492,6 +1860,8 @@ class MainWindow(QMainWindow):
         canvas.note_color_requested.connect(self.set_note_color)
         canvas.note_style_requested.connect(self.set_note_style)
         canvas.note_delete_requested.connect(self.delete_note_by_id)
+        canvas.annotation_note_requested.connect(self.add_annotation_note)
+        canvas.annotation_note_remove_requested.connect(lambda note_id: self.remove_annotation_note(note_id, confirm=True))
         canvas.reset_note_counters_requested.connect(self.reset_note_counters_to_current_notes)
         canvas.settings_requested.connect(self.open_settings)
         canvas.zoom_requested.connect(self.change_zoom)
@@ -1531,6 +1901,9 @@ class MainWindow(QMainWindow):
                 widget.setParent(None)
         self.page_canvases = {}
         self.page_widgets = {}
+        self._page_widget_key = None
+        self._pending_page_renders.clear()
+        self._progressive_render_timer.stop()
 
     def _lock_pages_container_to_layout(self) -> None:
         self.pages_layout.activate()
@@ -1585,6 +1958,8 @@ class MainWindow(QMainWindow):
             self.render_page_preserving_view()
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id)
+        self._ensure_notes_visible()
+        self.note_panel.show_note_editor()
 
     def add_text_annotation(self, page_index: int, note_type: str, rects_norm: list, selected_text: str, color: str = "") -> None:
         if self.document is None or self.pdf_key is None or not rects_norm:
@@ -1600,33 +1975,122 @@ class MainWindow(QMainWindow):
         first_rect = cleaned_rects[0]
         x_norm = (first_rect[0] + first_rect[2]) / 2
         y_norm = (first_rect[1] + first_rect[3]) / 2
-        note_number = self._allocate_note_number(page_index)
+        # No note by default: it shows in the Summary, and the user may add one note to it later.
         note = Note.create(
             pdf_key=self.pdf_key,
             page_index=page_index,
             x_norm=x_norm,
             y_norm=y_norm,
-            markdown=f"# {self._default_note_title(page_index, note_number)}\n\n> {selected_text}\n\n",
             note_type=note_type,
             rects_norm=cleaned_rects,
             selected_text=selected_text,
             color=color,
-            note_number=note_number,
+            has_note=False,
         )
         self.page_index = page_index
         self.notes.append(note)
         self.persist_notes()
         if not self._refresh_page_notes(page_index):
             self.render_page_preserving_view()
-        self.note_panel.set_note(note)
-        self._refresh_note_selector(note.id)
+        self._refresh_note_selector()
+        self.note_panel.show_annotation_in_summary(note.id)
+        kind = "Highlight" if note_type == "highlight" else "Underline"
+        self.statusBar().showMessage(f"{kind} added. Right-click it to add a note.", 4000)
+
+    def add_annotation_note(self, note_id: str) -> None:
+        """Opens the highlight/underline's note, creating it first if it has none (one per annotation)."""
+        annotation = find_note(self.notes, note_id)
+        if annotation is None or not is_annotation(annotation):
+            return
+        if annotation.has_note:
+            self.select_note(annotation.id)
+            return
+        self._auto_save_current_note()
+        if annotation.note_number <= 0:
+            annotation.note_number = self._allocate_note_number(annotation.page_index)
+        if not annotation.markdown.strip():
+            title = self._default_note_title(annotation.page_index, annotation.note_number)
+            quote = "\n".join(f"> {line}" if line else ">" for line in annotation.selected_text.strip().splitlines())
+            if self.vault is not None and self.pdf_path is not None:
+                link = pdfnest_url(self.pdf_path, annotation.page_index + 1, annotation.id)
+                quote += f"\n> — [p.{annotation.page_index + 1}]({link})"
+            annotation.markdown = f"# {title}\n\n{quote}\n\n"
+        annotation.has_note = True
+        annotation.update_markdown(annotation.markdown)
+        self.persist_notes()
+        self.note_panel.set_note(annotation)
+        self._refresh_note_selector(annotation.id)
+        self._ensure_notes_visible()
+        self.note_panel.show_note_editor()
+        editor = self.note_panel.editor
+        cursor = editor.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+
+    def remove_annotation_note(self, note_id: str, *, confirm: bool = False) -> None:
+        """Deletes a highlight/underline's note; the highlight or underline itself stays."""
+        annotation = find_note(self.notes, note_id)
+        if annotation is None or not is_annotation(annotation) or not annotation.has_note:
+            return
+        if confirm:
+            kind = "highlight" if annotation.note_type == "highlight" else "underline"
+            answer = QMessageBox.question(
+                self,
+                "Delete note",
+                f"Delete this note? The {kind} stays on the page.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        current_note_id = self.note_panel.current_note_id
+        if current_note_id != note_id:
+            self._auto_save_current_note()
+        self._trash_vault_file(annotation)
+        # Text copied into this note was marked on the page; those markers go with the note.
+        affected_pages = {annotation.page_index} | {item.page_index for item in self.notes if item.linked_note_id == note_id}
+        self.notes = [item for item in self.notes if item.linked_note_id != note_id]
+        annotation.has_note = False
+        annotation.vault_path = ""
+        annotation.vault_hash = ""
+        annotation.exported_markdown_path = ""
+        annotation.update_markdown("")
+        self.persist_notes()
+        surviving = find_note(self.notes, current_note_id) if current_note_id and current_note_id != note_id else None
+        self.note_panel.set_note(surviving)
+        self._refresh_note_selector(surviving.id if surviving is not None else None)
+        self._refresh_page_notes(*affected_pages)
+        self.statusBar().showMessage("Note deleted; the marked text stays.", 4000)
+
+    def go_to_annotation(self, note_id: str) -> None:
+        note = find_note(self.notes, note_id)
+        if note is None or self.document is None:
+            return
+        self._push_reader_return_position()
+        self._go_to_page_offset(note.page_index, self._note_page_offset(note))
+        if note.has_note and note.id != self.note_panel.current_note_id:
+            self._auto_save_current_note()
+            self.note_panel.set_note(note)
+            self._refresh_note_selector(note.id)
 
     def select_note(self, note_id: str) -> None:
+        note = find_note(self.notes, note_id)
+        if note is not None and is_annotation(note) and not note.has_note:
+            # A highlight without a note: show it in the Summary instead of an empty editor.
+            if not self.note_panel.isHidden():
+                self.note_panel.show_annotation_in_summary(note.id)
+            self.statusBar().showMessage("This text has no note. Right-click it to add one.", 4000)
+            return
         if note_id != self.note_panel.current_note_id:
             self._auto_save_current_note()
-        note = find_note(self.notes, note_id)
+            self._pull_from_vault()
+            note = find_note(self.notes, note_id)
         self.note_panel.set_note(note)
         self._refresh_note_selector(note.id if note else None)
+        if note is not None:
+            self._ensure_notes_visible()
+            self.note_panel.show_note_editor()
 
     def jump_to_current_note(self) -> None:
         note_id = self.note_panel.current_note_id
@@ -1668,6 +2132,8 @@ class MainWindow(QMainWindow):
             return
         markdown = self.note_panel.editor.toPlainText()
         if note.markdown == markdown:
+            return
+        if self._save_editor_as_vault_conflict(note, markdown):
             return
         note.update_markdown(markdown)
         self.persist_notes()
@@ -1718,6 +2184,8 @@ class MainWindow(QMainWindow):
             self.note_panel.set_note(None)
             return
 
+        if self._save_editor_as_vault_conflict(note, markdown_text):
+            return
         note.update_markdown(markdown_text)
         self.persist_notes()
         self.note_panel.set_note(note)
@@ -1737,8 +2205,15 @@ class MainWindow(QMainWindow):
             self.note_panel.set_note(None)
             return
 
+        if self._save_editor_as_vault_conflict(note, markdown_text):
+            return
         note.update_markdown(markdown_text)
         self.persist_notes()
+        if self.vault is not None:
+            self.note_panel.set_note(note)
+            self._refresh_note_selector(note.id)
+            self.open_note_in_obsidian(note)
+            return
         export_mode = self._choose_export_mode(note)
         if export_mode is None:
             self.note_panel.set_note(note)
@@ -1833,12 +2308,27 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select or create a note before appending selected text.", 5000)
             return
 
+        link_back = self.vault is not None and self.pdf_path is not None and page_index is not None
+        marker = None
+        if link_back and rects_norm:
+            # Created first so the quote can link to this exact excerpt.
+            marker = self._add_excerpt_marker(
+                page_index,
+                rects_norm,
+                cleaned,
+                self.note_panel.current_note_id,
+                marker_style=marker_style,
+                color=marker_color or self._selection_color("append_selection_color"),
+            )
         current = self.note_panel.editor.toPlainText().rstrip()
         quote = "\n".join(f"> {line}" if line else ">" for line in cleaned.splitlines())
+        if link_back:
+            link = pdfnest_url(self.pdf_path, page_index + 1, marker.id if marker is not None else "")
+            quote += f"\n> — [p.{page_index + 1}]({link})"
         updated = f"{current}\n\n{quote}\n" if current else f"{quote}\n"
         self.note_panel.editor.setPlainText(updated)
         self.save_current_note(updated)
-        if page_index is not None and rects_norm:
+        if not link_back and page_index is not None and rects_norm:
             self._add_excerpt_marker(
                 page_index,
                 rects_norm,
@@ -1858,15 +2348,15 @@ class MainWindow(QMainWindow):
         *,
         marker_style: str = "dashed_underline",
         color: str = EXCERPT_MARKER_COLOR,
-    ) -> None:
+    ) -> Note | None:
         if self.document is None or self.pdf_key is None or not linked_note_id:
-            return
+            return None
         cleaned_rects: list[list[float]] = []
         for rect in rects_norm:
             if isinstance(rect, list | tuple) and len(rect) == 4:
                 cleaned_rects.append([max(0.0, min(1.0, float(value))) for value in rect])
         if not cleaned_rects:
-            return
+            return None
         first_rect = cleaned_rects[0]
         marker = Note.create(
             pdf_key=self.pdf_key,
@@ -1884,12 +2374,18 @@ class MainWindow(QMainWindow):
         self.persist_notes()
         if not self._refresh_page_notes(marker.page_index):
             self.render_page_preserving_view()
+        return marker
 
     def delete_current_note(self) -> None:
         note_id = self.note_panel.current_note_id
         if note_id is None:
             return
 
+        note = find_note(self.notes, note_id)
+        if note is not None and is_annotation(note):
+            # The note panel deletes the note; the highlight itself is deleted from the page.
+            self.remove_annotation_note(note_id, confirm=True)
+            return
         self.delete_note_by_id(note_id, confirm=True)
 
     def delete_note_by_id(self, note_id: str, *, confirm: bool = False) -> None:
@@ -1902,6 +2398,8 @@ class MainWindow(QMainWindow):
         if confirm:
             title = "Delete annotation" if note.note_type != "point" else "Delete note"
             message = "Delete this annotation?" if note.note_type != "point" else "Delete this note?"
+            if is_annotation(note) and note.has_note:
+                message = "Delete this annotation and its note?"
             answer = QMessageBox.question(
                 self,
                 title,
@@ -1924,6 +2422,7 @@ class MainWindow(QMainWindow):
             return
 
         affected_pages = {item.page_index for item in self.notes if item.id == note_id or item.linked_note_id == note_id}
+        self._trash_vault_file(note)
         self.notes = [item for item in self.notes if item.id != note_id and item.linked_note_id != note_id]
         self.persist_notes()
         surviving_current = find_note(self.notes, current_note_id) if current_note_id and current_note_id != note_id else None
@@ -1940,11 +2439,41 @@ class MainWindow(QMainWindow):
 
     def _refresh_note_selector(self, current_note_id: str | None = None) -> None:
         current = current_note_id if current_note_id is not None else self.note_panel.current_note_id
-        self.note_panel.set_notes([note for note in self.notes if note.note_type != "excerpt"], current)
+        self.note_panel.set_notes([note for note in self.notes if shows_as_note(note)], current)
+        self._refresh_annotation_summary()
+
+    def _refresh_annotation_summary(self) -> None:
+        """Highlights/underlines grouped by outline section, or by page where there is no section."""
+        if self.document is None:
+            self.note_panel.set_summary([])
+            return
+        self.note_panel.set_summary(group_annotations(self.notes, self._chapter_for_page))
+
+    def export_annotation_summary(self) -> Path | None:
+        if self.pdf_path is None or self.document is None:
+            return None
+        groups = group_annotations(self.notes, self._chapter_for_page)
+        if not groups:
+            self.statusBar().showMessage("No highlights or underlines to export.", 3000)
+            return None
+        text = summary_markdown(self.pdf_path.stem, groups)
+        if self.vault is not None:
+            path = self.vault.book_dir(self.pdf_path) / "Highlights.md"
+        else:
+            path = self.note_export_dir / safe_filename(self.pdf_path.stem, max_length=48) / "Highlights.md"
+        try:
+            write_text_atomic(path, text)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export summary", f"Could not write the summary:\n{exc}")
+            return None
+        self.statusBar().showMessage(f"Exported highlights summary: {path}", 6000)
+        return path
 
     def persist_notes(self) -> None:
         if self.pdf_path is None or self.pdf_key is None:
             return
+        if self.vault is not None:
+            self._after_vault_sync(push_notes(self.vault, self.pdf_path, self.notes, self._vault_fallback_title))
         save_notes(
             pdf_key=self.pdf_key,
             pdf_path=self.pdf_path,
@@ -1952,6 +2481,134 @@ class MainWindow(QMainWindow):
             note_counters=self.note_counters,
             bookmarks=self.bookmarks,
         )
+
+    # --- Obsidian vault -----------------------------------------------------------------------
+
+    def _apply_obsidian_settings(self) -> None:
+        previous = self.vault
+        self.vault = VaultConfig.from_settings(self.settings)
+        self.note_panel.set_obsidian_mode(self.vault is not None)
+        try:
+            set_pdfnest_links_registered(bool(self.settings.get("register_pdfnest_links")))
+        except OSError as exc:
+            QMessageBox.warning(self, "Links back", f"Could not register pdfnest:// links:\n{exc}")
+        if self.vault is not None and self.vault != previous:
+            self._sync_vault()
+
+    def _vault_fallback_title(self, note: Note) -> str:
+        return self._default_note_title(note.page_index, self._note_number(note))
+
+    def _sync_vault(self) -> None:
+        """Takes Obsidian's edits, then writes missing or changed note files and the index."""
+        if self.vault is None or self.pdf_path is None or self.pdf_key is None:
+            return
+        self._pull_from_vault(persist=False)
+        self.persist_notes()
+
+    def _pull_from_vault(self, *, persist: bool = True) -> None:
+        if self.vault is None or self.pdf_path is None or self.pdf_key is None:
+            return
+        current_id = self.note_panel.current_note_id
+        current = find_note(self.notes, current_id) if current_id else None
+        editor_clean = current is None or self.note_panel.editor.toPlainText() == current.markdown
+        before = [(note.vault_path, note.vault_hash) for note in self.notes]
+        report = pull_notes(self.vault, self.pdf_path, self.notes)
+        self._report_vault_problems(report)
+        if before == [(note.vault_path, note.vault_hash) for note in self.notes]:
+            return
+        if persist:
+            self.persist_notes()
+        if report.pulled:
+            if current is not None and current.id in report.pulled and editor_clean:
+                self.note_panel.set_note(current)
+            self._refresh_note_selector()
+            self.statusBar().showMessage(f"Updated {len(report.pulled)} note(s) from Obsidian.", 4000)
+
+    def _save_editor_as_vault_conflict(self, note: Note, markdown: str) -> bool:
+        """The note was changed in Obsidian while the editor held unsaved text: keep Obsidian's
+        version as the note and save the editor's text as a conflict copy, so neither is lost."""
+        if self.vault is None or self.pdf_path is None or note.id != self.note_panel.current_note_id:
+            return False
+        if note.markdown == self.note_panel.loaded_markdown or markdown == note.markdown:
+            return False
+        try:
+            conflict = write_conflict_copy(self.vault, self.pdf_path, note, markdown)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Not saved: the note changed in Obsidian and the conflict copy failed: {exc}", 12000)
+            return True
+        self.note_panel.set_note(note)
+        self._refresh_note_selector(note.id)
+        self.statusBar().showMessage(
+            f"This note was changed in Obsidian: kept Obsidian's text; your text is saved as {conflict.name}", 12000
+        )
+        return True
+
+    def _after_vault_sync(self, report: SyncReport) -> None:
+        if report.pulled:
+            # Edited in both apps: Obsidian's text is now the note (PDFNest's is in the conflict file).
+            current_id = self.note_panel.current_note_id
+            if current_id in report.pulled:
+                self.note_panel.set_note(find_note(self.notes, current_id))
+            self._refresh_note_selector()
+        self._report_vault_problems(report)
+
+    def _report_vault_problems(self, report: SyncReport) -> None:
+        if report.conflicts:
+            names = ", ".join(path.name for path in report.conflicts)
+            self.statusBar().showMessage(f"Edited in both PDFNest and Obsidian: kept Obsidian's text; PDFNest's text is saved as {names}", 12000)
+        elif report.errors:
+            self.statusBar().showMessage(f"Could not write to the Obsidian vault: {report.errors[0]}", 10000)
+
+    def _trash_vault_file(self, note: Note) -> None:
+        if self.vault is None:
+            return
+        try:
+            trash_note_file(self.vault, note)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not move the note file to the vault trash: {exc}", 8000)
+
+    def open_note_in_obsidian(self, note: Note) -> None:
+        if self.vault is None:
+            return
+        path = note_file_for_opening(self.vault, note)
+        if path is None:
+            self.statusBar().showMessage("The note file was not found in the Obsidian vault.", 5000)
+            return
+        QDesktopServices.openUrl(QUrl(obsidian_open_url(path)))
+        self.statusBar().showMessage(f"Opened in Obsidian: {path.name}", 4000)
+
+    def open_url(self, url: str) -> bool:
+        """Opens a pdfnest://open?path=...&page=N&note=ID link (or a plain .pdf path)."""
+        request = parse_pdfnest_url(url)
+        if request is None:
+            return False
+        if not request.path.is_file():
+            self.statusBar().showMessage(f"The PDF was not found: {request.path}", 8000)
+            return False
+        self.load_pdf(request.path)
+        if self.document is None or self.pdf_key != pdf_key_for_path(request.path):
+            return False
+        note = find_note(self.notes, request.note_id) if request.note_id else None
+        if note is not None and note.note_type == "excerpt":
+            self._push_reader_return_position()
+            self._go_to_page_offset(note.page_index, self._note_page_offset(note))
+            parent = find_note(self.notes, note.linked_note_id)
+            if parent is not None:
+                self.note_panel.set_note(parent)
+                self._refresh_note_selector(parent.id)
+        elif note is not None:
+            self.jump_to_note(note)
+        elif request.page_number:
+            self.go_to_page_number(request.page_number)
+        # Re-anchor any pending fit refresh (e.g. from opening the PDF) to the linked position.
+        self._schedule_fit_refresh(anchor_page=self.page_index)
+        return True
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() and self.vault is not None:
+            # Coming back from Obsidian: take the edits made there.
+            QTimer.singleShot(0, self._pull_from_vault)
 
     def choose_note_export_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Choose Markdown notes folder", str(self.note_export_dir))
@@ -2110,14 +2767,20 @@ class MainWindow(QMainWindow):
         self._cache_page_base_sizes()
         self.render_page(center_current=False)
         self._restore_view_snapshot(view)
+        self._refresh_annotation_summary()
 
     def export_all_notes(self) -> None:
-        exportable_notes = [note for note in self.notes if note.note_type != "excerpt"]
+        exportable_notes = [note for note in self.notes if shows_as_note(note)]
         if not exportable_notes:
             self.statusBar().showMessage("No notes to export.", 3000)
             return
         if self.note_panel.current_note_id is not None:
             self.save_current_note_from_panel()
+        if self.vault is not None and self.pdf_path is not None:
+            self._pull_from_vault()
+            self.persist_notes()
+            self.statusBar().showMessage(f"Synced {len(exportable_notes)} notes to Obsidian: {self.vault.book_dir(self.pdf_path)}", 6000)
+            return
 
         exported = 0
         for note in sorted(exportable_notes, key=lambda item: (item.page_index, self._note_number(item), item.created_at)):
@@ -2242,7 +2905,7 @@ class MainWindow(QMainWindow):
     def _rebuild_note_counters_from_current_note_counts(self) -> None:
         counts_by_key: dict[str, int] = {}
         for note in self.notes:
-            if note.note_type == "excerpt":
+            if not shows_as_note(note):
                 continue
             key = self._counter_key(note.page_index)
             counts_by_key[key] = counts_by_key.get(key, 0) + 1
@@ -2258,7 +2921,7 @@ class MainWindow(QMainWindow):
         if note.note_number > 0:
             return note.note_number
         key = self._counter_key(note.page_index)
-        page_notes = [item for item in self.notes if item.note_type != "excerpt" and self._counter_key(item.page_index) == key]
+        page_notes = [item for item in self.notes if shows_as_note(item) and self._counter_key(item.page_index) == key]
         page_notes.sort(key=lambda item: item.created_at)
         for index, item in enumerate(page_notes, start=1):
             if item.id == note.id:
@@ -2439,13 +3102,16 @@ class MainWindow(QMainWindow):
             self._schedule_page_window_render()
 
     def _schedule_page_window_render(self) -> None:
-        if self.document is None:
+        # Throttle, not debounce: a render already scheduled is kept, so pages keep appearing while
+        # the user scrolls continuously instead of only after scrolling stops.
+        if self.document is None or self._page_window_render_scheduled:
             return
-        self._page_window_render_token += 1
+        self._page_window_render_scheduled = True
         token = self._page_window_render_token
         QTimer.singleShot(35, lambda token=token: self._render_scheduled_page_window(token))
 
     def _render_scheduled_page_window(self, token: int) -> None:
+        self._page_window_render_scheduled = False
         if token != self._page_window_render_token or self.document is None:
             return
         self.render_page(center_current=False)
@@ -2667,6 +3333,8 @@ class MainWindow(QMainWindow):
         self.outline_action.setEnabled(has_document)
         self.reader_action.setEnabled(has_document)
         self.outline_toggle_button.setEnabled(has_document and self.main_stack.currentWidget() is self.reader_splitter)
+        self.notes_action.setEnabled(has_document)
+        self.notes_toggle_button.setEnabled(has_document and self.main_stack.currentWidget() is self.reader_splitter)
         self.page_spin.setEnabled(has_document)
         self.zoom_spin.setEnabled(has_document)
         self._refresh_document_chrome()
@@ -2706,4 +3374,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         self._save_runtime_settings()
         self._close_all_pdf_tabs()
+        self._worker_poll_timer.stop()
+        self._worker_jobs.clear()
+        self.render_workers.shutdown()
         super().closeEvent(event)

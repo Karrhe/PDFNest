@@ -67,6 +67,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "window_maximized": False,
     "storage_dir": "",
     "markdown_export_dir": "",
+    "last_pdf_dir": "",  # where the Open / Add PDF dialogs start
+    # Obsidian integration: off while the vault folder is empty.
+    "obsidian_vault_dir": "",
+    "obsidian_subfolder": "PDFNest",
+    "register_pdfnest_links": False,
 }
 
 
@@ -153,7 +158,16 @@ def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
     settings["window_height"] = clamp_window_dimension(settings.get("window_height"), 820)
     settings["window_maximized"] = bool(settings.get("window_maximized"))
     settings["storage_dir"] = str(settings.get("storage_dir") or data_dir or default_data_dir())
+    settings["last_pdf_dir"] = str(settings.get("last_pdf_dir") or "")
+    _clean_obsidian_settings(settings)
     return settings
+
+
+def _clean_obsidian_settings(settings: dict[str, Any]) -> None:
+    settings["obsidian_vault_dir"] = str(settings.get("obsidian_vault_dir") or "").strip()
+    subfolder = settings.get("obsidian_subfolder")
+    settings["obsidian_subfolder"] = "PDFNest" if subfolder is None else str(subfolder).strip()
+    settings["register_pdfnest_links"] = bool(settings.get("register_pdfnest_links"))
 
 
 def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Path:
@@ -171,5 +185,6 @@ def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Pat
     payload["window_height"] = clamp_window_dimension(payload.get("window_height"), 820)
     payload["window_maximized"] = bool(payload.get("window_maximized"))
     payload["storage_dir"] = str(storage_dir)
+    _clean_obsidian_settings(payload)
     _atomic_write_json(path, payload)
     return path

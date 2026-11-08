@@ -7,7 +7,14 @@ build keep working.
 
 from __future__ import annotations
 
-from pdf_notes_reader.app import main
+import multiprocessing
+
+if __name__ == "__main__":
+    # The PyInstaller build starts page-render worker processes by re-running this executable.
+    # freeze_support() turns such a re-run into the worker, before the UI below is imported.
+    multiprocessing.freeze_support()
+
+from pdf_notes_reader.app import main  # noqa: E402
 from pdf_notes_reader.markdown_render import latex_to_html, render_markdown_preview
 from pdf_notes_reader.ui.canvas import PdfCanvas
 from pdf_notes_reader.ui.history_panel import HistoryPanel
