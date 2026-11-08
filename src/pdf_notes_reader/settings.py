@@ -6,7 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from pdf_notes_reader.notes import _atomic_write_json, default_data_dir, read_json_checked, set_configured_data_dir
+from pdf_notes_reader.notes import _atomic_write_json, default_data_dir, machine_settings_path, read_json_checked, set_configured_data_dir
+from pdf_notes_reader.portable import is_native_absolute_path
 
 
 DEFAULT_THEMES: dict[str, dict[str, str]] = {
@@ -75,6 +76,42 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 
+# Settings that describe this computer, not the user's preferences. The data folder (with
+# user_config.json) may be shared by a Windows PC and a Mac through a cloud drive, so these live in
+# .local-data/machine_settings.json beside the data-folder pointer, which is never synced.
+MACHINE_SETTINGS: frozenset[str] = frozenset(
+    {
+        "window_width",
+        "window_height",
+        "window_maximized",
+        "storage_dir",
+        "markdown_export_dir",
+        "last_pdf_dir",
+        "obsidian_vault_dir",
+        "register_pdfnest_links",
+    }
+)
+# Machine settings holding a folder: a value read from the shared file is only used when it is an
+# absolute path of this OS (a Mac ignores ``C:\...`` written by the PC, and the other way around).
+MACHINE_PATH_SETTINGS: frozenset[str] = frozenset({"storage_dir", "markdown_export_dir", "last_pdf_dir", "obsidian_vault_dir"})
+
+
+def load_machine_settings() -> dict[str, Any]:
+    payload = read_json_checked(machine_settings_path())
+    if not isinstance(payload, dict):
+        return {}
+    return {key: value for key, value in payload.items() if key in MACHINE_SETTINGS}
+
+
+def _apply_machine_settings(settings: dict[str, Any]) -> None:
+    machine = load_machine_settings()
+    for key in MACHINE_SETTINGS:
+        if key in machine:
+            settings[key] = machine[key]
+        elif key in MACHINE_PATH_SETTINGS and settings.get(key) and not is_native_absolute_path(str(settings[key])):
+            settings[key] = DEFAULT_SETTINGS[key]
+
+
 def clamp_marker_radius(value: Any) -> int:
     try:
         number = int(value)
@@ -141,16 +178,18 @@ def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
     settings = deepcopy(DEFAULT_SETTINGS)
     ensure_default_themes(data_dir)
     path = settings_path(data_dir)
-    if not path.exists():
-        settings["storage_dir"] = str(data_dir or default_data_dir())
-        return settings
-
-    loaded = read_json_checked(path)
+    loaded = read_json_checked(path) if path.exists() else None
     if not isinstance(loaded, dict):
+        # A new (for example freshly synced, still empty) data folder: this computer's own settings
+        # still apply.
+        _apply_machine_settings(settings)
         settings["storage_dir"] = str(data_dir or default_data_dir())
+        settings["window_width"] = clamp_window_dimension(settings.get("window_width"), 1180)
+        settings["window_height"] = clamp_window_dimension(settings.get("window_height"), 820)
         return settings
 
     settings.update({key: value for key, value in loaded.items() if key in DEFAULT_SETTINGS})
+    _apply_machine_settings(settings)
     settings["note_marker_radius"] = clamp_marker_radius(settings.get("note_marker_radius"))
     settings["wheel_scroll_lines"] = clamp_wheel_scroll_lines(settings.get("wheel_scroll_lines"))
     settings["auto_save_current_note"] = bool(settings.get("auto_save_current_note"))
@@ -187,4 +226,9 @@ def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Pat
     payload["storage_dir"] = str(storage_dir)
     _clean_obsidian_settings(payload)
     _atomic_write_json(path, payload)
+    machine = {key: payload[key] for key in sorted(MACHINE_SETTINGS)}
+    try:
+        _atomic_write_json(machine_settings_path(), {"schema_version": 1, "app": "PDFNest", **machine})
+    except OSError:
+        pass  # The shared file still holds them; only the per-computer override is missing.
     return path

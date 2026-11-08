@@ -83,13 +83,13 @@ For end-user distribution on Windows, build the executable package with PyInstal
 .\scripts\build_windows_exe.ps1
 ```
 
-Pushing a tag such as `v0.3.1` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
+Pushing a tag such as `v0.3.2` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
 
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.3.1-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.3.1-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.3.2-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.3.2-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
@@ -98,14 +98,14 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 
 PyInstaller cannot cross-compile, so the Mac app is built on a Mac or by GitHub Actions.
 
-**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.1` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
+**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.2` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
 
 **On a Mac** (Python 3.10+, with the Xcode command line tools for `codesign`):
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt pyinstaller
-bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.1
+bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.2
 ```
 
 The outputs are written under `release/`:
@@ -269,6 +269,8 @@ The app settings file is:
 
 It stores the selected theme name, note marker size, shortcut settings, and the configurable PDFNest data folder.
 
+Settings that describe one computer (window size and state, the data folder, the Markdown export folder, the last folder used to open PDFs, the Obsidian vault folder and the `pdfnest://` link registration) are also kept in `.local-data/machine_settings.json`, beside the data-folder pointer. That file is never inside the data folder, so a Windows PC and a Mac that share one data folder each keep their own. See [Sync between Windows and Mac](#sync-between-windows-and-mac).
+
 Theme files are stored as independent JSON files under:
 
 ```text
@@ -313,11 +315,19 @@ The project `.gitignore` ignores `.local-data/` and `Note_PDFNest/`, so private 
 
 ### PDF Key And File Naming
 
-Each PDF gets a stable key derived from its canonical file path:
+Each PDF gets a `pdf_key` the first time PDFNest sees it, and keeps it for good. Notes, bookmarks, history and library folders all refer to it, and notebooks are never re-keyed.
 
-```text
-pdf_key = first 24 characters of sha256(normcase(resolved_pdf_path))
-```
+- A new PDF's key is a hash of its path relative to the data folder (`sha256("pdfnest-relpath\0" + relpath)[:24]`, with the path in a case- and Unicode-normalized form). It is the same on every computer that shares the data folder.
+- A PDF on a different drive than the data folder has no relative path. It gets the older path key, `sha256(normcase(resolved_pdf_path))[:24]`, which notebooks made by PDFNest 0.3.1 and earlier also keep.
+
+When a PDF is opened, PDFNest looks for its notebook in this order:
+
+1. This computer's path key (older notebooks, or the same file reopened from the same place).
+2. The PDF's path relative to the data folder (`relpath` in `manifest.json`, for example `../Books/a.pdf`). With the data folder and the PDFs both in iCloud Drive, this is identical on Windows and macOS.
+3. The content fingerprint (`fingerprint` in `manifest.json`): a SHA-256 of the file size plus the first and last MiB. This finds a PDF that moved, or one outside the data folder's drive. Step 2 still finds a PDF whose contents changed in place, for example after *Save contents to PDF*.
+4. For an old notebook made on the other computer that has no fingerprint yet: a unique match on the file name.
+
+Steps 3 and 4 skip a notebook whose PDF still exists on this computer at another path. That is a second copy, and each copy keeps its own notes.
 
 The primary note data file path is:
 
@@ -398,11 +408,14 @@ The history file stores one entry per opened PDF:
       "last_page_index": 3,
       "page_count": 20,
       "opened_at": "...",
-      "updated_at": "..."
+      "updated_at": "...",
+      "rel_path": "../path/to/example.pdf"
     }
   ]
 }
 ```
+
+`path` is absolute and only valid on the computer that wrote it. `rel_path` is the same file relative to the data folder (empty when the PDF is on another drive). On a computer that shares the data folder, an entry whose `rel_path` points at an existing file opens that file.
 
 When opening a PDF from history:
 
@@ -411,6 +424,34 @@ When opening a PDF from history:
 - On app startup, the most recent existing PDF is reopened at its saved page; opening an existing PDF from Home history also restores its saved page.
 - If `path` no longer exists, the app asks whether to relocate the PDF.
 - If relocated, the history entry keeps the same `pdf_key`, updates the absolute path, and restores the last-read page.
+
+### Sync between Windows and Mac
+
+PDFNest can share notes, highlights, bookmarks, library folders and reading positions between a Windows PC and a Mac through iCloud Drive. OneDrive and Dropbox work the same way. PDFNest does not talk to the cloud itself: both computers use one data folder inside the cloud drive, and the cloud client copies the files.
+
+1. Put the PDFs in the cloud drive, for example `iCloud Drive/Books/`.
+2. Create a data folder in the cloud drive too, for example `iCloud Drive/PDFNest/`. To keep the notes you already have, copy your current `Note_PDFNest` folder's contents into it first.
+3. On each computer, choose that folder in **Settings → Storage → PDFNest data folder**:
+   - Windows (iCloud for Windows): `C:\Users\<you>\iCloudDrive\PDFNest`
+   - macOS: `~/Library/Mobile Documents/com~apple~CloudDocs/PDFNest` (in Finder: *iCloud Drive → PDFNest*)
+4. On both computers, open the PDFs from the cloud drive, not from a local copy.
+
+The data folder and the PDFs must sit the same way relative to each other on both computers (`../Books/a.pdf` from the data folder). A PDF opened from somewhere else, for example a copy in Downloads, is still found by its fingerprint, but its library entry only opens on the computer that has that copy.
+
+The first time PDFNest starts with a data folder, it records the relative path and fingerprint of every notebook whose PDF it can read (`migration_state.json` records which folder that was done for). Old notebooks keep their key and their notes. They show up on the other computer once the computer that made them has done this, or earlier through the file-name match above.
+
+When both computers are in use:
+
+- Saving notes or history merges with the copy on disk instead of replacing it. A note or book added on the other computer is kept. A note deleted here stays deleted. When the same note was edited on both, the later edit wins.
+- Sync clients sometimes make conflict copies: `notes 2.json` (iCloud), `notes (… conflicted copy …).json` (Dropbox), `notes-PCNAME.json` (OneDrive). For `notes.json`, a bookmarks file or `recentnotes.json`, PDFNest merges the copy in, moves it to a `conflicts/` folder and shows a warning. `notebooks/index.json` is only a cache: if the other computer's copy is missing a notebook, PDFNest finds it again from the `manifest.json` files.
+- When macOS has evicted a file to a `.<name>.icloud` placeholder, PDFNest asks iCloud to download it (`brctl download`) and waits up to 10 seconds. If the file is still missing, PDFNest shows a warning and treats the notebook as empty without overwriting the real file. The next save merges with the file once it arrives. Files that are only in the cloud on Windows or on newer macOS download when PDFNest reads them. Library covers are not made for books that are only in the cloud.
+- Settings for one computer stay in `.local-data/machine_settings.json` (see above). A folder setting that the other operating system wrote into the shared `user_config.json` (`C:\...` on a Mac, `/Users/...` on Windows) is ignored.
+
+Good practice:
+
+- Keep the data folder downloaded. On the Mac: right-click it in Finder → *Keep Downloaded*. On Windows: right-click it → *Always keep on this device*.
+- Let the cloud finish syncing before you switch computers, and don't edit the same note on both at once. PDFNest does not reload an open PDF's notes when they change on disk, so close and reopen the PDF to see notes just synced from the other computer.
+- Markdown export paths and the Obsidian vault folder are per computer. On each computer, set the vault folder to that computer's path to the same vault.
 
 ### Backups and moving the data folder
 

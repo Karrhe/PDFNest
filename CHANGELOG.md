@@ -2,7 +2,24 @@
 
 All notable changes to PDFNest. Issue IDs refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
-## Unreleased
+## 0.3.2 — 2026-11-08
+
+### Added
+- Sync between a Windows PC and a Mac through a data folder in iCloud Drive (or OneDrive / Dropbox): choose
+  the same cloud folder in Settings → Storage on both. A PDF's notebook is found by its path relative to the
+  data folder, then by a content fingerprint, so the same PDF shows the same notes, highlights, bookmarks and
+  reading position on both computers (README → *Sync between Windows and Mac*).
+- Saving notes, bookmarks and history merges with the copy on disk, so a computer with a stale copy no
+  longer overwrites notes or books added on the other one. Sync-client conflict copies (`notes 2.json` etc.)
+  are merged and moved to `conflicts/`.
+- Evicted iCloud files (`.name.icloud`) are downloaded before they are read, and never overwritten meanwhile.
+
+### Changed
+- New PDFs get a key from their path relative to the data folder instead of the absolute path. Existing
+  notebooks keep their keys; a one-time migration adds `relpath` and `fingerprint` to their `manifest.json`
+  and `rel_path` to history entries.
+- Window size, the data folder, export and last-opened folders, the Obsidian vault folder and the
+  `pdfnest://` registration are kept per computer in `.local-data/machine_settings.json`.
 
 ## 0.3.1 — 2026-11-08
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from pdf_notes_reader.notes import default_data_dir, notebook_dir_for_pdf, pdf_key_for_path, root_sync_lock_path, utc_now
 from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock, read_json_checked
+from pdf_notes_reader.notes import _LOCATOR_CACHE, _absorb_conflicts, _dict_list, read_manifest
+from pdf_notes_reader.portable import ensure_local, icloud_stub_for, merge_records, portable_relpath, record_stamps
 
 
 @dataclass
@@ -20,6 +23,9 @@ class PdfHistoryEntry:
     last_note_id: str = ""
     zoom: float = 1.25
     fit_mode: str = ""
+    # ``path`` relative to the data folder (``/`` separators): finds the PDF on another computer that
+    # shares the data folder through iCloud Drive, OneDrive or Dropbox. Empty on another drive.
+    rel_path: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PdfHistoryEntry":
@@ -35,6 +41,7 @@ class PdfHistoryEntry:
             last_note_id=str(data.get("last_note_id") or ""),
             zoom=normalize_zoom(data.get("zoom")),
             fit_mode=normalize_fit_mode(data.get("fit_mode")),
+            rel_path=str(data.get("rel_path") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,6 +50,11 @@ class PdfHistoryEntry:
     @property
     def exists(self) -> bool:
         return Path(self.path).exists()
+
+    @property
+    def in_cloud_only(self) -> bool:
+        """The PDF is an iCloud ``.name.icloud`` stub: present, but not downloaded to this computer."""
+        return not self.exists and icloud_stub_for(self.path).exists()
 
 
 def history_path(data_dir: Path | None = None) -> Path:
@@ -85,15 +97,62 @@ def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
     for item in raw_entries:
         if isinstance(item, dict):
             entries.append(PdfHistoryEntry.from_dict(item))
+    root = data_dir or default_data_dir()
+    for entry in entries:
+        resolve_entry_path(entry, root)
+    _HISTORY_BASES[str(history_path(data_dir))] = record_stamps([entry.to_dict() for entry in entries], key="pdf_key")
     return sorted(entries, key=lambda entry: entry.updated_at, reverse=True)
 
 
+# pdf_key -> updated_at of the entries this process last loaded or saved; see notes._SYNC_BASES.
+_HISTORY_BASES: dict[str, dict[str, str]] = {}
+
+
+def resolve_entry_path(entry: PdfHistoryEntry, data_dir: Path) -> None:
+    """Points ``entry.path`` at the PDF on this computer, which may not be the one that recorded it.
+
+    ``path`` is absolute and only valid where it was written (a ``C:`` path means nothing on a Mac);
+    ``rel_path`` is relative to the shared data folder, so it finds the same file in the cloud drive.
+    """
+    if not entry.rel_path:
+        return
+    try:
+        candidate = Path(os.path.normpath(data_dir / entry.rel_path))
+        # The copy next to the shared data folder wins: on the computer that wrote ``path`` it is the
+        # same file, and elsewhere ``path`` may name an unrelated local file.
+        if candidate.exists() or (not Path(entry.path).exists() and icloud_stub_for(candidate).exists()):
+            entry.path = str(candidate)
+    except (OSError, ValueError):
+        return
+
+
 def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *, touched_pdf_keys: set[str] | None = None) -> Path:
+    """Writes the library list, merged with the copy on disk.
+
+    With the data folder in a cloud drive, the other computer may have added books or read further
+    since this list was loaded; those entries are merged into ``entries`` (in place) instead of lost.
+    """
     path = history_path(data_dir)
+    root = data_dir or default_data_dir()
+    for entry in entries:
+        _refresh_rel_path(entry, root)
+    ours = [entry.to_dict() for entry in entries]
+    base_key = str(path)
+    if ensure_local(path):
+        _absorb_conflicts(path, _merge_history_payloads, root / "conflicts")
+    on_disk = read_json_checked(path)
+    disk_entries = _dict_list(on_disk.get("entries") if isinstance(on_disk, dict) else on_disk)
+    merged = merge_records(ours, disk_entries, base=_HISTORY_BASES.get(base_key), key="pdf_key") if disk_entries else ours
+    _HISTORY_BASES[base_key] = record_stamps(ours, key="pdf_key")
+    if merged != ours:
+        updated = [PdfHistoryEntry.from_dict(item) for item in merged]
+        for entry in updated:
+            resolve_entry_path(entry, root)
+        entries[:] = sorted(updated, key=lambda item: item.updated_at, reverse=True)
     payload = {
         "schema_version": 1,
         "app": "PDFNest",
-        "entries": [entry.to_dict() for entry in entries],
+        "entries": merged,
     }
     _atomic_write_json(path, payload)
     _write_sync_lock(root_sync_lock_path(data_dir))
@@ -105,10 +164,39 @@ def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *
     return path
 
 
+def _merge_history_payloads(ours: Any, theirs: Any, base: dict[str, str] | None = None) -> dict[str, Any]:
+    ours_entries = _dict_list(ours.get("entries") if isinstance(ours, dict) else ours)
+    theirs_entries = _dict_list(theirs.get("entries") if isinstance(theirs, dict) else theirs)
+    return {
+        "schema_version": 1,
+        "app": "PDFNest",
+        "entries": merge_records(ours_entries, theirs_entries, base=base, key="pdf_key"),
+    }
+
+
+def _refresh_rel_path(entry: PdfHistoryEntry, data_dir: Path) -> None:
+    try:
+        if Path(entry.path).exists():
+            entry.rel_path = portable_relpath(entry.path, data_dir)
+    except (OSError, ValueError):
+        return
+
+
 def _save_notebook_recent_file(entry: PdfHistoryEntry, data_dir: Path | None = None) -> None:
     notebook_dir = notebook_dir_for_pdf(entry.path, entry.pdf_key, data_dir)
     notebook_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(notebook_dir / "manifest.json", _manifest_payload(pdf_key=entry.pdf_key, pdf_path=entry.path, page_count=entry.page_count))
+    manifest_path = notebook_dir / "manifest.json"
+    _atomic_write_json(
+        manifest_path,
+        _manifest_payload(
+            pdf_key=entry.pdf_key,
+            pdf_path=entry.path,
+            page_count=entry.page_count,
+            data_dir=data_dir,
+            previous=read_manifest(manifest_path),
+        ),
+    )
+    _LOCATOR_CACHE.clear()
     if not (notebook_dir / "markups.json").exists():
         _atomic_write_json(notebook_dir / "markups.json", _markups_payload([]))
     recent_payload = [

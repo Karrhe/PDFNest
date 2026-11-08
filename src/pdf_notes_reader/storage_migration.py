@@ -12,7 +12,10 @@ from pdf_notes_reader.notes import (
     _atomic_write_json,
     app_local_data_dir,
     default_data_dir,
+    notebooks_dir,
     notes_path_for_key,
+    portable_locators,
+    read_manifest,
     rebuild_notebook_index,
     record_storage_issue,
     save_notes,
@@ -21,7 +24,8 @@ from pdf_notes_reader.notes import (
 from pdf_notes_reader.settings import DEFAULT_SETTINGS, save_settings, settings_path
 
 
-MIGRATION_VERSION = 1
+# 1: old notes/ and pdf_history.json moved into notebooks/. 2: portable locators (cross-machine sync).
+MIGRATION_VERSION = 2
 
 
 def migration_state_path(data_dir: Path | None = None) -> Path:
@@ -31,42 +35,94 @@ def migration_state_path(data_dir: Path | None = None) -> Path:
 def migrate_storage(data_dir: Path | None = None, *, legacy_roots: list[Path] | None = None) -> bool:
     target_dir = data_dir or default_data_dir()
     state_path = migration_state_path(target_dir)
-    if _migration_complete(state_path):
+    state = _read_migration_state(state_path)
+    version = _state_version(state)
+    # Locators are relative to the data folder, so a copied or moved data folder recomputes them.
+    locators_current = version >= 2 and str(state.get("locators_dir") or "") == str(target_dir)
+    if version >= MIGRATION_VERSION and locators_current:
         return False
 
-    roots = legacy_roots or _legacy_roots(target_dir)
     migrated = False
-    migrated = _migrate_settings(target_dir, roots) or migrated
-    migrated = _migrate_history(target_dir, roots) or migrated
-    rebuild_notebook_index(target_dir)
-    migrated = _migrate_notes(target_dir, roots) or migrated
-    rebuild_notebook_index(target_dir)
-    _write_migration_state(state_path)
+    if version < 1:
+        roots = legacy_roots or _legacy_roots(target_dir)
+        migrated = _migrate_settings(target_dir, roots) or migrated
+        migrated = _migrate_history(target_dir, roots) or migrated
+        rebuild_notebook_index(target_dir)
+        migrated = _migrate_notes(target_dir, roots) or migrated
+        rebuild_notebook_index(target_dir)
+    if not locators_current:
+        migrated = backfill_portable_locators(target_dir) or migrated
+    _write_migration_state(state_path, target_dir)
     return migrated
 
 
-def _migration_complete(path: Path) -> bool:
+def _read_migration_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return False
+        return {}
     try:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _state_version(state: dict[str, Any]) -> int:
     try:
-        return int(payload.get("schema_version", 0)) >= MIGRATION_VERSION
+        return int(state.get("schema_version", 0))
     except (TypeError, ValueError):
-        return False
+        return 0
 
 
-def _write_migration_state(path: Path) -> None:
+def _migration_complete(path: Path) -> bool:
+    return _state_version(_read_migration_state(path)) >= MIGRATION_VERSION
+
+
+def _write_migration_state(path: Path, target_dir: Path) -> None:
     payload = {
         "schema_version": MIGRATION_VERSION,
         "migrated_at": utc_now(),
+        "locators_dir": str(target_dir),
     }
     _atomic_write_json(path, payload)
+
+
+def backfill_portable_locators(target_dir: Path) -> bool:
+    """Adds ``relpath`` and ``fingerprint`` to notebooks saved before cross-machine lookup existed.
+
+    Notebooks keep their key and folder: nothing is renamed or re-keyed, so no note can be lost. The
+    locators only let another computer sharing this data folder find the notebook for its own path to
+    the same PDF (see ``notes.resolve_pdf_key``). PDFs that are missing here, or only in the cloud,
+    are left for the computer that has them. History entries get their ``rel_path`` the same way.
+    """
+    changed = False
+    root = notebooks_dir(target_dir)
+    for manifest_path in sorted(root.glob("*/manifest.json")) if root.exists() else []:
+        manifest = read_manifest(manifest_path)
+        resources = manifest.get("res")
+        if not manifest.get("pdf_key") or not isinstance(resources, list) or not resources or not isinstance(resources[0], dict):
+            continue
+        refpath = str(resources[0].get("refpath") or "")
+        if not refpath:
+            continue
+        locators = portable_locators(refpath, target_dir, manifest)
+        if all(manifest.get(name) == value for name, value in locators.items()):
+            continue
+        manifest.update(locators)
+        try:
+            _atomic_write_json(manifest_path, manifest)
+        except OSError as exc:
+            record_storage_issue(f"Could not update {manifest_path} for cloud sync ({exc}).", manifest_path)
+            continue
+        changed = True
+    if history_path(target_dir).exists():
+        entries = load_history(target_dir)
+        before = [entry.rel_path for entry in entries]
+        if entries:
+            save_history(entries, target_dir, touched_pdf_keys=set())
+            changed = changed or before != [entry.rel_path for entry in entries]
+    rebuild_notebook_index(target_dir)
+    return changed
 
 
 def _legacy_roots(target_dir: Path) -> list[Path]:

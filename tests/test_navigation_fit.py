@@ -10,7 +10,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QTabBar, QToolButton
 from pdf_notes_reader.main import MainWindow
 from pdf_notes_reader.notes import load_notes
-from pdf_notes_reader.notes import pdf_key_for_path
+from pdf_notes_reader.notes import resolve_pdf_key
 
 
 class NavigationFitTest(GuiTestCase):
@@ -114,13 +114,13 @@ class NavigationFitTest(GuiTestCase):
                 second_note_id = window.note_panel.current_note_id
 
                 self.assertEqual(window.document_tab_bar.count(), 3)
-                self.assertEqual(set(window.pdf_tabs), {pdf_key_for_path(first_pdf), pdf_key_for_path(second_pdf)})
+                self.assertEqual(set(window.pdf_tabs), {resolve_pdf_key(first_pdf), resolve_pdf_key(second_pdf)})
                 self.assertEqual(window.pdf_path, second_pdf)
                 self.assertEqual(window.document_title_combo.count(), 2)
                 self.assertEqual(window.document_title_combo.currentText(), second_pdf.name)
                 self.assertEqual(
                     [window.document_title_combo.itemData(index) for index in range(window.document_title_combo.count())],
-                    [pdf_key_for_path(first_pdf), pdf_key_for_path(second_pdf)],
+                    [resolve_pdf_key(first_pdf), resolve_pdf_key(second_pdf)],
                 )
                 close_button = window.document_tab_bar.tabButton(1, QTabBar.RightSide)
                 self.assertIsInstance(close_button, QToolButton)
@@ -154,7 +154,7 @@ class NavigationFitTest(GuiTestCase):
                 window.show_reader()
 
                 window.close_tab_shortcut.activated.emit()
-                self.assertNotIn(pdf_key_for_path(second_pdf), window.pdf_tabs)
+                self.assertNotIn(resolve_pdf_key(second_pdf), window.pdf_tabs)
                 self.assertEqual(window.document_tab_bar.count(), 2)
                 self.assertEqual(window.pdf_path, first_pdf)
             finally:

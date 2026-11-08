@@ -14,6 +14,19 @@ from typing import Any
 
 import fitz
 
+from pdf_notes_reader.portable import (
+    conflict_copies,
+    ensure_local,
+    foreign_basename,
+    is_cloud_placeholder,
+    merge_records,
+    move_aside,
+    normalize_portable,
+    pdf_fingerprint,
+    portable_relpath,
+    record_stamps,
+)
+
 
 APP_NAME = "PDFNest"
 STORAGE_DIR_NAME = "Note_PDFNest"
@@ -232,6 +245,11 @@ def storage_pointer_path() -> Path:
     return app_local_data_dir() / "storage_location.json"
 
 
+def machine_settings_path() -> Path:
+    """Settings that belong to this computer (window size, folders on this disk). Never synced."""
+    return storage_pointer_path().parent / "machine_settings.json"
+
+
 def _read_storage_pointer() -> Path | None:
     path = storage_pointer_path()
     if not path.exists():
@@ -336,6 +354,137 @@ def pdf_key_for_path(pdf_path: str | Path) -> str:
 
 
 @dataclass
+class NotebookLocator:
+    """What a notebook's manifest says about its PDF, for finding it from another machine."""
+
+    pdf_key: str
+    folder: Path
+    relpath: str  # normalized, relative to the data folder
+    fingerprint: str
+    name: str  # normalized file name
+    refpath: str
+
+
+_LOCATOR_CACHE: dict[str, tuple[tuple[int, int], list[NotebookLocator]]] = {}
+
+
+def _mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def notebook_locators(data_dir: Path | None = None) -> list[NotebookLocator]:
+    """Reads every notebook manifest once; cached until a notebook is added (here or by sync)."""
+    root = notebooks_dir(data_dir)
+    stamp = (_mtime_ns(root), _mtime_ns(root / "index.json"))
+    cached = _LOCATOR_CACHE.get(str(root))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    locators: list[NotebookLocator] = []
+    if root.exists():
+        for manifest_path in sorted(root.glob("*/manifest.json")):
+            try:
+                payload = _read_json_path(manifest_path)
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict) or not payload.get("pdf_key"):
+                continue
+            refpath = ""
+            resources = payload.get("res")
+            if isinstance(resources, list) and resources and isinstance(resources[0], dict):
+                refpath = str(resources[0].get("refpath") or "")
+            locators.append(
+                NotebookLocator(
+                    pdf_key=str(payload["pdf_key"]),
+                    folder=manifest_path.parent,
+                    relpath=normalize_portable(str(payload.get("relpath") or "")),
+                    fingerprint=str(payload.get("fingerprint") or ""),
+                    name=normalize_portable(foreign_basename(refpath)) if refpath else "",
+                    refpath=refpath,
+                )
+            )
+    _LOCATOR_CACHE[str(root)] = (stamp, locators)
+    return locators
+
+
+def resolve_pdf_key(pdf_path: str | Path, data_dir: Path | None = None) -> str:
+    """The key of the notebook that belongs to ``pdf_path``, on this machine or any other.
+
+    A key is an opaque ID chosen when a PDF is first seen and kept forever, so notes never move. It
+    is found again by, in order:
+
+    1. this machine's old path key (notebooks made before portable lookup, and same-path reopens);
+    2. the path relative to the data folder: identical on Windows and macOS when both the data folder
+       and the PDFs live in the cloud drive;
+    3. the content fingerprint: the PDF was moved, or lives outside the data folder's drive;
+    4. for an old notebook made on another machine (no fingerprint yet), a unique file-name match.
+
+    Steps 3 and 4 skip a notebook whose recorded PDF still exists here at another path: that is a
+    second copy on this computer, and each copy keeps its own notes.
+
+    A PDF seen for the first time gets a key derived from its relative path, so two computers that open
+    a new PDF in the cloud drive before the cloud has synced still pick the same notebook. A PDF on
+    another drive than the data folder gets the path key.
+    """
+    data_dir = data_dir or default_data_dir()
+    path = Path(pdf_path).expanduser()
+    legacy = pdf_key_for_path(path)
+    index = _load_notebook_index(data_dir)
+    root = notebooks_dir(data_dir)
+    if legacy in index and (root / index[legacy]).exists():
+        return legacy
+    locators = notebook_locators(data_dir)
+    if any(locator.pdf_key == legacy for locator in locators):
+        return legacy
+
+    relpath = normalize_portable(portable_relpath(path, data_dir))
+    if relpath:
+        for locator in locators:
+            if locator.relpath == relpath:
+                return locator.pdf_key
+
+    fingerprint = pdf_fingerprint(path)
+    if fingerprint:
+        for locator in locators:
+            if locator.fingerprint == fingerprint and not _is_other_local_file(locator.refpath, path):
+                return locator.pdf_key
+
+    name = normalize_portable(path.name)
+    candidates = [
+        locator
+        for locator in locators
+        if not locator.fingerprint and locator.name == name and not _is_other_local_file(locator.refpath, path)
+    ]
+    if len(candidates) == 1:
+        return candidates[0].pdf_key
+    return new_pdf_key(path, data_dir)
+
+
+def new_pdf_key(pdf_path: str | Path, data_dir: Path | None = None) -> str:
+    """The key for a PDF without a notebook: a hash of its path relative to the data folder.
+
+    The relative path is the same on every computer sharing the data folder, unlike the absolute path
+    behind ``pdf_key_for_path``, which is still used for a PDF on another drive (no relative path).
+    """
+    relpath = normalize_portable(portable_relpath(pdf_path, data_dir or default_data_dir()))
+    if not relpath:
+        return pdf_key_for_path(pdf_path)
+    return hashlib.sha256(f"pdfnest-relpath\0{relpath}".encode("utf-8")).hexdigest()[:24]
+
+
+def _is_other_local_file(refpath: str, path: Path) -> bool:
+    """Whether ``refpath`` is a file on this computer other than ``path`` (a second copy of the PDF)."""
+    try:
+        if not refpath or not Path(refpath).exists():
+            return False
+        return os.path.normcase(str(Path(refpath).resolve(strict=False))) != os.path.normcase(str(path.resolve(strict=False)))
+    except (OSError, ValueError):
+        return False
+
+
+@dataclass
 class StorageIssue:
     message: str
     path: Path
@@ -371,8 +520,14 @@ def quarantine_file(path: Path) -> Path:
 
 
 def read_json_checked(path: Path) -> Any | None:
-    """Reads JSON, or returns None. Corrupt files are quarantined and reported instead of raising."""
-    if not path.exists():
+    """Reads JSON, or returns None. Corrupt files are quarantined and reported instead of raising.
+
+    A file iCloud evicted to a ``.name.icloud`` stub is downloaded first; if that does not finish in
+    time it is reported, because "no file" would otherwise read as "no data".
+    """
+    if not ensure_local(path):
+        if is_cloud_placeholder(path):
+            record_storage_issue(f"{path.name} is still downloading from iCloud; reopen the PDF in a moment.", path)
         return None
     try:
         return _read_json_path(path)
@@ -434,6 +589,7 @@ def _save_notebook_index(index: dict[str, str], data_dir: Path | None = None) ->
         "notebooks": dict(sorted(index.items())),
     }
     _atomic_write_json(notebook_index_path(data_dir), payload)
+    _LOCATOR_CACHE.clear()
 
 
 def register_notebook_dir(pdf_key: str, notebook_dir: Path, data_dir: Path | None = None) -> None:
@@ -544,7 +700,8 @@ def bookmark_path_for_key(pdf_key: str, data_dir: Path | None = None) -> Path:
 
 
 def load_notes(pdf_key: str, data_dir: Path | None = None) -> list[Note]:
-    notes, _counters, _bookmarks = load_notes_data(pdf_key, data_dir)
+    """Read-only view (search, summaries): does not change what the next save merges against."""
+    notes, _counters, _bookmarks = load_notes_data(pdf_key, data_dir, track=False)
     return notes
 
 
@@ -553,8 +710,12 @@ def load_notes_with_counters(pdf_key: str, data_dir: Path | None = None) -> tupl
     return notes, counters
 
 
-def load_notes_data(pdf_key: str, data_dir: Path | None = None) -> tuple[list[Note], dict[str, int], list[Bookmark]]:
-    payload = load_notes_payload(pdf_key, data_dir)
+def load_notes_data(
+    pdf_key: str, data_dir: Path | None = None, *, track: bool = True
+) -> tuple[list[Note], dict[str, int], list[Bookmark]]:
+    """Loads a notebook for editing. With ``track`` the next ``save_notes`` treats records missing
+    from the saved list as deleted here; records another machine adds meanwhile are kept."""
+    payload = load_notes_payload(pdf_key, data_dir, track=track)
     raw_notes = payload.get("notes", [])
     if not isinstance(raw_notes, list):
         raw_notes = []
@@ -564,7 +725,7 @@ def load_notes_data(pdf_key: str, data_dir: Path | None = None) -> tuple[list[No
         if isinstance(item, dict):
             notes.append(Note.from_dict(item))
 
-    bookmark_payload = load_bookmarks_payload(pdf_key, data_dir)
+    bookmark_payload = load_bookmarks_payload(pdf_key, data_dir, track=track)
     raw_bookmarks = bookmark_payload.get("bookmarks", payload.get("bookmarks", []))
     if not isinstance(raw_bookmarks, list):
         raw_bookmarks = []
@@ -579,18 +740,104 @@ def load_notes_data(pdf_key: str, data_dir: Path | None = None) -> tuple[list[No
     return notes, normalize_note_counters(payload.get("note_counters", {})), bookmarks
 
 
-def load_notes_payload(pdf_key: str, data_dir: Path | None = None) -> dict[str, Any]:
-    path = notes_path_for_key(pdf_key, data_dir)
-    if not path.exists():
+# What this process last loaded or saved per file: record id -> timestamp. Saving merges with the copy
+# on disk, and these tell a record another machine added apart from one deleted here.
+_SYNC_BASES: dict[str, dict[str, str]] = {}
+
+
+def _sync_base_key(path: Path) -> str:
+    return os.path.normcase(str(path))
+
+
+def load_notes_payload(pdf_key: str, data_dir: Path | None = None, *, track: bool = True) -> dict[str, Any]:
+    notes_path = notes_path_for_key(pdf_key, data_dir)
+    path = notes_path
+    if ensure_local(path):
+        _absorb_notes_conflicts(path)
+    elif is_cloud_placeholder(path):
+        pass  # read_json_checked reports it; never fall back to an older copy meanwhile
+    else:
         legacy_notebook_path = legacy_notebook_note_file_for_key(pdf_key, data_dir)
         path = legacy_notebook_path or legacy_notes_path_for_key(pdf_key, data_dir)
     payload = read_json_checked(path)
-    return payload if isinstance(payload, dict) else {}
+    payload = payload if isinstance(payload, dict) else {}
+    if track:
+        _SYNC_BASES[_sync_base_key(notes_path)] = record_stamps(_dict_list(payload.get("notes")))
+    return payload
 
 
-def load_bookmarks_payload(pdf_key: str, data_dir: Path | None = None) -> dict[str, Any]:
-    payload = read_json_checked(bookmark_path_for_key(pdf_key, data_dir))
-    return payload if isinstance(payload, dict) else {}
+def load_bookmarks_payload(pdf_key: str, data_dir: Path | None = None, *, track: bool = True) -> dict[str, Any]:
+    path = bookmark_path_for_key(pdf_key, data_dir)
+    if ensure_local(path):
+        _absorb_conflicts(path, _merge_bookmark_payloads, path.parent / "conflicts")
+    payload = read_json_checked(path)
+    payload = payload if isinstance(payload, dict) else {}
+    if track:
+        _SYNC_BASES[_sync_base_key(path)] = record_stamps(_dict_list(payload.get("bookmarks")), stamp="created_at")
+    return payload
+
+
+def _merge_notes_payloads(ours: dict[str, Any], theirs: dict[str, Any], base: dict[str, str] | None = None) -> dict[str, Any]:
+    merged = dict(theirs)
+    merged.update(ours)
+    merged["notes"] = merge_records(_dict_list(ours.get("notes")), _dict_list(theirs.get("notes")), base=base)
+    merged["bookmarks"] = merge_records(
+        _dict_list(ours.get("bookmarks")), _dict_list(theirs.get("bookmarks")), base=None, stamp="created_at"
+    )
+    counters = normalize_note_counters(theirs.get("note_counters", {}))
+    for key, value in normalize_note_counters(ours.get("note_counters", {})).items():
+        counters[key] = max(value, counters.get(key, 0))
+    merged["note_counters"] = counters
+    return merged
+
+
+def _merge_bookmark_payloads(ours: dict[str, Any], theirs: dict[str, Any], base: dict[str, str] | None = None) -> dict[str, Any]:
+    merged = dict(theirs)
+    merged.update(ours)
+    merged["bookmarks"] = merge_records(
+        _dict_list(ours.get("bookmarks")), _dict_list(theirs.get("bookmarks")), base=base, stamp="created_at"
+    )
+    return merged
+
+
+def _dict_list(value: Any) -> list[dict[str, Any]]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _absorb_notes_conflicts(path: Path) -> None:
+    _absorb_conflicts(path, _merge_notes_payloads, path.parent.parent / "conflicts")
+
+
+def _absorb_conflicts(path: Path, merge, conflicts_dir: Path) -> None:
+    """Merges sync-client conflict copies (``notes 2.json``...) into ``path`` and moves them aside.
+
+    Records are combined, never dropped, so a note written on either machine survives; the copies are
+    kept in ``conflicts/`` in case something needs to be recovered by hand.
+    """
+    copies = conflict_copies(path)
+    if not copies:
+        return
+    current = read_json_checked(path)
+    merged = current if isinstance(current, dict) else {}
+    absorbed: list[Path] = []
+    for copy in copies:
+        try:
+            other = _read_json_path(copy)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(other, dict):
+            merged = merge(merged, other, None)
+            absorbed.append(copy)
+    if not absorbed:
+        return
+    _atomic_write_json(path, merged)
+    for copy in absorbed:
+        move_aside(copy, conflicts_dir)
+    record_storage_issue(
+        f"{path.name} had {len(absorbed)} conflicting cop{'y' if len(absorbed) == 1 else 'ies'} from cloud sync; "
+        f"they were merged and kept in {conflicts_dir}.",
+        path,
+    )
 
 
 def normalize_note_counters(value: Any) -> dict[str, int]:
@@ -612,12 +859,51 @@ def normalize_nonnegative_int(value: Any, *, default: int = 0) -> int:
         return default
 
 
-def _manifest_payload(*, pdf_key: str, pdf_path: str | Path, page_count: int = 0) -> dict[str, Any]:
+def portable_locators(pdf_path: str | Path, data_dir: Path | None = None, previous: dict[str, Any] | None = None) -> dict[str, str]:
+    """The ``relpath`` and ``fingerprint`` a manifest records so other machines find the notebook.
+
+    A PDF that is not readable here (missing, or a cloud placeholder that would start a download)
+    keeps what the manifest recorded before.
+    """
+    previous = previous or {}
+    locators = {
+        "relpath": str(previous.get("relpath") or ""),
+        "fingerprint": str(previous.get("fingerprint") or ""),
+    }
+    path = Path(pdf_path).expanduser()
+    try:
+        available = path.is_file() and not is_cloud_placeholder(path)
+    except OSError:
+        available = False
+    if not available:
+        return locators
+    locators["relpath"] = portable_relpath(path, data_dir or default_data_dir())
+    locators["fingerprint"] = pdf_fingerprint(path) or locators["fingerprint"]
+    return locators
+
+
+def read_manifest(manifest_path: Path) -> dict[str, Any]:
+    try:
+        payload = _read_json_path(manifest_path)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _manifest_payload(
+    *,
+    pdf_key: str,
+    pdf_path: str | Path,
+    page_count: int = 0,
+    data_dir: Path | None = None,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     path = Path(pdf_path).expanduser()
     return {
         "schema_version": 1,
         "app": APP_NAME,
         "pdf_key": pdf_key,
+        **portable_locators(path, data_dir, previous),
         "resid": 1,
         "res": [
             {
@@ -663,8 +949,8 @@ def _recent_file_payload(*, page_index: int, zoom: float = 1.25) -> list[dict[st
 
 def _ensure_cover(pdf_path: str | Path, notebook_dir: Path) -> None:
     cover_path = notebook_dir / "cover.png"
-    if cover_path.exists():
-        return
+    if cover_path.exists() or is_cloud_placeholder(pdf_path):
+        return  # A cover is not worth downloading a whole book from the cloud.
     try:
         document = fitz.open(pdf_path)
     except Exception:
@@ -707,13 +993,39 @@ def save_notes(
         "notes": [note.to_dict() for note in notes],
     }
     notebook_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(path, payload)
-    _atomic_write_json(bookmark_path, {"schema_version": 1, "app": APP_NAME, "bookmarks": [bookmark.to_dict() for bookmark in current_bookmarks]})
+    # Another machine may have saved this notebook since it was loaded here (cloud-synced data
+    # folder). Merge with the file on disk instead of overwriting it.
+    if ensure_local(path):
+        _absorb_notes_conflicts(path)
+    on_disk = read_json_checked(path)
+    written = _merge_notes_payloads(payload, on_disk, _SYNC_BASES.get(_sync_base_key(path))) if isinstance(on_disk, dict) else payload
+    bookmark_payload: dict[str, Any] = {"schema_version": 1, "app": APP_NAME, "bookmarks": payload["bookmarks"]}
+    if ensure_local(bookmark_path):
+        _absorb_conflicts(bookmark_path, _merge_bookmark_payloads, bookmark_path.parent / "conflicts")
+    bookmarks_on_disk = read_json_checked(bookmark_path)
+    if isinstance(bookmarks_on_disk, dict):
+        bookmark_payload = _merge_bookmark_payloads(
+            bookmark_payload, bookmarks_on_disk, _SYNC_BASES.get(_sync_base_key(bookmark_path))
+        )
+    written["bookmarks"] = bookmark_payload["bookmarks"]
+    _atomic_write_json(path, written)
+    _atomic_write_json(bookmark_path, bookmark_payload)
+    # The base is what this machine holds, not the merged result: a record merged in from the other
+    # machine but absent from the caller's list stays an addition next time, not a deletion.
+    _SYNC_BASES[_sync_base_key(path)] = record_stamps(payload["notes"])
+    _SYNC_BASES[_sync_base_key(bookmark_path)] = record_stamps(payload["bookmarks"], stamp="created_at")
     manifest_path = notebook_dir / "manifest.json"
     _atomic_write_json(
         manifest_path,
-        _manifest_payload(pdf_key=pdf_key, pdf_path=pdf_path, page_count=_manifest_page_count(manifest_path)),
+        _manifest_payload(
+            pdf_key=pdf_key,
+            pdf_path=pdf_path,
+            page_count=_manifest_page_count(manifest_path),
+            data_dir=data_dir,
+            previous=read_manifest(manifest_path),
+        ),
     )
+    _LOCATOR_CACHE.clear()
     _atomic_write_json(notebook_dir / "markups.json", _markups_payload(notes))
     recent_path = notebook_dir / "recentfile.json"
     if not recent_path.exists():  # History owns the last-read page; only seed it here.

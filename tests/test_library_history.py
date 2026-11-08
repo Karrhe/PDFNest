@@ -14,7 +14,7 @@ from pdf_notes_reader.library import UNFILED_FOLDER_ID, load_library
 from pdf_notes_reader.main import MainWindow
 from pdf_notes_reader.notes import default_data_dir
 from pdf_notes_reader.notes import load_notes
-from pdf_notes_reader.notes import pdf_key_for_path
+from pdf_notes_reader.notes import pdf_key_for_path, resolve_pdf_key
 from pdf_notes_reader.settings import load_settings
 
 
@@ -51,10 +51,10 @@ class LibraryHistoryTest(GuiTestCase):
 
                 library = load_library(data_dir)
                 folder = next(item for item in library.folders if item.name == "alpha")
-                window.history_panel._assign_entry_folder(pdf_key_for_path(pdf_path), folder.id)
+                window.history_panel._assign_entry_folder(resolve_pdf_key(pdf_path), folder.id)
                 library = load_library(data_dir)
 
-                self.assertEqual(library.assignments[pdf_key_for_path(pdf_path)], folder.id)
+                self.assertEqual(library.assignments[resolve_pdf_key(pdf_path)], folder.id)
                 self.assertTrue(pdf_path.exists())
                 self.assertEqual(window.history_entries[0].path, str(pdf_path.resolve(strict=False)))
             finally:
@@ -89,7 +89,7 @@ class LibraryHistoryTest(GuiTestCase):
 
                 with patch.object(window, "_choose_pdf_files", return_value=[str(pdf_path)]):
                     window.add_planned_notebook(child.id)
-                pdf_key = pdf_key_for_path(pdf_path)
+                pdf_key = resolve_pdf_key(pdf_path)
                 library = load_library(data_dir)
                 self.assertEqual(library.assignments[pdf_key], child.id)
                 self.assertTrue(pdf_path.exists())
@@ -257,7 +257,7 @@ class LibraryHistoryTest(GuiTestCase):
             finally:
                 first_window.close()
 
-            notes = load_notes(pdf_key_for_path(pdf_path))
+            notes = load_notes(resolve_pdf_key(pdf_path))
             note_text_by_id = {note.id: note.markdown for note in notes}
             self.assertEqual(note_text_by_id[first_note_id], "# First edited without manual save\nBody")
             self.assertEqual(note_text_by_id[second_note_id], "# Second left open\nDraft")
@@ -370,7 +370,7 @@ class LibraryHistoryTest(GuiTestCase):
             os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
             pdf_path = tmp_path / "sample.pdf"
             self._create_sample_pdf(pdf_path, page_count=5)
-            pdf_key = pdf_key_for_path(pdf_path)
+            pdf_key = resolve_pdf_key(pdf_path)
             save_history(
                 [
                     PdfHistoryEntry(

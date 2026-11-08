@@ -48,7 +48,7 @@ from pdf_notes_reader.notes import (
     is_annotation,
     load_notes_data,
     notes_path_for_key,
-    pdf_key_for_path,
+    resolve_pdf_key,
     save_notes,
     shows_as_note,
     utc_now,
@@ -72,6 +72,7 @@ from pdf_notes_reader.settings import (
     save_settings,
     themes_dir,
 )
+from pdf_notes_reader.portable import icloud_stub_for, request_cloud_download
 from pdf_notes_reader.storage_migration import migrate_storage
 from pdf_notes_reader.ui.canvas import PdfCanvas
 from pdf_notes_reader.ui.constants import APP_TITLE, EXCERPT_MARKER_COLOR, EXCERPT_MARKER_STYLES, SELECTION_COLOR_SETTINGS, SELECTION_SHORTCUTS
@@ -916,7 +917,11 @@ class MainWindow(QMainWindow):
         return selected[0] if selected else ""
 
     def load_pdf(self, path: Path, *, pdf_key: str | None = None, restore_last_page: bool = True) -> None:
-        key = pdf_key or pdf_key_for_path(path)
+        if not path.exists() and icloud_stub_for(path).exists():
+            request_cloud_download(path)
+            self.statusBar().showMessage(f"{path.name} is in iCloud only; downloading it. Open it again in a moment.", 8000)
+            return
+        key = pdf_key or resolve_pdf_key(path)
         if key in self.pdf_tabs:
             self._activate_pdf_tab(key)
             return
@@ -1038,6 +1043,9 @@ class MainWindow(QMainWindow):
         if path.exists():
             self.load_pdf(path, pdf_key=entry.pdf_key, restore_last_page=True)
             return
+        if entry.in_cloud_only:
+            self.load_pdf(path, pdf_key=entry.pdf_key)  # starts the iCloud download and says so
+            return
 
         answer = QMessageBox.question(
             self,
@@ -1127,7 +1135,7 @@ class MainWindow(QMainWindow):
             progress.setValue(number)
             if progress.wasCanceled():
                 break
-            pdf_key = pdf_key_for_path(path)
+            pdf_key = resolve_pdf_key(path)
             if pdf_key in added or find_history_entry(self.history_entries, pdf_key) is not None:
                 existing += 1
                 continue
@@ -2585,8 +2593,9 @@ class MainWindow(QMainWindow):
         if not request.path.is_file():
             self.statusBar().showMessage(f"The PDF was not found: {request.path}", 8000)
             return False
-        self.load_pdf(request.path)
-        if self.document is None or self.pdf_key != pdf_key_for_path(request.path):
+        key = resolve_pdf_key(request.path)
+        self.load_pdf(request.path, pdf_key=key)
+        if self.document is None or self.pdf_key != key:
             return False
         note = find_note(self.notes, request.note_id) if request.note_id else None
         if note is not None and note.note_type == "excerpt":
