@@ -113,7 +113,7 @@ The outputs are written under `release/`:
 - `PDFNest.app`: the app bundle (for the Mac's own architecture). It declares the `pdfnest://` link scheme and offers itself in Finder's *Open With* menu for PDFs.
 - `PDFNest-<version>-macos-<arch>.dmg`: disk image with the app and an `Applications` shortcut (a `.zip` instead when `hdiutil` is unavailable).
 
-**Installing**: open the `.dmg` and drag PDFNest into Applications. Choose `arm64` for Apple Silicon Macs (M1 and later) and `x86_64` for Intel Macs. The app is ad-hoc signed but not signed with an Apple Developer ID or notarized, so Gatekeeper says it is from an unidentified developer (or that it "is damaged and can't be opened" for downloaded copies). To open it the first time, either:
+**Installing**: open the `.dmg` and drag PDFNest into Applications. Choose `arm64` for Apple Silicon Macs (M1 and later) and `x86_64` for Intel Macs (Apple menu → About This Mac shows which). Both need macOS 14 Sonoma or later (required by Qt 6.12). The app is ad-hoc signed but not signed with an Apple Developer ID or notarized, so Gatekeeper says it is from an unidentified developer (or that it "is damaged and can't be opened" for downloaded copies). To open it the first time, either:
 
 - Control-click PDFNest in Applications → **Open** → **Open** (on macOS 15 and later: try to open it once, then *System Settings → Privacy & Security → Open Anyway*), or
 - remove the download quarantine flag in Terminal:

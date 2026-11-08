@@ -1,3 +1,4 @@
 PySide6>=6.7
-PyMuPDF>=1.24
+# 2.x has no Intel macOS wheels (the release builds an x86_64 Mac app).
+PyMuPDF>=1.24,<2
 Markdown>=3.6
