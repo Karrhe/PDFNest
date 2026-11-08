@@ -41,6 +41,38 @@ def expand_pdf_paths(paths: Iterable[str | Path]) -> list[Path]:
     return result
 
 
+def plan_pdf_import(paths: Iterable[str | Path]) -> list[tuple[Path, tuple[str, ...]]]:
+    """Like ``expand_pdf_paths``, with the library folder path each PDF belongs in.
+
+    A picked or dropped folder becomes a library folder of the same name, and its subfolders become
+    library subfolders, so ``Books/Physics/a.pdf`` added as ``Books`` lands in *Books / Physics*. A PDF
+    picked on its own has an empty folder path (it goes where it was dropped).
+    """
+    result: list[tuple[Path, tuple[str, ...]]] = []
+    seen: set[str] = set()
+    for raw in paths:
+        path = Path(raw)
+        if path.is_dir():
+            base = path.resolve(strict=False)
+            planned = []
+            for candidate in pdfs_in_folder(path):
+                try:
+                    relative_parent = candidate.resolve(strict=False).parent.relative_to(base)
+                except ValueError:
+                    relative_parent = Path()
+                planned.append((candidate, (base.name or str(base), *relative_parent.parts)))
+        elif is_pdf_file(path):
+            planned = [(path, ())]
+        else:
+            planned = []
+        for candidate, folder_parts in planned:
+            key = os.path.normcase(str(candidate.resolve(strict=False)))
+            if key not in seen:
+                seen.add(key)
+                result.append((candidate, folder_parts))
+    return result
+
+
 def pdf_page_count(path: Path) -> int:
     """The page count, or 0 when the file cannot be opened (it can still be added and opened later)."""
     try:

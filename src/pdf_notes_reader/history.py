@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from pdf_notes_reader.notes import default_data_dir, notebook_dir_for_pdf, pdf_key_for_path, root_sync_lock_path, utc_now
 from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock, read_json_checked
-from pdf_notes_reader.notes import _LOCATOR_CACHE, _absorb_conflicts, _dict_list, read_manifest
+from pdf_notes_reader.notes import _LOCATOR_CACHE, _absorb_conflicts, _dict_list, machine_id, read_manifest
 from pdf_notes_reader.portable import ensure_local, icloud_stub_for, merge_records, portable_relpath, record_stamps
 
 
@@ -26,6 +26,9 @@ class PdfHistoryEntry:
     # ``path`` relative to the data folder (``/`` separators): finds the PDF on another computer that
     # shares the data folder through iCloud Drive, OneDrive or Dropbox. Empty on another drive.
     rel_path: str = ""
+    # Where each computer sharing the data folder keeps this PDF: machine id -> absolute path. The
+    # book (notes, cover, reading position) is the same everywhere; only its file location differs.
+    machine_paths: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PdfHistoryEntry":
@@ -42,6 +45,7 @@ class PdfHistoryEntry:
             zoom=normalize_zoom(data.get("zoom")),
             fit_mode=normalize_fit_mode(data.get("fit_mode")),
             rel_path=str(data.get("rel_path") or ""),
+            machine_paths=_clean_machine_paths(data.get("machine_paths")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -52,9 +56,38 @@ class PdfHistoryEntry:
         return Path(self.path).exists()
 
     @property
+    def located_here(self) -> bool:
+        """Whether this computer has been told where the PDF is (opened, added or relocated here)."""
+        return machine_id() in self.machine_paths
+
+    @property
     def in_cloud_only(self) -> bool:
         """The PDF is an iCloud ``.name.icloud`` stub: present, but not downloaded to this computer."""
         return not self.exists and icloud_stub_for(self.path).exists()
+
+
+def _clean_machine_paths(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): str(path) for key, path in value.items() if str(key) and str(path)}
+
+
+def _combine_machine_paths(merged: list[dict[str, Any]], *sources: list[dict[str, Any]]) -> None:
+    """Each computer's path survives a merge, whichever computer's copy of the entry won:
+    this computer's own path comes from ``sources[0]`` (ours), the others' from the rest."""
+    me = machine_id()
+    by_key: dict[str, dict[str, str]] = {}
+    for source in reversed(sources):  # ours last, so it wins
+        for item in source:
+            paths = by_key.setdefault(str(item.get("pdf_key")), {})
+            paths.update(_clean_machine_paths(item.get("machine_paths")))
+    ours = {str(item.get("pdf_key")): _clean_machine_paths(item.get("machine_paths")) for item in sources[0]} if sources else {}
+    for item in merged:
+        key = str(item.get("pdf_key"))
+        paths = dict(by_key.get(key, {}))
+        if me in ours.get(key, {}):
+            paths[me] = ours[key][me]
+        item["machine_paths"] = dict(sorted(paths.items()))
 
 
 def history_path(data_dir: Path | None = None) -> Path:
@@ -108,12 +141,40 @@ def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
 _HISTORY_BASES: dict[str, dict[str, str]] = {}
 
 
+def reload_history_into(entries: list[PdfHistoryEntry], data_dir: Path | None = None) -> bool:
+    """Merges books the other computer added, removed or read further in into ``entries`` (in place),
+    without writing anything. Returns whether ``entries`` changed."""
+    path = history_path(data_dir)
+    if not path.exists():
+        return False
+    on_disk = read_json_checked(path)
+    disk_entries = _dict_list(on_disk.get("entries") if isinstance(on_disk, dict) else on_disk)
+    ours = [entry.to_dict() for entry in entries]
+    merged = merge_records(ours, disk_entries, base=_HISTORY_BASES.get(str(path)), key="pdf_key")
+    _combine_machine_paths(merged, ours, disk_entries)
+    _HISTORY_BASES[str(path)] = record_stamps(merged, key="pdf_key")
+    if merged == ours:
+        return False
+    root = data_dir or default_data_dir()
+    updated = [PdfHistoryEntry.from_dict(item) for item in merged]
+    for entry in updated:
+        resolve_entry_path(entry, root)
+    entries[:] = sorted(updated, key=lambda item: item.updated_at, reverse=True)
+    return True
+
+
 def resolve_entry_path(entry: PdfHistoryEntry, data_dir: Path) -> None:
     """Points ``entry.path`` at the PDF on this computer, which may not be the one that recorded it.
 
-    ``path`` is absolute and only valid where it was written (a ``C:`` path means nothing on a Mac);
-    ``rel_path`` is relative to the shared data folder, so it finds the same file in the cloud drive.
+    In order: the path this computer recorded (``machine_paths``); the path relative to the shared
+    data folder (``rel_path``), for a PDF that is in the cloud drive too; ``path`` as written by
+    whichever computer saved last. When none exists, the user is asked to locate the file once.
     """
+    own = entry.machine_paths.get(machine_id())
+    if own:
+        entry.path = own
+        if Path(own).exists():
+            return
     if not entry.rel_path:
         return
     try:
@@ -143,6 +204,8 @@ def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *
     on_disk = read_json_checked(path)
     disk_entries = _dict_list(on_disk.get("entries") if isinstance(on_disk, dict) else on_disk)
     merged = merge_records(ours, disk_entries, base=_HISTORY_BASES.get(base_key), key="pdf_key") if disk_entries else ours
+    if disk_entries:
+        _combine_machine_paths(merged, ours, disk_entries)
     _HISTORY_BASES[base_key] = record_stamps(ours, key="pdf_key")
     if merged != ours:
         updated = [PdfHistoryEntry.from_dict(item) for item in merged]
@@ -243,10 +306,12 @@ def upsert_history_entry(
             last_note_id=str(last_note_id or ""),
             zoom=normalize_zoom(zoom),
             fit_mode=normalize_fit_mode(fit_mode),
+            machine_paths={machine_id(): absolute_path},
         )
         entries.append(entry)
     else:
         entry.path = absolute_path
+        entry.machine_paths[machine_id()] = absolute_path
         entry.title = Path(absolute_path).name
         entry.page_count = max(0, page_count)
         entry.last_page_index = max(0, min(last_page_index, max(page_count - 1, 0)))

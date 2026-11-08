@@ -4,8 +4,8 @@ import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
-from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QFont, QKeyEvent
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QDropEvent, QFont, QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QComboBox, QPushButton, QSplitter, QWidget
 from PySide6.QtWidgets import QMessageBox
@@ -155,11 +155,11 @@ class LibraryHistoryTest(GuiTestCase):
                     for index in range(root_item.childCount())
                     if root_item.child(index).data(0, Qt.UserRole) == parent.id
                 )
-                target_pos = window.history_panel.folder_tree.viewport().mapToGlobal(
-                    window.history_panel.folder_tree.visualItemRect(parent_item).center()
-                )
-                window.history_panel._start_entry_drag(row_widget, pdf_key)
-                window.history_panel._finish_entry_drag(target_pos)
+                # Dropping a dragged book (QDrag carries its key) onto a folder files it there.
+                target_pos = QPointF(window.history_panel.folder_tree.visualItemRect(parent_item).center())
+                drag_mime = window.history_panel.entry_drag_mime(pdf_key)  # kept alive: QDropEvent does not own it
+                drop = QDropEvent(target_pos, Qt.MoveAction, drag_mime, Qt.LeftButton, Qt.NoModifier)
+                window.history_panel.folder_tree.dropEvent(drop)
                 self.assertEqual(load_library(data_dir).assignments[pdf_key], parent.id)
                 window.history_panel._assign_entry_folder(pdf_key, child.id)
                 self.assertEqual(

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QLabel, QSizePolicy, QTreeWidget
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen
+from PySide6.QtWidgets import QLabel, QSizePolicy, QTreeWidget, QTreeWidgetItem
 
 
 class ElidedLabel(QLabel):
@@ -36,11 +36,69 @@ class ElidedLabel(QLabel):
         super().setText(self.fontMetrics().elidedText(self._full_text, self._elide_mode, available_width))
 
 
+PDF_KEY_MIME_TYPE = "application/x-pdfnest-pdf-key"
+
+
 class LibraryFolderTree(QTreeWidget):
-    folder_drop_requested = Signal(str, str)
+    """The library's folder list. Library books dragged onto a folder are filed there."""
+
+    folder_drop_requested = Signal(str, str)  # pdf key, folder id ("" for the top level = unfiled)
 
     def __init__(self) -> None:
         super().__init__()
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self._drop_hover_item: QTreeWidgetItem | None = None
+
+    @staticmethod
+    def dragged_pdf_key(event) -> str:
+        mime = event.mimeData()
+        if mime is None or not mime.hasFormat(PDF_KEY_MIME_TYPE):
+            return ""
+        return bytes(mime.data(PDF_KEY_MIME_TYPE)).decode("utf-8", "replace").strip()
+
+    def _set_drop_hover(self, item: QTreeWidgetItem | None) -> None:
+        if item is self._drop_hover_item:
+            return
+        if self._drop_hover_item is not None:
+            try:
+                self._drop_hover_item.setBackground(0, QBrush())
+            except RuntimeError:  # the item was rebuilt meanwhile
+                pass
+        self._drop_hover_item = item
+        if item is not None:
+            item.setBackground(0, QBrush(self.palette().highlight().color().lighter(150)))
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self.dragged_pdf_key(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()  # files from Explorer/Finder: the library panel handles those
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if not self.dragged_pdf_key(event):
+            event.ignore()
+            return
+        item = self.itemAt(event.position().toPoint())
+        self._set_drop_hover(item)
+        if item is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._set_drop_hover(None)
+        event.accept()
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        pdf_key = self.dragged_pdf_key(event)
+        item = self.itemAt(event.position().toPoint())
+        self._set_drop_hover(None)
+        if not pdf_key or item is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.folder_drop_requested.emit(pdf_key, str(item.data(0, Qt.UserRole) or ""))
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().paintEvent(event)

@@ -2,6 +2,25 @@
 
 All notable changes to PDFNest. Issue IDs refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
+## 0.3.3 — 2026-11-08
+
+### Added
+- Books keep one path per computer: a book added on the PC shows on the Mac with its cover, notes and reading
+  position, and is located there once (double-click, *Locate PDF on this computer…*, or adding the file),
+  without changing where the PC finds it.
+- Adding a folder builds the same folder tree in the library and files each PDF into its subfolder.
+- Drag a book onto a folder in the Folders sidebar (a real drag with a picture of the row; the sidebar appears
+  while dragging, also from Recent).
+- `D` on Home moves the selected book to the Archive, like `Delete`.
+- Touchpad pinch zoom on macOS; smooth pinch zoom on Windows precision touchpads.
+
+### Fixed
+- Left / Right arrows did not turn pages after clicking in the PDF (the scroll area took them).
+- Library folders, filing, renames and the archive (`library.json`) are merged with the other computer's
+  changes instead of overwritten; the open window picks up the other computer's books when it is activated.
+- Settings → Storage showed the data folder twice and repeated it in every path below; files inside the
+  data folder are now shown relative to it.
+
 ## 0.3.2 — 2026-11-08
 
 ### Added

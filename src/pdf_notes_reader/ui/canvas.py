@@ -10,6 +10,15 @@ from pdf_notes_reader.notes import Note
 from pdf_notes_reader.ui.constants import ANNOTATION_COLORS, EXCERPT_MARKER_COLOR, EXCERPT_MARKER_STYLES
 
 
+def wheel_zoom_delta(event) -> float:
+    """Zoom change for a Ctrl+wheel event: 0.1 per mouse-wheel notch, proportionally less for the many
+    small steps of a touchpad pinch (Windows precision touchpads send pinches as Ctrl+wheel)."""
+    steps = event.angleDelta().y() / 120.0
+    if not steps:
+        steps = event.pixelDelta().y() / 240.0
+    return max(-0.25, min(0.25, steps * 0.1))
+
+
 class PdfCanvas(QWidget):
     add_note_requested = Signal(int, float, float)
     append_selection_requested = Signal(int, list, str)
@@ -406,7 +415,9 @@ class PdfCanvas(QWidget):
 
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.modifiers() & Qt.ControlModifier:
-            self.zoom_requested.emit(0.1 if event.angleDelta().y() > 0 else -0.1)
+            delta = wheel_zoom_delta(event)
+            if delta:
+                self.zoom_requested.emit(delta)
             event.accept()
             return
         super().wheelEvent(event)

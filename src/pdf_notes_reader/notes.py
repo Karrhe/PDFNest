@@ -250,6 +250,35 @@ def machine_settings_path() -> Path:
     return storage_pointer_path().parent / "machine_settings.json"
 
 
+_MACHINE_IDS: dict[str, str] = {}
+
+
+def machine_id() -> str:
+    """A random id for this computer, kept beside the data-folder pointer (never in the synced data).
+
+    Library entries remember the PDF's path per computer under this id, so a Mac and a PC sharing a
+    data folder can each keep the book wherever they like.
+    """
+    path = storage_pointer_path().parent / "machine_id.txt"
+    cached = _MACHINE_IDS.get(str(path))
+    if cached:
+        return cached
+    value = ""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    if not re.fullmatch(r"[0-9a-f]{32}", value):
+        value = uuid.uuid4().hex
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n", encoding="utf-8")
+        except OSError:
+            pass  # still unique for this run
+    _MACHINE_IDS[str(path)] = value
+    return value
+
+
 def _read_storage_pointer() -> Path | None:
     path = storage_pointer_path()
     if not path.exists():

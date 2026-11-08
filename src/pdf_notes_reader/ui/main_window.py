@@ -13,8 +13,12 @@ import fitz
 from PySide6.QtCore import QEvent, QSize, Qt, QSignalBlocker, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QAbstractSpinBox,
     QApplication,
     QComboBox,
+    QPlainTextEdit,
+    QTextEdit,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -36,8 +40,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from pdf_notes_reader.history import find_history_entry, load_history, remove_history_entry, save_history, upsert_history_entry
-from pdf_notes_reader.library import UNFILED_FOLDER_ID, load_library, save_library
+from pdf_notes_reader.history import (
+    find_history_entry,
+    history_path,
+    load_history,
+    reload_history_into,
+    remove_history_entry,
+    save_history,
+    upsert_history_entry,
+)
+from pdf_notes_reader.library import UNFILED_FOLDER_ID, ensure_folder_path, library_path, load_library, save_library
 from pdf_notes_reader.notes import (
     Bookmark,
     Note,
@@ -46,6 +58,7 @@ from pdf_notes_reader.notes import (
     drain_storage_issues,
     find_note,
     is_annotation,
+    machine_id,
     load_notes_data,
     notes_path_for_key,
     resolve_pdf_key,
@@ -74,7 +87,7 @@ from pdf_notes_reader.settings import (
 )
 from pdf_notes_reader.portable import icloud_stub_for, request_cloud_download
 from pdf_notes_reader.storage_migration import migrate_storage
-from pdf_notes_reader.ui.canvas import PdfCanvas
+from pdf_notes_reader.ui.canvas import PdfCanvas, wheel_zoom_delta
 from pdf_notes_reader.ui.constants import APP_TITLE, EXCERPT_MARKER_COLOR, EXCERPT_MARKER_STYLES, SELECTION_COLOR_SETTINGS, SELECTION_SHORTCUTS
 from pdf_notes_reader.ui.find_bar import FindBar
 from pdf_notes_reader.ui.history_panel import HistoryPanel
@@ -90,7 +103,7 @@ from pdf_notes_reader.pdf.text import page_words
 from pdf_notes_reader.services.chapters import ChapterLookup, counter_key, location_label, single_line_title
 from pdf_notes_reader.services.annotation_summary import group_annotations, summary_markdown
 from pdf_notes_reader.services.export import ExportError, export_note_markdown, safe_filename
-from pdf_notes_reader.services.library_import import expand_pdf_paths, pdf_page_count
+from pdf_notes_reader.services.library_import import pdf_page_count, plan_pdf_import
 from pdf_notes_reader.services.url_scheme import set_registered as set_pdfnest_links_registered
 from pdf_notes_reader.services.obsidian import (
     SyncReport,
@@ -231,6 +244,16 @@ class MainWindow(QMainWindow):
         self.scroll_area.viewport().setObjectName("ReaderViewport")
         self.scroll_area.viewport().setAutoFillBackground(True)
         self.scroll_area.viewport().installEventFilter(self)
+        # Arrow keys, pinch zoom and Home shortcuts must work whichever child has focus: the reader's
+        # QScrollArea would otherwise take Left/Right for horizontal scrolling.
+        self._pending_zoom_delta = 0.0
+        self._zoom_gesture_timer = QTimer(self)
+        self._zoom_gesture_timer.setSingleShot(True)
+        self._zoom_gesture_timer.setInterval(30)
+        self._zoom_gesture_timer.timeout.connect(self._apply_pending_zoom)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._sync_current_page_from_scroll)
 
         self.note_panel = NotePanel()
@@ -335,6 +358,7 @@ class MainWindow(QMainWindow):
         self.history_panel = HistoryPanel()
         self.history_panel.open_requested.connect(self.open_history_entry)
         self.history_panel.archive_requested.connect(self.archive_history_entry)
+        self.history_panel.locate_requested.connect(self.locate_history_entry)
         self.history_panel.remove_requested.connect(self.remove_history_entry)
         self.history_panel.export_requested.connect(self.export_history_entry_notes)
         self.history_panel.add_notebook_requested.connect(self.add_planned_notebook)
@@ -1016,7 +1040,7 @@ class MainWindow(QMainWindow):
         self._clear_current_pdf_state()
 
     def _record_current_pdf(self) -> None:
-        if self.document is None or self.pdf_path is None or self.pdf_key is None:
+        if self.document is None or self.pdf_path is None or self.pdf_key is None or getattr(self, "_closed", False):
             return
         current_note_id = self.note_panel.current_note_id
         if current_note_id is not None and find_note(self.notes, current_note_id) is None:
@@ -1047,17 +1071,25 @@ class MainWindow(QMainWindow):
             self.load_pdf(path, pdf_key=entry.pdf_key)  # starts the iCloud download and says so
             return
 
-        answer = QMessageBox.question(
-            self,
-            "PDF file not found",
-            "This PDF path no longer exists. Relocate it?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
+        if entry.located_here:
+            question = f"The PDF was moved or deleted:\n{entry.path}\n\nLocate it?"
+        else:
+            question = (
+                "This book's PDF is not on this computer yet (it was added on another computer).\n\n"
+                "Locate the PDF here? Its notes, highlights and reading position stay with the book."
+            )
+        answer = QMessageBox.question(self, "Locate PDF", question, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
         if answer != QMessageBox.Yes:
             return
+        self.locate_history_entry(pdf_key)
 
-        filename = self._choose_pdf_file("Relocate PDF")
+    def locate_history_entry(self, pdf_key: str) -> None:
+        """Lets the user pick this book's PDF on this computer. The path is remembered for this
+        computer only, so the other computers sharing the data folder keep theirs."""
+        entry = find_history_entry(self.history_entries, pdf_key)
+        if entry is None:
+            return
+        filename = self._choose_pdf_file(f"Locate {entry.title or 'PDF'}")
         if filename:
             self.load_pdf(Path(filename), pdf_key=entry.pdf_key, restore_last_page=True)
 
@@ -1115,29 +1147,46 @@ class MainWindow(QMainWindow):
         self.add_pdfs_to_library([folder], folder_id)
 
     def add_pdfs_to_library(self, paths: list[str] | list[Path], folder_id: str = "") -> tuple[int, int]:
-        """Add PDF files (folders are searched for PDFs) to the library, into ``folder_id`` when that is a
-        library folder. Books already in the library keep their reading position and folder.
+        """Add PDF files to the library, into ``folder_id`` when that is a library folder.
+
+        A folder (picked or dropped) is added with its structure: it becomes a library folder of the
+        same name, its subfolders become subfolders, and each PDF goes into the one matching its disk
+        folder. Books already in the library keep their reading position; one that is still unfiled
+        moves into its folder, one already filed elsewhere stays there.
         Returns (added, already in the library)."""
-        pdf_paths = expand_pdf_paths(paths)
-        if not pdf_paths:
+        planned = plan_pdf_import(paths)
+        if not planned:
             self.statusBar().showMessage("No PDF files found.", 4000)
             return 0, 0
 
         library = load_library()
         target_folder = folder_id if folder_id and folder_id != UNFILED_FOLDER_ID and folder_id in {folder.id for folder in library.folders} else ""
-        progress = QProgressDialog("Adding PDFs to the library…", "Stop", 0, len(pdf_paths), self)
+        progress = QProgressDialog("Adding PDFs to the library…", "Stop", 0, len(planned), self)
         progress.setWindowTitle("Add PDFs")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(500)
         added: set[str] = set()
+        located: set[str] = set()
         existing = 0
-        for number, path in enumerate(pdf_paths):
+        library_changed = False
+        for number, (path, folder_parts) in enumerate(planned):
             progress.setValue(number)
             if progress.wasCanceled():
                 break
             pdf_key = resolve_pdf_key(path)
-            if pdf_key in added or find_history_entry(self.history_entries, pdf_key) is not None:
+            destination = ensure_folder_path(library, target_folder, folder_parts) if folder_parts else target_folder
+            library_changed = library_changed or bool(folder_parts)
+            known = find_history_entry(self.history_entries, pdf_key)
+            if pdf_key in added or known is not None:
                 existing += 1
+                if known is not None and not known.exists:
+                    # The book came from another computer (or moved): this is its file here.
+                    known.path = str(Path(path).expanduser().resolve(strict=False))
+                    known.machine_paths[machine_id()] = known.path
+                    located.add(pdf_key)
+                if destination and pdf_key not in library.assignments:
+                    library.assignments[pdf_key] = destination
+                    library_changed = True
                 continue
             upsert_history_entry(
                 self.history_entries,
@@ -1149,15 +1198,17 @@ class MainWindow(QMainWindow):
                 fit_mode="",
             )
             added.add(pdf_key)
-            if target_folder:
-                library.assignments[pdf_key] = target_folder
-        progress.setValue(len(pdf_paths))
+            if destination:
+                library.assignments[pdf_key] = destination
+                library_changed = True
+        progress.setValue(len(planned))
         progress.close()
 
-        if added:
-            save_history(self.history_entries, touched_pdf_keys=added)
-            if target_folder:
-                save_library(library)
+        if added or located:
+            save_history(self.history_entries, touched_pdf_keys=added | located)
+        if library_changed:
+            save_library(library)
+        if added or located or library_changed:
             self.history_panel.set_entries(self.history_entries)
         message = f"Added {len(added)} PDF{'s' if len(added) != 1 else ''} to the library."
         if existing:
@@ -1222,8 +1273,32 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Exported {exported} Markdown notes.", 5000)
         self._report_export_errors()
 
+    def _library_files_stamp(self) -> tuple[int, int]:
+        stamps = []
+        for path in (history_path(), library_path()):
+            try:
+                stamps.append(path.stat().st_mtime_ns)
+            except OSError:
+                stamps.append(0)
+        return stamps[0], stamps[1]
+
+    def refresh_library_from_disk(self, *, force: bool = False) -> bool:
+        """Picks up books, folders, archive changes and reading positions saved by the other computer
+        that shares the data folder (iCloud Drive, OneDrive, Dropbox). Writes nothing."""
+        if not hasattr(self, "history_panel"):
+            return False
+        stamp = self._library_files_stamp()
+        if not force and stamp == getattr(self, "_library_stamp_seen", None):
+            return False
+        reload_history_into(self.history_entries)
+        self._library_stamp_seen = stamp
+        if self.main_stack.currentWidget() is self.history_panel or force:
+            self.history_panel.set_entries(self.history_entries)
+        return True
+
     def show_home(self) -> None:
         self._save_active_pdf_tab_state()
+        self.refresh_library_from_disk()
         self.history_panel.set_entries(self.history_entries)
         self.main_stack.setCurrentWidget(self.history_panel)
         self._refresh_document_chrome()
@@ -1872,7 +1947,7 @@ class MainWindow(QMainWindow):
         canvas.annotation_note_remove_requested.connect(lambda note_id: self.remove_annotation_note(note_id, confirm=True))
         canvas.reset_note_counters_requested.connect(self.reset_note_counters_to_current_notes)
         canvas.settings_requested.connect(self.open_settings)
-        canvas.zoom_requested.connect(self.change_zoom)
+        canvas.zoom_requested.connect(self.queue_zoom)
         return canvas
 
     def _render_empty_state(self) -> None:
@@ -3268,17 +3343,96 @@ class MainWindow(QMainWindow):
         self._schedule_fit_refresh(anchor_page=self.page_index)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
-        if hasattr(self, "page_spin") and watched is self.page_spin and event.type() == QEvent.FocusOut:
+        event_type = event.type()
+        if event_type == QEvent.KeyPress and self._handle_window_key(watched, event):
+            return True
+        if event_type == QEvent.WindowActivate and watched is self:
+            # Coming back to PDFNest (for example after the other computer synced): show its changes.
+            QTimer.singleShot(0, self.refresh_library_from_disk)
+        if event_type == QEvent.NativeGesture and self._handle_native_gesture(watched, event):
+            return True
+        if hasattr(self, "page_spin") and watched is self.page_spin and event_type == QEvent.FocusOut:
             self.reset_page_number_input()
         if hasattr(self, "scroll_area") and watched is self.scroll_area.viewport():
-            if event.type() == QEvent.Resize:
+            if event_type == QEvent.Resize:
                 self._schedule_fit_refresh(anchor_page=self.page_index)
-            elif event.type() == QEvent.Wheel:
+            elif event_type == QEvent.Wheel:
                 if event.modifiers() & Qt.ControlModifier:
-                    self.change_zoom(0.1 if event.angleDelta().y() > 0 else -0.1)
+                    self.queue_zoom(wheel_zoom_delta(event))
                     event.accept()
                     return True
         return super().eventFilter(watched, event)
+
+    def _owns_widget(self, widget) -> bool:
+        return isinstance(widget, QWidget) and widget.window() is self
+
+    @staticmethod
+    def _is_text_or_list_input(widget) -> bool:
+        """Widgets that use the arrow and letter keys themselves."""
+        return isinstance(widget, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox, QAbstractItemView))
+
+    def _handle_window_key(self, watched, event) -> bool:
+        """Left/Right turn pages in the reader; D or Delete moves the selected PDF to the archive on Home."""
+        if not hasattr(self, "note_panel") or not self._owns_widget(watched) or QApplication.activeModalWidget() is not None:
+            return False
+        if self._is_text_or_list_input(watched) or self._is_text_or_list_input(watched.parentWidget()):
+            return False  # the key goes to a text field or list (or a spin box's inner editor)
+        focus = QApplication.focusWidget()
+        if focus is not None and (not self._owns_widget(focus) or self._is_text_or_list_input(focus)):
+            return False
+        if focus is not None and (focus is self.note_panel or self.note_panel.isAncestorOf(focus)):
+            return False
+        key = event.key()
+        modifiers = event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
+        current = self.main_stack.currentWidget()
+        if current is self.history_panel:
+            if key in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace) and modifiers in (Qt.NoModifier, Qt.ShiftModifier):
+                pdf_key = self.history_panel.selected_pdf_key
+                if not pdf_key or (key == Qt.Key_D and modifiers != Qt.NoModifier):
+                    return False
+                if modifiers == Qt.ShiftModifier:
+                    self.remove_history_entry(pdf_key)
+                elif pdf_key not in self.history_panel.library_state.archived:
+                    self.archive_history_entry(pdf_key)
+                return True
+            return False
+        if current is self.reader_splitter and self.document is not None and modifiers == Qt.NoModifier:
+            if key == Qt.Key_Left:
+                self.previous_page()
+                return True
+            if key == Qt.Key_Right:
+                self.next_page()
+                return True
+        return False
+
+    def _handle_native_gesture(self, watched, event) -> bool:
+        """A trackpad pinch on macOS arrives as a native zoom gesture, not as Ctrl+wheel."""
+        if self.document is None or not isinstance(watched, QWidget) or not hasattr(self, "scroll_area"):
+            return False
+        if watched is not self.scroll_area and not self.scroll_area.isAncestorOf(watched):
+            return False
+        if event.gestureType() == Qt.ZoomNativeGesture:
+            self.queue_zoom(self.zoom * float(event.value()))
+            event.accept()
+            return True
+        return False
+
+    def queue_zoom(self, delta: float) -> None:
+        """Zooms by ``delta``. The first step of a burst applies at once (a mouse-wheel notch); the many
+        small steps of a touchpad pinch that follow are added up and rendered every 30 ms."""
+        if self.document is None or not delta:
+            return
+        if self._zoom_gesture_timer.isActive():
+            self._pending_zoom_delta += delta
+            return
+        self.change_zoom(delta)
+        self._zoom_gesture_timer.start()
+
+    def _apply_pending_zoom(self) -> None:
+        delta, self._pending_zoom_delta = self._pending_zoom_delta, 0.0
+        if abs(delta) >= 0.005:
+            self.change_zoom(delta)
+            self._zoom_gesture_timer.start()  # keep coalescing while the pinch goes on
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
         focus = QApplication.focusWidget()
@@ -3386,4 +3540,11 @@ class MainWindow(QMainWindow):
         self._worker_poll_timer.stop()
         self._worker_jobs.clear()
         self.render_workers.shutdown()
+        # A closed window must not keep filtering every event of the application or save anything.
+        self._closed = True
+        self._zoom_gesture_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+            app.removeEventFilter(self.history_panel)
         super().closeEvent(event)

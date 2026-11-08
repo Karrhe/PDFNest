@@ -221,8 +221,16 @@ def test_name_fallback_ignores_old_notebook_whose_pdf_exists_here(tmp_path) -> N
 # --- Library / history ----------------------------------------------------------------------------
 
 
-def test_history_entry_resolves_on_the_other_machine(machines) -> None:
+def as_computer(monkeypatch, name: str) -> None:
+    """Both simulated computers run in this one process; give each its own machine id."""
+    import pdf_notes_reader.history as history_module
+
+    monkeypatch.setattr(history_module, "machine_id", lambda: name)
+
+
+def test_history_entry_resolves_on_the_other_machine(machines, monkeypatch) -> None:
     pc, mac = machines
+    as_computer(monkeypatch, "pc")
     pc_data, mac_data = pc / "PDFNest", mac / "PDFNest"
     key = resolve_pdf_key(pc / "Books" / "a.pdf", pc_data)
     entries = []
@@ -230,6 +238,7 @@ def test_history_entry_resolves_on_the_other_machine(machines) -> None:
     save_history(entries, pc_data)
     sync(pc, mac)
 
+    as_computer(monkeypatch, "mac")
     [entry] = load_history(mac_data)
     assert entry.pdf_key == key
     assert entry.rel_path == "../Books/a.pdf"
@@ -238,8 +247,9 @@ def test_history_entry_resolves_on_the_other_machine(machines) -> None:
     assert entry.last_page_index == 2 and entry.zoom == 1.5
 
 
-def test_history_save_keeps_books_added_on_the_other_machine(machines) -> None:
+def test_history_save_keeps_books_added_on_the_other_machine(machines, monkeypatch) -> None:
     pc, mac = machines
+    as_computer(monkeypatch, "pc")
     pc_data, mac_data = pc / "PDFNest", mac / "PDFNest"
     pdf_factory.create_sample_pdf(pc / "Books" / "b.pdf", page_count=2)
     key_a = resolve_pdf_key(pc / "Books" / "a.pdf", pc_data)
@@ -247,13 +257,16 @@ def test_history_save_keeps_books_added_on_the_other_machine(machines) -> None:
     upsert_history_entry(pc_entries, pdf_key=key_a, path=pc / "Books" / "a.pdf", page_count=3, last_page_index=0)
     save_history(pc_entries, pc_data)
     sync(pc, mac)
+    as_computer(monkeypatch, "mac")
     mac_entries = load_history(mac_data)
 
     # The PC adds b.pdf; then the Mac, still holding its old list, records reading a.pdf.
     key_b = resolve_pdf_key(pc / "Books" / "b.pdf", pc_data)
+    as_computer(monkeypatch, "pc")
     upsert_history_entry(pc_entries, pdf_key=key_b, path=pc / "Books" / "b.pdf", page_count=2, last_page_index=1)
     save_history(pc_entries, pc_data)
     sync(pc, mac)
+    as_computer(monkeypatch, "mac")
     upsert_history_entry(mac_entries, pdf_key=key_a, path=mac / "Books" / "a.pdf", page_count=3, last_page_index=2)
     save_history(mac_entries, mac_data)
 
@@ -454,3 +467,49 @@ def test_machine_settings_stay_on_this_computer(tmp_path) -> None:
     assert fresh["obsidian_vault_dir"] == ""
     assert fresh["last_pdf_dir"] == ""
     assert fresh["window_width"] == 900
+
+
+# --- Each computer keeps its own path to the PDF -------------------------------------------------
+
+
+def test_each_computer_keeps_its_own_pdf_path(tmp_path, monkeypatch) -> None:
+    """The PDF lives in a different, unsynced place on each computer; the user locates it once there."""
+    import pdf_notes_reader.history as history_module
+
+    shared = tmp_path / "cloud" / "PDFNest"
+    pc_pdf = tmp_path / "pc-disk" / "Books" / "a.pdf"
+    mac_pdf = tmp_path / "mac-disk" / "Downloads" / "renamed.pdf"
+    for pdf in (pc_pdf, mac_pdf):
+        pdf.parent.mkdir(parents=True)
+    pdf_factory.create_sample_pdf(pc_pdf, page_count=3)
+    shutil.copy2(pc_pdf, mac_pdf)
+
+    monkeypatch.setattr(history_module, "machine_id", lambda: "pc")
+    key = resolve_pdf_key(pc_pdf, shared)
+    pc_entries = []
+    upsert_history_entry(pc_entries, pdf_key=key, path=pc_pdf, page_count=3, last_page_index=1)
+    save_history(pc_entries, shared)
+
+    monkeypatch.setattr(history_module, "machine_id", lambda: "mac")
+    shutil.move(str(tmp_path / "pc-disk"), str(tmp_path / "pc-disk-hidden"))  # the Mac cannot see the PC's disk
+    [entry] = load_history(shared)
+    assert not entry.exists and not entry.located_here  # shown as "locate it", with notes and cover
+    mac_entries = [entry]
+    # The user locates the file; the same book (same key) now has the Mac's path too.
+    assert resolve_pdf_key(mac_pdf, shared) == key
+    upsert_history_entry(mac_entries, pdf_key=key, path=mac_pdf, page_count=3, last_page_index=2)
+    save_history(mac_entries, shared)
+
+    shutil.move(str(tmp_path / "pc-disk-hidden"), str(tmp_path / "pc-disk"))
+    monkeypatch.setattr(history_module, "machine_id", lambda: "pc")
+    [on_pc] = load_history(shared)
+    assert Path(on_pc.path) == pc_pdf.resolve()  # the Mac's relocation did not break the PC
+    assert on_pc.last_page_index == 2  # but its reading position came along
+    assert set(on_pc.machine_paths) == {"pc", "mac"}
+
+    # The PC saves its stale list again: the Mac's path survives the merge.
+    upsert_history_entry(pc_entries, pdf_key=key, path=pc_pdf, page_count=3, last_page_index=2)
+    save_history(pc_entries, shared)
+    monkeypatch.setattr(history_module, "machine_id", lambda: "mac")
+    [on_mac] = load_history(shared)
+    assert Path(on_mac.path) == mac_pdf.resolve()

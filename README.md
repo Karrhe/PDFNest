@@ -34,7 +34,9 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Save note anchors/content in external JSON files without modifying the original PDF.
 - Export individual notes as Markdown files to a selectable local folder.
 - Reopen known PDFs from the Home history page.
-- Add books to the library without opening them: the Home **+** button offers *Add PDF files…* (pick several at once with `Ctrl`/`Shift`+click) and *Add all PDFs in a folder…* (subfolders included; hidden folders such as `.trash` are skipped). You can also drag PDFs or folders from Explorer onto Home, or onto a library folder in Notebooks. New books go into the open Notebooks folder; books already in the library keep their reading position and folder.
+- Add books to the library without opening them: the Home **+** button offers *Add PDF files…* (pick several at once with `Ctrl`/`Shift`+click) and *Add all PDFs in a folder…* (subfolders included; hidden folders such as `.trash` are skipped). You can also drag PDFs or folders from Explorer or Finder onto Home, or onto a library folder in Notebooks. A folder is added with its structure: `Books/Physics/a.pdf` added as `Books` lands in the library folder *Books / Physics*, created as needed (adding it again reuses the same folders). Loose PDFs go into the open Notebooks folder. Books already in the library keep their reading position; an unfiled one moves into its folder.
+- Drag a book from the Home list or grid onto a folder in the Folders sidebar to file it there; drop it on the top entry to take it out of its folder. The sidebar appears while you drag, also from Recent.
+- On Home, `D` or `Delete` (`Backspace` on a Mac) moves the selected book to the Archive (the bin button); `Shift+Delete` removes it from the library. Typing in the search field is not affected.
 - Open, Add and Relocate use the standard Windows file dialog and start in the folder you used last.
 - Restore the last-read page when opening a PDF again.
 - Prompt for relocation when a PDF history item points to a missing absolute path.
@@ -83,13 +85,13 @@ For end-user distribution on Windows, build the executable package with PyInstal
 .\scripts\build_windows_exe.ps1
 ```
 
-Pushing a tag such as `v0.3.2` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
+Pushing a tag such as `v0.3.3` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
 
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.3.2-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.3.2-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.3.3-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.3.3-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
@@ -98,14 +100,14 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 
 PyInstaller cannot cross-compile, so the Mac app is built on a Mac or by GitHub Actions.
 
-**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.2` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
+**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.3` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
 
 **On a Mac** (Python 3.10+, with the Xcode command line tools for `codesign`):
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt pyinstaller
-bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.2
+bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.3
 ```
 
 The outputs are written under `release/`:
@@ -132,9 +134,9 @@ On macOS the app keeps its data in `~/Library/Application Support/PDFNest/` (`No
 - `Contents`: toggles the PDF outline panel.
 - Bottom page control: `- Page n / l +`, where `-` goes to the previous page, `+` goes to the next page, and the page number field can be edited directly.
 - Bottom zoom control: edit the percentage field to set the PDF zoom directly.
-- Arrow keys: `Up` or `Left` goes to the previous page; `Down` or `Right` goes to the next page.
+- Arrow keys: `Left` goes to the previous page and `Right` to the next, wherever you clicked in the reader (not while typing in a field or a list). `Up` / `Down` scroll.
 - `PageUp` / `PageDown`: previous or next page.
-- `Ctrl` + mouse wheel over the PDF area: zooms in or out around the current reading page center.
+- `Ctrl` + mouse wheel over the PDF area zooms in or out (`Cmd` on a Mac). Touchpad pinch zooms too: on a Mac trackpad and on Windows precision touchpads; the many small pinch steps zoom smoothly instead of jumping 10 % each.
 - Right-click a PDF page for `Add note`, `Fit width`, `Fit height`, `Continuous scroll`, `Single page`, and `Settings`.
 - Open Settings from the Home page or from the PDF right-click menu.
 - Drag-select digital PDF text, then press `Ctrl+C` to copy the selected text. Selection follows PDF reading order: the start line, full middle lines, and end line are selected as continuous line spans. `Ctrl+V` also copies the current PDF selection for compatibility with the original shortcut request.
@@ -429,14 +431,16 @@ When opening a PDF from history:
 
 PDFNest can share notes, highlights, bookmarks, library folders and reading positions between a Windows PC and a Mac through iCloud Drive. OneDrive and Dropbox work the same way. PDFNest does not talk to the cloud itself: both computers use one data folder inside the cloud drive, and the cloud client copies the files.
 
-1. Put the PDFs in the cloud drive, for example `iCloud Drive/Books/`.
-2. Create a data folder in the cloud drive too, for example `iCloud Drive/PDFNest/`. To keep the notes you already have, copy your current `Note_PDFNest` folder's contents into it first.
+1. Optional: put the PDFs in the cloud drive too, for example `iCloud Drive/Books/` (see step 4).
+2. Create a data folder in the cloud drive, for example `iCloud Drive/PDFNest/`. To keep the notes you already have, copy your current `Note_PDFNest` folder's contents into it first.
 3. On each computer, choose that folder in **Settings → Storage → PDFNest data folder**:
    - Windows (iCloud for Windows): `C:\Users\<you>\iCloudDrive\PDFNest`
    - macOS: `~/Library/Mobile Documents/com~apple~CloudDocs/PDFNest` (in Finder: *iCloud Drive → PDFNest*)
-4. On both computers, open the PDFs from the cloud drive, not from a local copy.
+4. Keep the PDFs wherever you like on each computer. They do not have to be in the cloud drive or at the same path.
 
-The data folder and the PDFs must sit the same way relative to each other on both computers (`../Books/a.pdf` from the data folder). A PDF opened from somewhere else, for example a copy in Downloads, is still found by its fingerprint, but its library entry only opens on the computer that has that copy.
+Every book added on one computer appears in the library on the other, with its cover, folder, notes, highlights and reading position. If the PDF is not on that computer yet, the book shows *Not on this computer yet*. Double-click it (or right-click → *Locate PDF on this computer…*) and pick the file once, or add the file with **+** / drag and drop: PDFNest recognizes it by its contents and attaches it to the same book. The location is remembered per computer (`machine_paths` in `recentnotes.json`, keyed by the id in `.local-data/machine_id.txt`), so locating the file on the Mac does not change where the PC finds it.
+
+PDFs kept inside the cloud drive need no locating: their path relative to the data folder is the same on both computers. The running app picks up books, folders and archive changes from the other computer when you switch back to its window or go Home.
 
 The first time PDFNest starts with a data folder, it records the relative path and fingerprint of every notebook whose PDF it can read (`migration_state.json` records which folder that was done for). Old notebooks keep their key and their notes. They show up on the other computer once the computer that made them has done this, or earlier through the file-name match above.
 

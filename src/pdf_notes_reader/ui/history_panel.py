@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 import re
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QSignalBlocker, Signal
-from PySide6.QtGui import QAction, QFont, QPixmap
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QSize, Qt, QSignalBlocker, Signal
+from PySide6.QtGui import QAction, QDrag, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -31,7 +31,7 @@ from pdf_notes_reader.library import LibraryFolder, UNFILED_FOLDER_ID, load_libr
 from pdf_notes_reader.notes import notebook_dir_for_key
 from pdf_notes_reader.services.note_search import NotebookSearchIndex
 from pdf_notes_reader.ui.resources import pic_icon
-from pdf_notes_reader.ui.widgets import ElidedLabel, LibraryFolderTree
+from pdf_notes_reader.ui.widgets import PDF_KEY_MIME_TYPE, ElidedLabel, LibraryFolderTree
 
 
 class HistoryPanel(QWidget):
@@ -44,6 +44,7 @@ class HistoryPanel(QWidget):
     pdfs_dropped = Signal(list, str)  # dropped file/folder paths, library folder id
     rename_requested = Signal(str, str)
     restore_requested = Signal(str)
+    locate_requested = Signal(str)  # the PDF is not on this computer (yet): pick its file
     settings_requested = Signal()
 
     def __init__(self) -> None:
@@ -65,6 +66,7 @@ class HistoryPanel(QWidget):
         self._syncing_list_splitters = False
         self._dragging_pdf_key = ""
         self._drag_cursor_active = False
+        self.setFocusPolicy(Qt.ClickFocus)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
@@ -613,7 +615,7 @@ class HistoryPanel(QWidget):
         title.setFont(self._library_title_font())
         self._install_entry_context_menu(title, entry)
 
-        path = ElidedLabel(entry.path)
+        path = ElidedLabel(entry.path if entry.exists else self._not_here_text(entry))
         path.setObjectName("HistoryRowPath")
         path.setTextInteractionFlags(Qt.TextSelectableByMouse)
         path.setWordWrap(False)
@@ -624,7 +626,7 @@ class HistoryPanel(QWidget):
         if entry.page_count:
             last_read += f" / {entry.page_count}"
         if not entry.exists:
-            last_read += " Missing"
+            last_read += " · not here"
 
         name_box = QWidget()
         name_box.setMinimumWidth(0)
@@ -748,6 +750,8 @@ class HistoryPanel(QWidget):
 
         def handle_mouse_press(event, key=entry.pdf_key) -> None:
             self.selected_pdf_key = key
+            # Take keyboard focus from the search field, so D / Delete act on this book.
+            self.setFocus(Qt.MouseFocusReason)
             if event.button() == Qt.LeftButton:
                 widget.setProperty("_pdfnest_drag_key", key)
                 widget.setProperty("_pdfnest_drag_start", self._mouse_event_pos(event))
@@ -806,11 +810,33 @@ class HistoryPanel(QWidget):
             return event.globalPosition().toPoint()
         return event.globalPos()
 
-    def _start_entry_drag(self, _source: QWidget, pdf_key: str) -> None:
-        self._dragging_pdf_key = pdf_key
-        if not self._drag_cursor_active:
-            QApplication.setOverrideCursor(Qt.ClosedHandCursor)
-            self._drag_cursor_active = True
+    def entry_drag_mime(self, pdf_key: str) -> QMimeData:
+        mime = QMimeData()
+        mime.setData(PDF_KEY_MIME_TYPE, pdf_key.encode("utf-8"))
+        return mime
+
+    def _start_entry_drag(self, source: QWidget, pdf_key: str) -> None:
+        """Drags a book (shown as a picture of its row or card) onto a folder in the folder list.
+
+        The folder list is shown while dragging even from Recent, so there is always somewhere to drop.
+        """
+        drag = QDrag(self)  # not the row: dropping rebuilds the rows, which would delete the drag's owner
+        drag.setMimeData(self.entry_drag_mime(pdf_key))
+        picture = source.grab()
+        if not picture.isNull():
+            if picture.width() > 360:
+                picture = picture.scaledToWidth(360, Qt.SmoothTransformation)
+            drag.setPixmap(picture)
+            drag.setHotSpot(QPoint(min(24, picture.width() // 2), picture.height() // 2))
+        sidebar = self.folder_tree.parentWidget()
+        was_hidden = sidebar is not None and not sidebar.isVisible()
+        if was_hidden:
+            sidebar.setVisible(True)
+        try:
+            drag.exec(Qt.MoveAction)
+        finally:
+            if was_hidden and self.home_mode != "notebooks":
+                sidebar.setVisible(False)
 
     def _update_folder_drag_hover(self, global_pos: QPoint) -> None:
         item = self.folder_tree.itemAt(self.folder_tree.viewport().mapFromGlobal(global_pos))
@@ -840,6 +866,7 @@ class HistoryPanel(QWidget):
             return
         menu = QMenu(self)
         open_action = menu.addAction("Open")
+        locate_action = menu.addAction("Locate PDF on this computer…" if not entry.exists else "Change PDF file…")
         rename_action = menu.addAction("Rename")
         export_action = menu.addAction("Export all notes")
         move_menu = menu.addMenu("Move to folder")
@@ -857,6 +884,8 @@ class HistoryPanel(QWidget):
         chosen = menu.exec(global_pos)
         if chosen == open_action:
             self.open_requested.emit(pdf_key)
+        elif chosen == locate_action:
+            self.locate_requested.emit(pdf_key)
         elif chosen == rename_action:
             name, accepted = QInputDialog.getText(self, "Rename notebook", "Display name:", text=self._entry_title(entry))
             if accepted and name.strip():
@@ -871,6 +900,14 @@ class HistoryPanel(QWidget):
             self.remove_requested.emit(pdf_key)
         elif chosen in move_actions:
             self._assign_entry_folder(pdf_key, move_actions[chosen])
+
+    @staticmethod
+    def _not_here_text(entry: PdfHistoryEntry) -> str:
+        if entry.in_cloud_only:
+            return "In iCloud only: double-click to download and open it"
+        if entry.located_here:
+            return f"Moved or deleted ({entry.path}): double-click to locate it"
+        return "Not on this computer yet: double-click to locate the PDF (notes and cover are already here)"
 
     def _folder_path_label(self, folder_id: str) -> str:
         folder = self._folder_by_id.get(folder_id)
@@ -889,7 +926,7 @@ class HistoryPanel(QWidget):
         return " / ".join(reversed(parts))
 
     def _assign_entry_folder(self, pdf_key: str, folder_id: str) -> None:
-        if folder_id == UNFILED_FOLDER_ID:
+        if not folder_id or folder_id == UNFILED_FOLDER_ID:  # the top level means "in no folder"
             self.library_state.assignments.pop(pdf_key, None)
         else:
             self.library_state.assignments[pdf_key] = folder_id

@@ -172,10 +172,14 @@ class SettingsDialog(QDialog):
         self.vault_hint.setObjectName("SettingsHint")
         self._update_vault_hint()
 
-        data_label = self._path_row(str(data_dir))
-        note_label = self._path_row(str(note_json_path) if note_json_path is not None else "Open a PDF to see this path.")
-        settings_label = self._path_row(str(settings_path(data_dir)))
-        theme_dir_label = self._path_row(str(theme_dir))
+        # Files inside the data folder are shown relative to it: the folder itself is the row above.
+        note_label = (
+            self._path_row(str(note_json_path), shown=self._inside_data_dir(note_json_path, data_dir))
+            if note_json_path is not None
+            else self._path_row("Open a PDF to see this path.", copyable=False)
+        )
+        settings_label = self._path_row(str(settings_path(data_dir)), shown=self._inside_data_dir(settings_path(data_dir), data_dir))
+        theme_dir_label = self._path_row(str(theme_dir), shown=self._inside_data_dir(theme_dir, data_dir))
 
         self.category_list = QTreeWidget()
         self.category_list.setHeaderHidden(True)
@@ -206,11 +210,10 @@ class SettingsDialog(QDialog):
 
         storage_form = QGridLayout()
         self._add_storage_row(storage_form, 0, "PDFNest data folder", storage_row)
-        self._add_storage_row(storage_form, 1, "Data folder", data_label)
-        self._add_storage_row(storage_form, 2, "Current note data", note_label)
-        self._add_storage_row(storage_form, 3, "Markdown export base", markdown_row)
-        self._add_storage_row(storage_form, 4, "Settings file", settings_label)
-        self._add_storage_row(storage_form, 5, "Theme folder", theme_dir_label)
+        self._add_storage_row(storage_form, 1, "Current note data", note_label)
+        self._add_storage_row(storage_form, 2, "Settings file", settings_label)
+        self._add_storage_row(storage_form, 3, "Theme folder", theme_dir_label)
+        self._add_storage_row(storage_form, 4, "Markdown export base", markdown_row)
         self.backup_button = QPushButton("Back up all data...")
         self.backup_button.setToolTip("Save notes, anchors, highlights, bookmarks, library and settings into one .zip file")
         self.backup_button.clicked.connect(self.create_backup)
@@ -284,15 +287,26 @@ class SettingsDialog(QDialog):
         layout.addWidget(value_widget, row, 1)
 
     @staticmethod
-    def _path_row(text: str) -> QWidget:
+    def _inside_data_dir(path: Path, data_dir: Path) -> str:
+        """``path`` relative to the data folder (``…/notebooks/a/note/notes.json``), or in full outside it."""
+        try:
+            relative = Path(path).relative_to(data_dir)
+        except ValueError:
+            return str(path)
+        return str(Path("…") / relative)
+
+    @staticmethod
+    def _path_row(text: str, *, shown: str | None = None, copyable: bool = True) -> QWidget:
+        """A read-only path: ``shown`` is displayed (the full path is the tooltip and what Copy copies)."""
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
-        label = SettingsDialog._path_label(text)
-        copy_button = SettingsDialog._copy_button(lambda: text)
+        label = SettingsDialog._path_label(shown if shown is not None else text)
+        label.setToolTip(text)
         layout.addWidget(label, 1)
-        layout.addWidget(copy_button, 0)
+        if copyable:
+            layout.addWidget(SettingsDialog._copy_button(lambda: text), 0)
         return row
 
     def _sync_category_page(self) -> None:
