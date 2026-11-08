@@ -4,7 +4,7 @@ A Python desktop PDF reader with external anchored Markdown notes.
 
 ## Features
 
-- Open and render multiple local PDF files in browser-style tabs, including password-protected and damaged (repairable) PDFs.
+- Open and render multiple local PDF files in browser-style tabs (*Open PDF* accepts several files at once), including password-protected and damaged (repairable) PDFs.
 - Find text in the PDF with `Ctrl+F` (match case, whole words, `F3` / `Shift+F3`), filter notes by text, and search note content from Home.
 - Save edited contents (outline) into the PDF safely: full rewrite, verification, and a `.pdfnest.bak` backup of the original that can be restored.
 - Back up all PDFNest data into one verified `.zip` from Settings → Storage.
@@ -19,7 +19,7 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Browse PDF outlines from the left Contents panel when the PDF provides a table of contents.
 - Keep full-document page geometry in continuous mode so the scrollbar represents the whole PDF, while rasterizing only the current visible page window and nearby buffered pages.
 - Render only the current reading page during zoom and fit changes first, so zoom controls respond faster.
-- Render pages at 2x internal precision for sharper text while keeping anchors aligned to the visible page size.
+- Render pages at the screen's device pixel ratio for sharp text while keeping anchors aligned to the visible page size.
 - Apply a warm beige reading tint to the PDF page content, the reader blank area, and the UI.
 - Right-click anywhere on a PDF page to add an anchored note.
 - Drag across digital PDF text to select continuous line-by-line text, then press `Ctrl+C` to copy it.
@@ -34,6 +34,8 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Save note anchors/content in external JSON files without modifying the original PDF.
 - Export individual notes as Markdown files to a selectable local folder.
 - Reopen known PDFs from the Home history page.
+- Add books to the library without opening them: the Home **+** button offers *Add PDF files…* (pick several at once with `Ctrl`/`Shift`+click) and *Add all PDFs in a folder…* (subfolders included; hidden folders such as `.trash` are skipped). You can also drag PDFs or folders from Explorer onto Home, or onto a library folder in Notebooks. New books go into the open Notebooks folder; books already in the library keep their reading position and folder.
+- Open, Add and Relocate use the standard Windows file dialog and start in the folder you used last.
 - Restore the last-read page when opening a PDF again.
 - Prompt for relocation when a PDF history item points to a missing absolute path.
 - Use a beige reading theme inspired by notebook/library reading tools.
@@ -84,11 +86,41 @@ For end-user distribution on Windows, build the executable package with PyInstal
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.3.0-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.3.0-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.3.1-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.3.1-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
+
+## macOS App Release
+
+PyInstaller cannot cross-compile, so the Mac app is built on a Mac or by GitHub Actions.
+
+**GitHub Actions** (`.github/workflows/build-macos.yml`): pushing a tag such as `v0.3.1` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build macOS app → Run workflow* builds the same files as downloadable workflow artifacts without a release.
+
+**On a Mac** (Python 3.10+, with the Xcode command line tools for `codesign`):
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt pyinstaller
+bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.1
+```
+
+The outputs are written under `release/`:
+
+- `PDFNest.app`: the app bundle (for the Mac's own architecture). It declares the `pdfnest://` link scheme and offers itself in Finder's *Open With* menu for PDFs.
+- `PDFNest-<version>-macos-<arch>.dmg`: disk image with the app and an `Applications` shortcut (a `.zip` instead when `hdiutil` is unavailable).
+
+**Installing**: open the `.dmg` and drag PDFNest into Applications. Choose `arm64` for Apple Silicon Macs (M1 and later) and `x86_64` for Intel Macs. The app is ad-hoc signed but not signed with an Apple Developer ID or notarized, so Gatekeeper says it is from an unidentified developer (or that it "is damaged and can't be opened" for downloaded copies). To open it the first time, either:
+
+- Control-click PDFNest in Applications → **Open** → **Open** (on macOS 15 and later: try to open it once, then *System Settings → Privacy & Security → Open Anyway*), or
+- remove the download quarantine flag in Terminal:
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/PDFNest.app
+  ```
+
+On macOS the app keeps its data in `~/Library/Application Support/PDFNest/` (`Note_PDFNest/` and `.local-data/`), not inside the app bundle, so replacing the app with a newer version keeps your notes. A data folder chosen in Settings and `PDF_NOTES_READER_DATA_DIR` still take precedence. Running from source on a Mac keeps data in the project folder, as on Windows.
 
 ## Reading Controls
 
@@ -109,7 +141,9 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 - `Ctrl+F`: find text in the PDF. `Enter` / `F3` = next match, `Shift+Enter` / `Shift+F3` = previous, `Esc` closes. Selected PDF text pre-fills the search. Matches are highlighted in orange; the search starts at the current page, wraps around, and runs in small steps so large PDFs stay responsive.
 - Contents ⋯ menu → **Restore original PDF** puts back the original file from before PDFNest first saved contents into it.
 
-Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions. In continuous mode, the reader keeps geometry for every page so the scrollbar range matches the whole PDF, but it only creates widgets for the current page window and a few merged spacer runs. It rasterizes only the current page plus nearby buffered pages, then refreshes that window as you scroll or jump. Zoom and fit commands prioritize the current reading page to reduce interaction lag.
+Pages are rasterized at the screen's device pixel ratio (for example 1.25 at 125% Windows scaling), so every screen pixel gets exactly one rendered pixel. Note anchors use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions. In continuous mode, the reader keeps geometry for every page so the scrollbar range matches the whole PDF, but it only creates widgets for the current page window and a few merged spacer runs, and reuses them while the zoom stays the same. Only the pages on screen are rendered right away; nearby buffered pages are filled in afterwards, nearest first, and pages keep appearing while you scroll.
+
+Pages are rendered in two background worker processes, so slow pages (scanned books, heavy drawings) never freeze the window. For such documents even visible pages are drawn by the workers, and a page waiting at a new zoom shows its previous image scaled until the sharp one arrives. Set the environment variable `PDFNEST_RENDER_WORKERS=0` to render everything in the main process.
 
 ## Markdown Notes
 
@@ -138,7 +172,7 @@ The local formula renderer (`latex.py`) is a brace-aware LaTeX parser that rende
 
 The full feature list with before/after status is in [`docs/markdown-compat.md`](docs/markdown-compat.md).
 
-The right note sidebar has a `Notes folder` button and an `Export MD` button. `Notes folder` selects the base folder for standalone `.md` files. `Export MD` creates a subfolder named after the current PDF inside that base folder, first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
+Without an Obsidian vault (see below), the right note sidebar has an `Export MD` button; the base folder for standalone `.md` files is set in Settings → Storage → *Markdown export base*. `Export MD` creates a subfolder named after the current PDF inside that base folder, first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
 
 ```text
 YYYYMMDD-HHMMSS-<chapter-name-or-page-number>-<number>.md
@@ -147,6 +181,35 @@ YYYYMMDD-HHMMSS-<chapter-name-or-page-number>-<number>.md
 `<number>` is a monotonic note number for that PDF page and is not reused after deleting earlier notes. Chapter names come from the PDF outline when available; otherwise the filename uses `page-<page_number>`. Characters that are invalid in Windows filenames are replaced with `_`. Long PDF names and location names are truncated with a stable hash suffix before folder or file creation to avoid Windows path component limits.
 
 After a note has been exported once, its Markdown file path is stored in the note JSON. Exporting that same note again asks whether to replace the previous `.md` file or create a new timestamped `.md` file.
+
+## Obsidian Integration
+
+PDFNest can keep your notes in an [Obsidian](https://obsidian.md) vault, so you write and format them in Obsidian (with its plugins, links, graph and search) while PDFNest keeps the anchors, highlights and excerpt markers. The integration is off until you choose a vault in **Settings → Obsidian**:
+
+- **Vault folder**: your vault. If it is not an Obsidian vault yet, open it once in Obsidian (*Open folder as vault*).
+- **Folder in vault**: where PDFNest's notes go (default `PDFNest`; empty = the vault's top folder).
+- **Links back**: registers PDFNest as the handler of `pdfnest://` links for your Windows user (`HKCU\Software\Classes\pdfnest`; unticking removes it). On macOS this setting is unavailable: `PDFNest.app` declares the scheme in its `Info.plist`, so links work once the app is in Applications (and has been opened once).
+
+Layout, one file per note plus a generated index per book:
+
+```text
+<vault>/PDFNest/<pdf name>/
+  _Index.md              generated: links to every note in page order (rewritten by PDFNest)
+  p25 Scaling-1.md       one file per note, highlight and underline
+```
+
+Each note file starts with front matter that PDFNest manages (`pdfnest_id`, `pdf`, `page`, `type`, `created`, `link`); properties you add in Obsidian, such as `tags`, are kept. Everything below the front matter is the note itself. Text appended from the PDF ends with a link to its exact place, for example `> — [p.25](pdfnest://open?path=…&page=25&note=…)`. With *Links back* on, clicking such a link in Obsidian opens the PDF at that excerpt: in the running PDFNest if there is one (PDFNest runs as a single instance), otherwise in a new one.
+
+Sync rules:
+
+- The note sidebar's button becomes **Open in Obsidian** (`Ctrl+Shift+S`): it saves the note to the vault and opens it in Obsidian.
+- PDFNest writes a note's file whenever it saves the note. It reads Obsidian's edits back when a PDF opens, when you pick another note, and whenever the PDFNest window becomes active again.
+- If a note was edited in both apps, Obsidian's text is kept as the note and PDFNest's text is saved beside it as `<name>.pdfnest-conflict.md`. Nothing is overwritten silently.
+- Renaming or moving a note file inside the vault is fine: PDFNest finds it again by its `pdfnest_id`. File names are chosen once, when the note is created.
+- Deleting a note in PDFNest moves its file to the vault's `.trash` folder (Obsidian's trash). A file deleted only in Obsidian is written again from PDFNest's copy.
+- Existing notes are written to the vault the first time their PDF is opened after a vault is set; sidebar ⋯ → *Export all notes* (or the library's export) syncs a whole book at once.
+
+The built-in editor and preview remain for quick notes while reading; Obsidian is the place for longer writing.
 
 ## Data Storage
 
@@ -161,6 +224,8 @@ Default storage location:
 ```text
 <project-or-program-folder>\Note_PDFNest\
 ```
+
+(For the macOS app: `~/Library/Application Support/PDFNest/Note_PDFNest/`, with `.local-data/` beside it.)
 
 PDFNest stores PDF history, bookmarks, notebook data, and app settings in this structure:
 
@@ -361,7 +426,7 @@ src/pdf_notes_reader/
   latex.py                 LaTeX math → Qt rich-text HTML
   notes.py, history.py, library.py, settings.py, storage_migration.py   storage
 docs/                      audits, issue register, Markdown compatibility matrix, GitHub release notes
-scripts/                   Windows build, icon tool, render benchmark, compatibility-matrix generator
+scripts/                   Windows and macOS builds, icon tool, render benchmark, compatibility-matrix generator
 ```
 
 ## Tests

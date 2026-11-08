@@ -2,6 +2,7 @@ from gui_helpers import GuiTestCase  # noqa: I001 - sets sys.path and offscreen 
 
 import os
 import tempfile
+import time
 from pathlib import Path
 from PySide6.QtCore import QPoint
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
@@ -24,7 +25,9 @@ class ReaderRenderTest(GuiTestCase):
             self.assertIsNotNone(window.document)
             self.assertGreater(window.canvas.width(), 0)
             self.assertGreater(window.canvas.height(), 0)
-            self.assertEqual(window.canvas.render_device_pixel_ratio(), 2.0)
+            # Pages are rasterized at the screen's device pixel ratio (1.0 offscreen).
+            self.assertEqual(window.canvas.render_device_pixel_ratio(), window.render_scale)
+            self.assertEqual(window.render_scale, max(1.0, window.scroll_area.viewport().devicePixelRatioF()))
 
             window.add_note(0.5, 0.4)
             self.assertEqual(len(window.notes), 1)
@@ -119,6 +122,62 @@ class ReaderRenderTest(GuiTestCase):
                 QTest.qWait(80)
                 self.app.processEvents()
                 self.assertIn(5, window.page_canvases)
+            finally:
+                window.close()
+
+    def test_offscreen_pages_render_after_load_and_canvases_are_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "progressive.pdf"
+            self._create_sample_pdf(pdf_path, page_count=12)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                # Only the pages on screen are rasterized during load; the buffer pages are pending.
+                self.assertFalse(window.page_canvases[window.page_index].is_pending())
+                pending = {page for page, canvas in window.page_canvases.items() if canvas.is_pending()}
+                self.assertTrue(pending)
+                self.assertEqual(window.page_canvases[max(pending)].size(), window._page_display_size(max(pending)))
+
+                deadline = time.monotonic() + 5
+                while any(canvas.is_pending() for canvas in window.page_canvases.values()) and time.monotonic() < deadline:
+                    QTest.qWait(20)
+                self.assertFalse(any(canvas.is_pending() for canvas in window.page_canvases.values()))
+
+                kept = window.page_canvases[2]
+                rasterizations = window.render_cache.rasterizations
+                window.render_page(center_current=False)
+                self.assertIs(window.page_canvases[2], kept)
+                self.assertEqual(window.render_cache.rasterizations, rasterizations)
+            finally:
+                window.close()
+
+    def test_continuous_scrolling_renders_pages_before_scrolling_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            os.environ["PDF_NOTES_READER_DATA_DIR"] = str(tmp_path / "data")
+            pdf_path = tmp_path / "throttle.pdf"
+            self._create_sample_pdf(pdf_path, page_count=30)
+
+            window = MainWindow()
+            try:
+                window.resize(900, 600)
+                window.show()
+                window.load_pdf(pdf_path)
+                self.app.processEvents()
+                scroll_bar = window.scroll_area.verticalScrollBar()
+                step = max(1, window.page_heights[0] // 4)
+                for _ in range(40):  # one event every 10 ms: never a 35 ms pause
+                    scroll_bar.setValue(scroll_bar.value() + step)
+                    QTest.qWait(10)
+                    if window.page_index >= 8:
+                        break
+                self.assertGreaterEqual(window.page_index, 8)
+                self.assertIn(window.page_index, window.page_canvases)
             finally:
                 window.close()
 

@@ -87,7 +87,7 @@ class LibraryHistoryTest(GuiTestCase):
                 child = next(folder for folder in library.folders if folder.name == "String_Theory")
                 self.assertEqual(child.parent_id, parent.id)
 
-                with patch.object(window, "_choose_pdf_file", return_value=str(pdf_path)):
+                with patch.object(window, "_choose_pdf_files", return_value=[str(pdf_path)]):
                     window.add_planned_notebook(child.id)
                 pdf_key = pdf_key_for_path(pdf_path)
                 library = load_library(data_dir)

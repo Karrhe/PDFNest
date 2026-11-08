@@ -21,6 +21,9 @@ class PdfCanvas(QWidget):
     note_color_requested = Signal(str, str)
     note_style_requested = Signal(str, str)
     note_delete_requested = Signal(str)
+    # Highlights/underlines: add (or open) the one optional note, or delete just that note.
+    annotation_note_requested = Signal(str)
+    annotation_note_remove_requested = Signal(str)
     reset_note_counters_requested = Signal()
     settings_requested = Signal()
     zoom_requested = Signal(float)
@@ -29,6 +32,8 @@ class PdfCanvas(QWidget):
         super().__init__()
         self.page_index = page_index
         self._pixmap: QPixmap | None = None
+        self._pending = False
+        self._preview: QPixmap | None = None
         self._page_size = QSize(640, 480)
         self._notes: list[Note] = []
         self._text_words: list[dict[str, object]] = []
@@ -60,6 +65,8 @@ class PdfCanvas(QWidget):
         text_words: list[dict[str, object]] | None = None,
     ) -> None:
         self._pixmap = pixmap
+        self._pending = False
+        self._preview = None
         self._notes = notes
         self._text_words = text_words or []
         self.clear_selection()
@@ -69,6 +76,24 @@ class PdfCanvas(QWidget):
             self._page_size = display_size or pixmap.deviceIndependentSize().toSize()
         self.setFixedSize(self._page_size)
         self.update()
+
+    def set_pending_page(self, display_size: QSize, notes: list[Note], preview: QPixmap | None = None) -> None:
+        """Reserve the page's final size; the reader fills the pixmap in shortly after (set_page).
+
+        ``preview`` (a render at another zoom) is shown scaled meanwhile, so zooming never blanks.
+        """
+        self._pixmap = None
+        self._preview = preview
+        self._pending = True
+        self._notes = notes
+        self._text_words = []
+        self.clear_selection()
+        self._page_size = QSize(display_size)
+        self.setFixedSize(self._page_size)
+        self.update()
+
+    def is_pending(self) -> bool:
+        return self._pending
 
     def set_notes(self, notes: list[Note]) -> None:
         """Refresh annotation overlays without recreating or rerasterizing the page."""
@@ -108,6 +133,13 @@ class PdfCanvas(QWidget):
         painter.fillRect(self.rect(), QColor(self._theme_colors.get("pdf_tint", "#f3ecd6")))
 
         if self._pixmap is None:
+            if self._pending:
+                if self._preview is not None:
+                    painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                    painter.drawPixmap(self.rect(), self._preview)
+                    painter.setCompositionMode(QPainter.CompositionMode_Multiply)
+                    painter.fillRect(self.rect(), QColor(self._theme_colors.get("pdf_tint", "#f3ecd6")))
+                return
             painter.setPen(QColor("#6f6653"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Open a PDF to begin")
             return
@@ -179,8 +211,16 @@ class PdfCanvas(QWidget):
         reset_note_numbers_action = QAction("Reset note numbering", self)
         copy_action = QAction("Copy selected text", self)
         append_selection_action = QAction("Add selected text to current note", self)
-        open_note_action = QAction("Open note", self)
-        delete_note_action = QAction("Delete annotation" if target_note and target_note.note_type != "point" else "Delete note", self)
+        target_is_annotation = target_note is not None and target_note.note_type in {"highlight", "underline"}
+        open_note_action = QAction("Add note" if target_is_annotation and not target_note.has_note else "Open note", self)
+        remove_annotation_note_action = QAction("Delete note", self)
+        if target_is_annotation:
+            delete_label = "Delete highlight" if target_note.note_type == "highlight" else "Delete underline"
+        elif target_note is not None and target_note.note_type != "point":
+            delete_label = "Delete annotation"
+        else:
+            delete_label = "Delete note"
+        delete_note_action = QAction(delete_label, self)
         fit_width_action = QAction("Fit width", self)
         fit_height_action = QAction("Fit height", self)
         continuous_action = QAction("Continuous scroll", self)
@@ -213,6 +253,8 @@ class PdfCanvas(QWidget):
 
         if target_note is not None:
             menu.addAction(open_note_action)
+            if target_is_annotation and target_note.has_note:
+                menu.addAction(remove_annotation_note_action)
             color_menu = menu.addMenu("Change color")
             for label, color in ANNOTATION_COLORS:
                 action = QAction(label, self)
@@ -252,7 +294,12 @@ class PdfCanvas(QWidget):
         if chosen is None:
             return
         if chosen == open_note_action and target_note is not None:
-            self.note_selected.emit(target_note.linked_note_id or target_note.id)
+            if target_is_annotation:
+                self.annotation_note_requested.emit(target_note.id)
+            else:
+                self.note_selected.emit(target_note.linked_note_id or target_note.id)
+        elif chosen == remove_annotation_note_action and target_note is not None:
+            self.annotation_note_remove_requested.emit(target_note.id)
         elif chosen == delete_note_action and target_note is not None:
             self.note_delete_requested.emit(target_note.id)
         elif chosen in note_color_actions and target_note is not None:
