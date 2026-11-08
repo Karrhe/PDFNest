@@ -4,7 +4,10 @@ A Python desktop PDF reader with external anchored Markdown notes.
 
 ## Features
 
-- Open and render multiple local PDF files in browser-style tabs.
+- Open and render multiple local PDF files in browser-style tabs, including password-protected and damaged (repairable) PDFs.
+- Find text in the PDF with `Ctrl+F` (match case, whole words, `F3` / `Shift+F3`), filter notes by text, and search note content from Home.
+- Save edited contents (outline) into the PDF safely: full rewrite, verification, and a `.pdfnest.bak` backup of the original that can be restored.
+- Back up all PDFNest data into one verified `.zip` from Settings → Storage.
 - Use `Ctrl+W` to close the current PDF tab, and `Ctrl+1` through `Ctrl+9` to switch tabs.
 - Read in continuous vertical scroll mode by default, or switch to single-page mode from the PDF context menu.
 - Navigate pages with the bottom `- Page n / l +` control or keyboard arrow keys.
@@ -81,8 +84,8 @@ For end-user distribution on Windows, build the executable package with PyInstal
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.2.4-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.2.4-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.3.0-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.3.0-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
@@ -103,6 +106,8 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 - Drag-select digital PDF text, then press `Ctrl+C` to copy the selected text. Selection follows PDF reading order: the start line, full middle lines, and end line are selected as continuous line spans. `Ctrl+V` also copies the current PDF selection for compatibility with the original shortcut request.
 - Right-click a text selection for `Copy selected text`, colored `Highlight selection`, and colored `Underline selection`.
 - Click an item in the left Contents panel to jump to that PDF outline page.
+- `Ctrl+F`: find text in the PDF. `Enter` / `F3` = next match, `Shift+Enter` / `Shift+F3` = previous, `Esc` closes. Selected PDF text pre-fills the search. Matches are highlighted in orange; the search starts at the current page, wraps around, and runs in small steps so large PDFs stay responsive.
+- Contents ⋯ menu → **Restore original PDF** puts back the original file from before PDFNest first saved contents into it.
 
 Page rendering uses a 2x internal render scale, so the PDF is rasterized at higher resolution than the on-screen logical page size. Note anchors still use normalized coordinates on the visible page, so zoom and render precision changes do not shift note positions. In continuous mode, the reader keeps geometry for every page so the scrollbar range matches the whole PDF, but it only creates widgets for the current page window and a few merged spacer runs. It rasterizes only the current page plus nearby buffered pages, then refreshes that window as you scroll or jump. Zoom and fit commands prioritize the current reading page to reduce interaction lag.
 
@@ -124,9 +129,14 @@ print("hello")
 - Inline formulas: `$a^2 + b^2 = c^2$`
 - Formula blocks: `$$E = mc^2$$`
 
+- Strikethrough `~~text~~`, task lists `- [ ]` / `- [x]`, footnotes, definition lists, abbreviations
+- Nested lists indented with 2 or 4 spaces
+
 Formula content is parsed and rendered into styled inline or block formula elements in the preview. It keeps the original LaTeX-style text in storage, so notes remain portable.
 
-The local formula renderer supports common LaTeX-style commands used in notes, including Greek symbols such as `\beta`, superscripts/subscripts such as `$x_i^2$`, fractions such as `$\frac{1}{2}$`, roots such as `$\sqrt{x}$`, and common math operators such as `\times`, `\leq`, `\sum`, and arrows.
+The local formula renderer (`latex.py`) is a brace-aware LaTeX parser that renders to Qt rich text. It supports 228 symbols (Greek with variants, relations, operators, arrows, big operators, dots and delimiters), `\sin`-style functions, nested `\frac`, `\sqrt[n]{}`, `\binom`, accents (`\hat`, `\vec`, `\bar`, …), `\mathbb`/`\mathcal`/`\mathfrak`/`\mathbf`/`\text`, `\left…\right`, and the `matrix`/`pmatrix`/`bmatrix`/`vmatrix`/`cases`/`aligned`/`array` environments. Display math (`$$…$$`) stacks fractions, matrices and limits under `\sum`/`\lim`; inline math stays on one line (`a⁄b`). Dollar amounts such as "$5 and $10" stay text, and `\$` is a literal dollar. Unknown commands stay visible in red instead of disappearing.
+
+The full feature list with before/after status is in [`docs/markdown-compat.md`](docs/markdown-compat.md).
 
 The right note sidebar has a `Notes folder` button and an `Export MD` button. `Notes folder` selects the base folder for standalone `.md` files. `Export MD` creates a subfolder named after the current PDF inside that base folder, first saves the current editor text to the JSON anchor store, then writes a Markdown copy using this default filename pattern:
 
@@ -141,6 +151,10 @@ After a note has been exported once, its Markdown file path is stored in the not
 ## Data Storage
 
 Notes and PDF-related metadata are saved outside the original PDF. The app never writes notes back into the PDF file.
+
+The only operation that changes a PDF is **Save contents to PDF** in the Contents panel, and only after you confirm. PDFNest rewrites the file completely into a temporary copy, re-opens and checks that copy, keeps the original as `<name>.pdf.pdfnest.bak` (created once and never overwritten), and only then replaces the PDF. Signed, permission-restricted and XFA-form PDFs are refused untouched.
+
+If a data file cannot be read (for example after a crash or a sync conflict), PDFNest moves it aside as `<name>.corrupt-<time>.json`, continues with what it can read, and shows a warning listing the files. It never overwrites an unreadable notes file with an empty one.
 
 Default storage location:
 
@@ -300,7 +314,7 @@ Field meanings:
 - `notes[].exported_markdown_path`: last exported Markdown file path for the note. It is used to offer replacement on later exports.
 - `created_at` and `updated_at`: UTC ISO timestamps.
 
-Saves are written through a temporary sibling file named `<pdf_key>.tmp`, then atomically replaced as `<pdf_key>.json`.
+Every JSON file is written to a uniquely named temporary file in the same folder, flushed to disk, then atomically renamed over the target, so a crash leaves either the old or the new file, never a partial one.
 
 ### PDF History Contents
 
@@ -331,10 +345,39 @@ When opening a PDF from history:
 - If `path` no longer exists, the app asks whether to relocate the PDF.
 - If relocated, the history entry keeps the same `pdf_key`, updates the absolute path, and restores the last-read page.
 
+### Backups and moving the data folder
+
+Settings → Storage → **Back up all data...** writes one `.zip` with notes, anchors, highlights, bookmarks, library folders and settings, and verifies it. If the data folder configured in Settings no longer exists (drive unplugged, folder moved), PDFNest uses the local `Note_PDFNest` folder instead of silently starting an empty library, and says so.
+
+## Project structure
+
+```text
+src/pdf_notes_reader/
+  app.py, main.py          entry point (main.py re-exports the public names for compatibility)
+  ui/                      Qt widgets: main_window, canvas, find_bar, note/outline/history panels, settings, styles
+  pdf/                     document opening, render cache, text geometry, search, safe outline writer
+  services/                Qt-free logic: chapters/numbering, Markdown export, note search, backup
+  markdown_render.py       Markdown preview pipeline
+  latex.py                 LaTeX math → Qt rich-text HTML
+  notes.py, history.py, library.py, settings.py, storage_migration.py   storage
+docs/                      audits, issue register, Markdown compatibility matrix, GitHub release notes
+scripts/                   Windows build, icon tool, render benchmark, compatibility-matrix generator
+```
+
 ## Tests
 
-Run the full test suite:
+Install the development dependencies, then run the full test suite (Qt tests run offscreen):
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pytest
+```
+
+The suite also runs with `python -m unittest discover -s tests` for the unittest-style modules. `tests/pdf_factory.py` builds the problem PDFs used by the loading, rendering and contents-saving tests. Each test gets its own temporary data folder, so tests never touch your notes.
+
+Useful tools:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\bench_render.py --pages 2000      # open/scroll rasterization benchmark
+.\.venv\Scripts\python.exe scripts\gen_markdown_compat.py            # regenerate docs/markdown-compat.md
 ```

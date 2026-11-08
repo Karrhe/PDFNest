@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -187,11 +188,7 @@ def _read_storage_pointer() -> Path | None:
 
 def set_configured_data_dir(data_dir: str | Path) -> Path:
     path = Path(data_dir).expanduser()
-    storage_pointer_path().parent.mkdir(parents=True, exist_ok=True)
-    payload = {"data_dir": str(path)}
-    with storage_pointer_path().open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    _atomic_write_json(storage_pointer_path(), {"data_dir": str(path)})
     return path
 
 
@@ -200,11 +197,35 @@ def default_data_dir() -> Path:
     if override:
         return Path(override).expanduser()
 
+    local = app_base_dir() / STORAGE_DIR_NAME
     configured = _read_storage_pointer()
     if configured is not None:
+        if configured.exists():
+            return configured
+        # The configured folder is gone (drive unplugged, folder moved or deleted). Silently creating
+        # an empty store there would look like all notes were lost, so prefer the local store when it
+        # exists or when the configured drive is missing, and tell the user once.
+        if local.exists() or not Path(configured.anchor or os.sep).exists():
+            _report_missing_configured_dir(configured, local)
+            return local
         return configured
 
-    return app_base_dir() / STORAGE_DIR_NAME
+    return local
+
+
+_reported_missing_dirs: set[str] = set()
+
+
+def _report_missing_configured_dir(configured: Path, fallback: Path) -> None:
+    key = str(configured)
+    if key in _reported_missing_dirs:
+        return
+    _reported_missing_dirs.add(key)
+    record_storage_issue(
+        f"The configured PDFNest data folder was not found, so the local folder {fallback} is used. "
+        "Choose the data folder again in Settings if it moved.",
+        configured,
+    )
 
 
 def notes_dir(data_dir: Path | None = None) -> Path:
@@ -253,13 +274,74 @@ def pdf_key_for_path(pdf_path: str | Path) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
+@dataclass
+class StorageIssue:
+    message: str
+    path: Path
+    quarantined_path: Path | None = None
+
+
+_STORAGE_ISSUES: list[StorageIssue] = []
+
+
+def record_storage_issue(message: str, path: Path, quarantined_path: Path | None = None) -> StorageIssue:
+    issue = StorageIssue(message=message, path=path, quarantined_path=quarantined_path)
+    _STORAGE_ISSUES.append(issue)
+    return issue
+
+
+def drain_storage_issues() -> list[StorageIssue]:
+    """Returns and clears storage problems found since the last call, for the UI to report once."""
+    issues = list(_STORAGE_ISSUES)
+    _STORAGE_ISSUES.clear()
+    return issues
+
+
+def quarantine_file(path: Path) -> Path:
+    """Moves an unreadable file aside so later saves cannot overwrite the only copy of the data."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = path.with_name(f"{path.stem}.corrupt-{stamp}{path.suffix}")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}.corrupt-{stamp}-{counter}{path.suffix}")
+        counter += 1
+    os.replace(path, candidate)
+    return candidate
+
+
+def read_json_checked(path: Path) -> Any | None:
+    """Reads JSON, or returns None. Corrupt files are quarantined and reported instead of raising."""
+    if not path.exists():
+        return None
+    try:
+        return _read_json_path(path)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        try:
+            quarantined = quarantine_file(path)
+        except OSError:
+            quarantined = None
+        record_storage_issue(f"{path.name} was unreadable and has been set aside.", path, quarantined)
+        return None
+    except OSError as exc:
+        record_storage_issue(f"{path.name} could not be read: {exc}", path)
+        return None
+
+
 def _atomic_write_json(path: Path, payload: Any) -> None:
+    """Writes to a unique temp file, flushes it to disk, then atomically replaces the target."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    tmp_path.replace(path)
+    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def legacy_notes_path_for_key(pdf_key: str, data_dir: Path | None = None) -> Path:
@@ -275,12 +357,9 @@ def _load_notebook_index(data_dir: Path | None = None) -> dict[str, str]:
     path = notebook_index_path(data_dir)
     if not path.exists():
         return {}
-    try:
-        payload = _read_json_path(path)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    payload = read_json_checked(path)
     if not isinstance(payload, dict):
-        return {}
+        return rebuild_notebook_index(data_dir)
     notebooks = payload.get("notebooks", payload)
     if not isinstance(notebooks, dict):
         return {}
@@ -334,10 +413,28 @@ def notebook_dir_for_key(pdf_key: str, data_dir: Path | None = None) -> Path | N
     if not index and not notebook_index_path(data_dir).exists():
         index = rebuild_notebook_index(data_dir)
     folder_name = index.get(pdf_key)
-    if not folder_name:
+    candidate = root / folder_name if folder_name else None
+    if candidate is not None and candidate.exists():
+        return candidate
+    # Stale index: the notebook may exist on disk without an index entry.
+    found = _find_notebook_by_manifest(pdf_key, data_dir)
+    if found is not None:
+        register_notebook_dir(pdf_key, found, data_dir)
+    return found
+
+
+def _find_notebook_by_manifest(pdf_key: str, data_dir: Path | None = None) -> Path | None:
+    root = notebooks_dir(data_dir)
+    if not root.exists():
         return None
-    candidate = root / folder_name
-    return candidate if candidate.exists() else None
+    for manifest_path in root.glob("*/manifest.json"):
+        try:
+            payload = _read_json_path(manifest_path)
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(payload, dict) and str(payload.get("pdf_key") or "") == pdf_key:
+            return manifest_path.parent
+    return None
 
 
 def notebook_dir_for_pdf(pdf_path: str | Path, pdf_key: str, data_dir: Path | None = None) -> Path:
@@ -426,21 +523,12 @@ def load_notes_payload(pdf_key: str, data_dir: Path | None = None) -> dict[str, 
     if not path.exists():
         legacy_notebook_path = legacy_notebook_note_file_for_key(pdf_key, data_dir)
         path = legacy_notebook_path or legacy_notes_path_for_key(pdf_key, data_dir)
-    if not path.exists():
-        return {}
-
-    payload = _read_json_path(path)
+    payload = read_json_checked(path)
     return payload if isinstance(payload, dict) else {}
 
 
 def load_bookmarks_payload(pdf_key: str, data_dir: Path | None = None) -> dict[str, Any]:
-    path = bookmark_path_for_key(pdf_key, data_dir)
-    if not path.exists():
-        return {}
-    try:
-        payload = _read_json_path(path)
-    except (OSError, json.JSONDecodeError):
-        return {}
+    payload = read_json_checked(bookmark_path_for_key(pdf_key, data_dir))
     return payload if isinstance(payload, dict) else {}
 
 
@@ -485,6 +573,14 @@ def _manifest_payload(*, pdf_key: str, pdf_path: str | Path, page_count: int = 0
     }
 
 
+def _manifest_page_count(manifest_path: Path) -> int:
+    try:
+        payload = _read_json_path(manifest_path)
+        return normalize_nonnegative_int(payload["res"][0].get("page_count", 0))
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return 0
+
+
 def _markups_payload(notes: list[Note]) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -513,12 +609,15 @@ def _ensure_cover(pdf_path: str | Path, notebook_dir: Path) -> None:
     except Exception:
         return
     try:
-        if document.page_count <= 0:
+        # Password-protected PDFs get no cover: the thumbnail would need the password again.
+        if document.needs_pass or document.page_count <= 0:
             return
         page = document.load_page(0)
         pixmap = page.get_pixmap(matrix=fitz.Matrix(0.45, 0.45), alpha=False)
         notebook_dir.mkdir(parents=True, exist_ok=True)
         pixmap.save(cover_path)
+    except Exception:  # A cover is cosmetic; it must never break saving notes or history.
+        return
     finally:
         document.close()
 
@@ -549,9 +648,15 @@ def save_notes(
     notebook_dir.mkdir(parents=True, exist_ok=True)
     _atomic_write_json(path, payload)
     _atomic_write_json(bookmark_path, {"schema_version": 1, "app": APP_NAME, "bookmarks": [bookmark.to_dict() for bookmark in current_bookmarks]})
-    _atomic_write_json(notebook_dir / "manifest.json", _manifest_payload(pdf_key=pdf_key, pdf_path=pdf_path))
+    manifest_path = notebook_dir / "manifest.json"
+    _atomic_write_json(
+        manifest_path,
+        _manifest_payload(pdf_key=pdf_key, pdf_path=pdf_path, page_count=_manifest_page_count(manifest_path)),
+    )
     _atomic_write_json(notebook_dir / "markups.json", _markups_payload(notes))
-    _atomic_write_json(notebook_dir / "recentfile.json", _recent_file_payload(page_index=max((note.page_index for note in notes), default=0)))
+    recent_path = notebook_dir / "recentfile.json"
+    if not recent_path.exists():  # History owns the last-read page; only seed it here.
+        _atomic_write_json(recent_path, _recent_file_payload(page_index=0))
     _write_sync_lock(root_sync_lock_path(data_dir))
     _write_sync_lock(notebook_dir / "sync.lock")
     _ensure_cover(pdf_path, notebook_dir)

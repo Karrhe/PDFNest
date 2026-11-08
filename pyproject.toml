@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdfnest"
-version = "0.2.5"
+version = "0.3.0"
 description = "PDFNest: a PySide6 PDF reader with anchored external Markdown notes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,3 +23,18 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 pdf_notes_reader = ["assets/*.png"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pikepdf>=9",
+    "pypdf>=5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+markers = [
+    "gui: needs a QApplication (runs offscreen)",
+    "slow: generates large PDFs or measures timing",
+]
