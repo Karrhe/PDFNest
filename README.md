@@ -83,6 +83,8 @@ For end-user distribution on Windows, build the executable package with PyInstal
 .\scripts\build_windows_exe.ps1
 ```
 
+Pushing a tag such as `v0.3.1` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
+
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
@@ -96,7 +98,7 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 
 PyInstaller cannot cross-compile, so the Mac app is built on a Mac or by GitHub Actions.
 
-**GitHub Actions** (`.github/workflows/build-macos.yml`): pushing a tag such as `v0.3.1` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build macOS app → Run workflow* builds the same files as downloadable workflow artifacts without a release.
+**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.1` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
 
 **On a Mac** (Python 3.10+, with the Xcode command line tools for `codesign`):
 

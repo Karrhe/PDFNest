@@ -1,19 +1,23 @@
 param(
-    [string]$Version = "0.3.1"
+    [string]$Version = "0.3.1",
+    # Python with the requirements and PyInstaller. Default: the project's .venv (CI passes its own).
+    [string]$Python = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Python = Join-Path $Root ".venv\Scripts\python.exe"
+if (-not $Python) {
+    $Python = Join-Path $Root ".venv\Scripts\python.exe"
+}
 # Run PyInstaller as a module: the venv's pyinstaller.exe launcher breaks when the project folder moves.
 $PyInstaller = {
     & $Python -m PyInstaller @args
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 }
 
-if (-not (Test-Path $Python)) {
-    throw "Missing virtual environment Python: $Python"
+if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) {
+    throw "Missing Python: $Python"
 }
 
 & $Python -m PyInstaller --version *> $null
@@ -27,6 +31,7 @@ $WorkOnedir = Join-Path $Root "build\pyinstaller"
 $WorkOnefile = Join-Path $Root "build\pyinstaller-onefile"
 $IconPng = Join-Path $ReleaseAssets "PDFNest-256x256-transparent.png"
 $IconIco = Join-Path $ReleaseAssets "PDFNest-transparent.ico"
+$TrackedIconPng = Join-Path $Root "PDFNest-Icon.png"
 $Main = Join-Path $Root "src\pdf_notes_reader\main.py"
 $Asset = Join-Path $Root "src\pdf_notes_reader\assets\Icon.png"
 $PicAssets = Join-Path $Root "Pic"
@@ -34,12 +39,20 @@ $PicAssets = Join-Path $Root "Pic"
 New-Item -ItemType Directory -Force -Path $ReleaseAssets | Out-Null
 New-Item -ItemType Directory -Force -Path $Release | Out-Null
 
-if (-not (Test-Path $IconPng)) {
-    throw "Missing transparent PNG icon source: $IconPng"
+# release_assets\ is not in Git. A fresh checkout (CI) uses the tracked PDFNest-Icon.png instead
+# and generates the .ico from it.
+$UseReleaseAssets = Test-Path $IconPng
+if (-not $UseReleaseAssets) {
+    if (-not (Test-Path $TrackedIconPng)) {
+        throw "Missing PNG icon source: $IconPng (or $TrackedIconPng)"
+    }
+    $IconPng = $TrackedIconPng
 }
 
 if (-not (Test-Path $IconIco)) {
-    throw "Missing transparent ICO icon source: $IconIco"
+    $IconIco = Join-Path $Root "build\PDFNest.ico"
+    & $Python (Join-Path $Root "scripts\make_windows_icon.py") $IconPng $IconIco
+    if ($LASTEXITCODE -ne 0) { throw "Could not generate $IconIco" }
 }
 
 if (-not (Test-Path $PicAssets)) {
@@ -105,9 +118,11 @@ function Write-StartMenuAssets {
     Set-Content -LiteralPath (Join-Path $TargetDir "$ExeStem.VisualElementsManifest.xml") -Value $Manifest -Encoding UTF8
 }
 
-Copy-Item -LiteralPath $IconPng -Destination (Join-Path $Root "Icon.png") -Force
-Copy-Item -LiteralPath $IconPng -Destination (Join-Path $Root "PDFNest-Icon.png") -Force
-Copy-Item -LiteralPath $IconPng -Destination $Asset -Force
+if ($UseReleaseAssets) {
+    Copy-Item -LiteralPath $IconPng -Destination (Join-Path $Root "Icon.png") -Force
+    Copy-Item -LiteralPath $IconPng -Destination (Join-Path $Root "PDFNest-Icon.png") -Force
+    Copy-Item -LiteralPath $IconPng -Destination $Asset -Force
+}
 
 & $PyInstaller --noconfirm --clean --windowed --name PDFNest --paths (Join-Path $Root "src") --distpath $Release --workpath $WorkOnedir --specpath $WorkOnedir --icon $IconIco --add-data "$Asset;pdf_notes_reader\assets" --add-data "$PicAssets;Pic" $Main
 Write-StartMenuAssets -TargetDir (Join-Path $Release "PDFNest") -ExeStem "PDFNest"

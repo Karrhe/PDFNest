@@ -23,8 +23,10 @@ All notable changes to PDFNest. Issue IDs refer to [`docs/KNOWN_ISSUES.md`](docs
 - **Notes** button in the document bar shows or hides the notes panel, like **Contents**.
 - macOS app: `scripts/build_macos_app.sh` builds `PDFNest.app` (`.icns` icon, `pdfnest://` URL scheme and
   `.pdf` document type in `Info.plist`, ad-hoc signed) and packs it as `PDFNest-<version>-macos-<arch>.dmg`;
-  `.github/workflows/build-macos.yml` builds arm64 and x86_64 on tag pushes or manual runs and attaches the
-  `.dmg` files to the GitHub Release.
+  `.github/workflows/release.yml` builds Windows x64 and macOS arm64 and x86_64 on tag pushes or manual runs
+  and attaches the Windows `.zip`/`.exe` and macOS `.dmg` files to the GitHub Release.
+- `scripts/build_windows_exe.ps1` takes `-Python`, and falls back to `PDFNest-Icon.png` (generating the `.ico`)
+  when the untracked `release_assets/` folder is missing, so it runs on a fresh checkout.
 - macOS: PDFs opened from Finder and clicked `pdfnest://` links (delivered as `QFileOpenEvent`, not on the
   command line) open in PDFNest.
 

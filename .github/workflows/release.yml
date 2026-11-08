@@ -1,8 +1,9 @@
-name: Build macOS app
+name: Build release
 
-# Builds PDFNest.app (arm64 for Apple Silicon and x86_64 for Intel Macs) with
-# scripts/build_macos_app.sh. Pushing a tag such as v0.3.0 also attaches the .dmg files to the
-# GitHub Release for that tag (creating the release if needed).
+# Builds PDFNest for Windows (scripts/build_windows_exe.ps1) and macOS (scripts/build_macos_app.sh,
+# arm64 for Apple Silicon and x86_64 for Intel Macs). Pushing a tag such as v0.3.1 also attaches
+# the Windows .zip/.exe and the macOS .dmg files to the GitHub Release for that tag (creating the
+# release if needed).
 on:
   push:
     tags:
@@ -10,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version for the file names (default: version in pyproject.toml)"
+        description: "Version for the file names (default: tag, else version in pyproject.toml)"
         required: false
         default: ""
 
@@ -18,7 +19,38 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build PDFNest.exe and .zip
+        shell: pwsh
+        run: |
+          $Version = "${{ github.event.inputs.version }}"
+          if (-not $Version -and $env:GITHUB_REF_TYPE -eq "tag") { $Version = $env:GITHUB_REF_NAME -replace '^v', '' }
+          if (-not $Version) { $Version = (Select-String -Path pyproject.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value }
+          ./scripts/build_windows_exe.ps1 -Version $Version -Python (Get-Command python).Source
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PDFNest-windows-x64
+          path: |
+            release/*.zip
+            release/*.exe
+          if-no-files-found: error
+
+  macos:
     name: macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -70,7 +102,7 @@ jobs:
   release:
     name: Attach to GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -81,6 +113,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.dmg
             dist/*.zip
+            dist/*.exe
+            dist/*.dmg
           fail_on_unmatched_files: false

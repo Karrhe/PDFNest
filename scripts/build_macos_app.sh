@@ -5,7 +5,7 @@
 #
 # Must run on a Mac: PyInstaller cannot cross-compile. The app is built for the architecture of
 # the Python that runs it (arm64 on Apple Silicon, x86_64 on Intel). CI builds both, see
-# .github/workflows/build-macos.yml.
+# .github/workflows/release.yml.
 #
 # Environment:
 #   PYTHON     Python with the app's requirements and PyInstaller (default: .venv/bin/python,
