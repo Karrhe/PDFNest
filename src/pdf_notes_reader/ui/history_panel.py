@@ -6,7 +6,7 @@ import os
 import re
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QSize, Qt, QSignalBlocker, Signal
-from PySide6.QtGui import QAction, QDrag, QFont, QPixmap
+from PySide6.QtGui import QAction, QColor, QDrag, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -38,6 +38,10 @@ class HistoryPanel(QWidget):
     open_requested = Signal(str)
     archive_requested = Signal(str)
     remove_requested = Signal(str)
+    # Several selected books at once (pdf keys).
+    archive_many_requested = Signal(list)
+    restore_many_requested = Signal(list)
+    remove_many_requested = Signal(list)
     export_requested = Signal(str)
     add_notebook_requested = Signal(str)  # folder id: pick PDF files to add
     add_folder_requested = Signal(str)  # folder id: pick a disk folder whose PDFs are added
@@ -55,7 +59,11 @@ class HistoryPanel(QWidget):
         self.home_mode = "recent"
         self.view_mode = "list"
         self.sort_mode = "time"
-        self.selected_pdf_key = ""
+        # Selected books, in the order they were selected; the anchor is where Shift+click ranges start.
+        self._selected_keys: list[str] = []
+        self._selection_anchor = ""
+        self._displayed_keys: list[str] = []  # the books shown now, in display order
+        self._entry_widgets: dict[str, list[QWidget]] = {}  # row and card of each shown book
         self._cover_cache: dict[tuple[str, int, int], QPixmap] = {}
         self._entry_by_key: dict[str, PdfHistoryEntry] = {}
         self._folder_by_id: dict[str, LibraryFolder] = {}
@@ -86,6 +94,7 @@ class HistoryPanel(QWidget):
         self.folder_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.folder_tree.customContextMenuRequested.connect(self._show_folder_context_menu)
         self.folder_tree.folder_drop_requested.connect(self._assign_entry_folder)
+        self.folder_tree.folder_drop_keys_requested.connect(self._assign_entries_folder)
 
         title = QLabel("Recent PDFs")
         title.setObjectName("HistoryTitle")
@@ -98,7 +107,7 @@ class HistoryPanel(QWidget):
         self.search_edit.setPlaceholderText("Search notebooks and notes")
         self.note_index = NotebookSearchIndex()
         self.note_match_counts: dict[str, int] = {}
-        self.search_edit.textChanged.connect(self._rebuild_files)
+        self.search_edit.textChanged.connect(self._rebuild_view)
 
         self.sort_combo = QComboBox()
         self.sort_combo.setObjectName("LibrarySortCombo")
@@ -264,7 +273,7 @@ class HistoryPanel(QWidget):
         self.title_label.setText({"recent": "Recent PDFs", "notebooks": "Notebooks", "archive": "Archive"}[self.home_mode])
         self.folder_tree.parentWidget().setVisible(self.home_mode == "notebooks")
         self.new_folder_button.setVisible(self.home_mode == "notebooks")
-        self._rebuild_files()
+        self._rebuild_view()
 
     def _set_sort_from_combo(self) -> None:
         self.sort_mode = str(self.sort_combo.currentData() or "time")
@@ -405,8 +414,12 @@ class HistoryPanel(QWidget):
 
     def _handle_folder_selection(self) -> None:
         item = self.folder_tree.currentItem()
+        previous = self.folder_filter
         self.folder_filter = str(item.data(0, Qt.UserRole) or "") if item is not None else ""
-        self._rebuild_files()
+        if self.folder_filter != previous:
+            self._rebuild_view()
+        else:
+            self._rebuild_files()  # the folder list was rebuilt: the same view
 
     def _create_virtual_folder(self, *, parent_id: str = "") -> None:
         if parent_id == UNFILED_FOLDER_ID:
@@ -537,6 +550,11 @@ class HistoryPanel(QWidget):
         entries = self._filtered_entries()
         self.folder_count_label.setText(f"({len(entries)})")
         self._list_row_splitters = []
+        self._entry_widgets = {}
+        self._displayed_keys = [entry.pdf_key for entry in entries]
+        # Books gone from the library leave the selection. One that just moved out of view (archived,
+        # filed elsewhere) stays selected until the view changes, so Shift+Delete still removes it.
+        self._selected_keys = [key for key in self._selected_keys if key in self._entry_by_key]
         self._clear_layout_widgets(self.list_layout)
         self._clear_layout_widgets(self.grid_layout)
 
@@ -555,6 +573,72 @@ class HistoryPanel(QWidget):
 
         for index, entry in enumerate(entries):
             self.grid_layout.addWidget(self._build_grid_card(entry), index // 5, index % 5)
+        self._refresh_selection_marks()
+
+    # --- selecting books -------------------------------------------------------------------------
+
+    def _rebuild_view(self, *_args) -> None:
+        """Shows another view (mode, folder, search): books it does not show are no longer selected."""
+        self._rebuild_files()
+        shown = set(self._displayed_keys)
+        if any(key not in shown for key in self._selected_keys):
+            self.set_selected_pdf_keys([key for key in self._selected_keys if key in shown])
+
+    @property
+    def selected_pdf_key(self) -> str:
+        """The book clicked last among the selected ones ("" when nothing is selected)."""
+        if self._selection_anchor in self._selected_keys:
+            return self._selection_anchor
+        return self._selected_keys[-1] if self._selected_keys else ""
+
+    @selected_pdf_key.setter
+    def selected_pdf_key(self, pdf_key: str) -> None:
+        self.set_selected_pdf_keys([pdf_key] if pdf_key else [])
+
+    @property
+    def selected_pdf_keys(self) -> list[str]:
+        return list(self._selected_keys)
+
+    def set_selected_pdf_keys(self, pdf_keys, anchor: str | None = None) -> None:
+        self._selected_keys = list(dict.fromkeys(key for key in pdf_keys if key))
+        self._selection_anchor = anchor if anchor is not None else (self._selected_keys[-1] if self._selected_keys else "")
+        self._refresh_selection_marks()
+
+    def select_all_entries(self) -> None:
+        """Ctrl+A: every book shown in the current view."""
+        self.set_selected_pdf_keys(self._displayed_keys, anchor=self._displayed_keys[0] if self._displayed_keys else "")
+
+    def _click_select(self, pdf_key: str, modifiers) -> None:
+        """Ctrl+click adds or removes one book, Shift+click selects the range from the last click."""
+        if modifiers & Qt.ControlModifier:
+            if pdf_key in self._selected_keys:
+                self._selected_keys.remove(pdf_key)
+            else:
+                self._selected_keys.append(pdf_key)
+            self._selection_anchor = pdf_key
+            self._refresh_selection_marks()
+        elif modifiers & Qt.ShiftModifier and self._selection_anchor in self._displayed_keys and pdf_key in self._displayed_keys:
+            start = self._displayed_keys.index(self._selection_anchor)
+            end = self._displayed_keys.index(pdf_key)
+            low, high = min(start, end), max(start, end)
+            self._selected_keys = self._displayed_keys[low : high + 1]
+            self._refresh_selection_marks()  # the anchor stays, so the range can be changed again
+        else:
+            self.set_selected_pdf_keys([pdf_key])
+
+    def _refresh_selection_marks(self) -> None:
+        selected = set(self._selected_keys)
+        for key, widgets in self._entry_widgets.items():
+            for widget in widgets:
+                try:
+                    if bool(widget.property("selected")) == (key in selected):
+                        continue
+                    widget.setProperty("selected", key in selected)
+                    widget.style().unpolish(widget)
+                    widget.style().polish(widget)
+                    widget.update()
+                except RuntimeError:  # deleted with an earlier rebuild
+                    continue
 
     def _build_list_header(self) -> QWidget:
         row = QWidget()
@@ -591,6 +675,8 @@ class HistoryPanel(QWidget):
     def _build_row(self, entry: PdfHistoryEntry) -> QWidget:
         row = QWidget()
         row.setObjectName("LibraryRowMissing" if not entry.exists else "LibraryRow")
+        row.setAttribute(Qt.WA_StyledBackground, True)
+        self._entry_widgets.setdefault(entry.pdf_key, []).append(row)
         self._install_entry_context_menu(row, entry)
 
         cover = QLabel()
@@ -688,6 +774,8 @@ class HistoryPanel(QWidget):
         card = QWidget()
         card.setObjectName("LibraryGridCardMissing" if not entry.exists else "LibraryGridCard")
         card.setFixedSize(214, 292)
+        card.setAttribute(Qt.WA_StyledBackground, True)
+        self._entry_widgets.setdefault(entry.pdf_key, []).append(card)
         self._install_entry_context_menu(card, entry)
 
         cover = QLabel()
@@ -749,13 +837,24 @@ class HistoryPanel(QWidget):
         original_mouse_double_click = widget.mouseDoubleClickEvent
 
         def handle_mouse_press(event, key=entry.pdf_key) -> None:
-            self.selected_pdf_key = key
-            # Take keyboard focus from the search field, so D / Delete act on this book.
+            # Take keyboard focus from the search field, so D / Delete / Ctrl+A act on the books.
             self.setFocus(Qt.MouseFocusReason)
+            modifiers = event.modifiers()
             if event.button() == Qt.LeftButton:
+                if key in self._selected_keys and len(self._selected_keys) > 1 and not modifiers & (Qt.ControlModifier | Qt.ShiftModifier):
+                    # Pressing on a selected book keeps the selection, so all of them can be dragged;
+                    # a click without a drag selects just this book (on release).
+                    widget.setProperty("_pdfnest_collapse_to", key)
+                    self._selection_anchor = key
+                else:
+                    self._click_select(key, modifiers)
                 widget.setProperty("_pdfnest_drag_key", key)
                 widget.setProperty("_pdfnest_drag_start", self._mouse_event_pos(event))
+            elif event.button() == Qt.RightButton and key not in self._selected_keys:
+                self.set_selected_pdf_keys([key])
             original_mouse_press(event)
+            if event.button() in (Qt.LeftButton, Qt.RightButton):
+                event.accept()  # the row or card it sits in must not handle the same click again
 
         def handle_mouse_move(event, key=entry.pdf_key) -> None:
             start = widget.property("_pdfnest_drag_start")
@@ -767,13 +866,18 @@ class HistoryPanel(QWidget):
                 and (self._mouse_event_pos(event) - start).manhattanLength() >= QApplication.startDragDistance()
             ):
                 widget.setProperty("_pdfnest_drag_start", None)
+                widget.setProperty("_pdfnest_collapse_to", "")
                 self._start_entry_drag(widget, key)
                 return
             original_mouse_move(event)
 
         def handle_mouse_release(event) -> None:
+            collapse_to = widget.property("_pdfnest_collapse_to")
+            widget.setProperty("_pdfnest_collapse_to", "")
             widget.setProperty("_pdfnest_drag_start", None)
             widget.setProperty("_pdfnest_drag_key", "")
+            if collapse_to and event.button() == Qt.LeftButton:
+                self.set_selected_pdf_keys([collapse_to])
             original_mouse_release(event)
 
         def handle_mouse_double_click(event, key=entry.pdf_key) -> None:
@@ -810,22 +914,28 @@ class HistoryPanel(QWidget):
             return event.globalPosition().toPoint()
         return event.globalPos()
 
-    def entry_drag_mime(self, pdf_key: str) -> QMimeData:
+    def entry_drag_mime(self, pdf_keys: str | list[str]) -> QMimeData:
+        """Drag data naming one book or several (one key per line)."""
+        keys = [pdf_keys] if isinstance(pdf_keys, str) else list(pdf_keys)
         mime = QMimeData()
-        mime.setData(PDF_KEY_MIME_TYPE, pdf_key.encode("utf-8"))
+        mime.setData(PDF_KEY_MIME_TYPE, "\n".join(keys).encode("utf-8"))
         return mime
 
     def _start_entry_drag(self, source: QWidget, pdf_key: str) -> None:
         """Drags a book (shown as a picture of its row or card) onto a folder in the folder list.
+        Dragging one of several selected books drags all of them; the picture shows how many.
 
         The folder list is shown while dragging even from Recent, so there is always somewhere to drop.
         """
+        keys = self.selected_pdf_keys if pdf_key in self._selected_keys else [pdf_key]
         drag = QDrag(self)  # not the row: dropping rebuilds the rows, which would delete the drag's owner
-        drag.setMimeData(self.entry_drag_mime(pdf_key))
+        drag.setMimeData(self.entry_drag_mime(keys))
         picture = source.grab()
         if not picture.isNull():
             if picture.width() > 360:
                 picture = picture.scaledToWidth(360, Qt.SmoothTransformation)
+            if len(keys) > 1:
+                self._paint_drag_count(picture, len(keys))
             drag.setPixmap(picture)
             drag.setHotSpot(QPoint(min(24, picture.width() // 2), picture.height() // 2))
         sidebar = self.folder_tree.parentWidget()
@@ -837,6 +947,21 @@ class HistoryPanel(QWidget):
         finally:
             if was_hidden and self.home_mode != "notebooks":
                 sidebar.setVisible(False)
+
+    @staticmethod
+    def _paint_drag_count(picture: QPixmap, count: int) -> None:
+        painter = QPainter(picture)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        size = min(28, picture.height())
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(37, 99, 235))
+        painter.drawEllipse(picture.width() - size - 2, 2, size, size)
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(picture.width() - size - 2, 2, size, size, Qt.AlignCenter, str(count))
+        painter.end()
 
     def _update_folder_drag_hover(self, global_pos: QPoint) -> None:
         item = self.folder_tree.itemAt(self.folder_tree.viewport().mapFromGlobal(global_pos))
@@ -860,15 +985,12 @@ class HistoryPanel(QWidget):
             QApplication.restoreOverrideCursor()
             self._drag_cursor_active = False
 
-    def _show_entry_context_menu(self, pdf_key: str, global_pos: QPoint) -> None:
-        entry = self._entry_by_key.get(pdf_key)
-        if entry is None:
-            return
-        menu = QMenu(self)
-        open_action = menu.addAction("Open")
-        locate_action = menu.addAction("Locate PDF on this computer…" if not entry.exists else "Change PDF file…")
-        rename_action = menu.addAction("Rename")
-        export_action = menu.addAction("Export all notes")
+    @staticmethod
+    def _exec_menu(menu: QMenu, global_pos: QPoint) -> QAction | None:
+        """Shows a book menu and returns the chosen action (tests replace this)."""
+        return menu.exec(global_pos)
+
+    def _add_move_to_folder_menu(self, menu: QMenu) -> dict[QAction, str]:
         move_menu = menu.addMenu("Move to folder")
         move_actions: dict[QAction, str] = {}
         unfiled_action = move_menu.addAction("Unfiled")
@@ -878,10 +1000,50 @@ class HistoryPanel(QWidget):
                 continue
             action = move_menu.addAction(self._folder_path_label(folder.id))
             move_actions[action] = folder.id
+        return move_actions
+
+    def _show_selection_context_menu(self, pdf_keys: list[str], global_pos: QPoint) -> None:
+        """The menu for several selected books: move, archive or restore, or remove them together."""
+        count = len(pdf_keys)
+        menu = QMenu(self)
+        title = menu.addAction(f"{count} PDFs selected")
+        title.setEnabled(False)
+        menu.addSeparator()
+        move_actions = self._add_move_to_folder_menu(menu)
+        archived = [key for key in pdf_keys if key in self.library_state.archived]
+        active = [key for key in pdf_keys if key not in self.library_state.archived]
+        restore_action = menu.addAction(f"Restore {len(archived)}" if active else "Restore") if archived else None
+        archive_action = menu.addAction(f"Move {len(active)} to archive" if archived else "Move to archive") if active else None
+        delete_action = menu.addAction(f"Permanent delete {count} PDFs…")
+        chosen = self._exec_menu(menu, global_pos)
+        if chosen is None:
+            return
+        if chosen in move_actions:
+            self._assign_entries_folder(pdf_keys, move_actions[chosen])
+        elif restore_action is not None and chosen == restore_action:
+            self.restore_many_requested.emit(archived)
+        elif archive_action is not None and chosen == archive_action:
+            self.archive_many_requested.emit(active)
+        elif chosen == delete_action:
+            self.remove_many_requested.emit(list(pdf_keys))
+
+    def _show_entry_context_menu(self, pdf_key: str, global_pos: QPoint) -> None:
+        entry = self._entry_by_key.get(pdf_key)
+        if entry is None:
+            return
+        if pdf_key in self._selected_keys and len(self._selected_keys) > 1:
+            self._show_selection_context_menu(self.selected_pdf_keys, global_pos)
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Open")
+        locate_action = menu.addAction("Locate PDF on this computer…" if not entry.exists else "Change PDF file…")
+        rename_action = menu.addAction("Rename")
+        export_action = menu.addAction("Export all notes")
+        move_actions = self._add_move_to_folder_menu(menu)
         restore_action = menu.addAction("Restore") if pdf_key in self.library_state.archived else None
         archive_action = menu.addAction("Move to archive") if pdf_key not in self.library_state.archived else None
         delete_action = menu.addAction("Permanent delete")
-        chosen = menu.exec(global_pos)
+        chosen = self._exec_menu(menu, global_pos)
         if chosen == open_action:
             self.open_requested.emit(pdf_key)
         elif chosen == locate_action:
@@ -926,10 +1088,15 @@ class HistoryPanel(QWidget):
         return " / ".join(reversed(parts))
 
     def _assign_entry_folder(self, pdf_key: str, folder_id: str) -> None:
-        if not folder_id or folder_id == UNFILED_FOLDER_ID:  # the top level means "in no folder"
-            self.library_state.assignments.pop(pdf_key, None)
-        else:
-            self.library_state.assignments[pdf_key] = folder_id
+        self._assign_entries_folder([pdf_key], folder_id)
+
+    def _assign_entries_folder(self, pdf_keys: list[str], folder_id: str) -> None:
+        """Files the books into ``folder_id`` with one save (the top level or Unfiled: no folder)."""
+        for pdf_key in pdf_keys:
+            if not folder_id or folder_id == UNFILED_FOLDER_ID:  # the top level means "in no folder"
+                self.library_state.assignments.pop(pdf_key, None)
+            else:
+                self.library_state.assignments[pdf_key] = folder_id
         save_library(self.library_state)
         self._rebuild_library_indexes()
         self._rebuild_folders()

@@ -2,6 +2,20 @@
 
 All notable changes to PDFNest. Issue IDs refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
+## 0.3.5 — 2026-11-09
+
+### Added
+- Select several books on Home and in library folders: Ctrl+click (⌘-click on the Mac) adds or removes one,
+  Shift+click selects a range, Ctrl+A selects every book shown. Selected books are outlined.
+- Act on all selected books at once: *Move to folder* in the right-click menu, dragging them onto a folder
+  in the Folders sidebar (the drag picture shows how many), `Delete` / `D` to move them to the Archive,
+  *Restore* in the Archive, and *Permanent delete N PDFs…* or `Shift+Delete`, which asks once and names how
+  many books it removes (the PDF files and their notes stay on disk). One book works as before.
+
+### Fixed
+- Adding the same disk folder on both computers before they synced made its library folders appear twice.
+  Folders created by adding a folder now get the same id on every computer, so they merge into one.
+
 ## 0.3.4 — 2026-11-08
 
 ### Fixed

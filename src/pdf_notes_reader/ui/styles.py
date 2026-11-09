@@ -160,6 +160,11 @@ APP_STYLESHEET_TEMPLATE = """
             #LibraryRowMissing, #LibraryGridCardMissing {
                 color: {colors["muted"]};
             }
+            #LibraryRow[selected="true"], #LibraryRowMissing[selected="true"],
+            #LibraryGridCard[selected="true"], #LibraryGridCardMissing[selected="true"] {
+                background: {colors["panel"]};
+                border: 2px solid {colors["selection"]};
+            }
             #LibraryRowCover {
                 background: {colors["editor"]};
                 border: 1px solid {colors["border"]};

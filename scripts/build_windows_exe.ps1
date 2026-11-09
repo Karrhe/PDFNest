@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.3.4",
+    [string]$Version = "0.3.5",
     # Python with the requirements and PyInstaller. Default: the project's .venv (CI passes its own).
     [string]$Python = ""
 )

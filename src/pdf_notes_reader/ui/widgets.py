@@ -43,6 +43,7 @@ class LibraryFolderTree(QTreeWidget):
     """The library's folder list. Library books dragged onto a folder are filed there."""
 
     folder_drop_requested = Signal(str, str)  # pdf key, folder id ("" for the top level = unfiled)
+    folder_drop_keys_requested = Signal(list, str)  # the dragged books' pdf keys, folder id
 
     def __init__(self) -> None:
         super().__init__()
@@ -51,11 +52,18 @@ class LibraryFolderTree(QTreeWidget):
         self._drop_hover_item: QTreeWidgetItem | None = None
 
     @staticmethod
-    def dragged_pdf_key(event) -> str:
+    def dragged_pdf_keys(event) -> list[str]:
+        """The keys of the dragged books (one per line in the drag data)."""
         mime = event.mimeData()
         if mime is None or not mime.hasFormat(PDF_KEY_MIME_TYPE):
-            return ""
-        return bytes(mime.data(PDF_KEY_MIME_TYPE)).decode("utf-8", "replace").strip()
+            return []
+        text = bytes(mime.data(PDF_KEY_MIME_TYPE)).decode("utf-8", "replace")
+        return list(dict.fromkeys(line.strip() for line in text.splitlines() if line.strip()))
+
+    @classmethod
+    def dragged_pdf_key(cls, event) -> str:
+        keys = cls.dragged_pdf_keys(event)
+        return keys[0] if keys else ""
 
     def _set_drop_hover(self, item: QTreeWidgetItem | None) -> None:
         if item is self._drop_hover_item:
@@ -91,14 +99,14 @@ class LibraryFolderTree(QTreeWidget):
         event.accept()
 
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
-        pdf_key = self.dragged_pdf_key(event)
+        pdf_keys = self.dragged_pdf_keys(event)
         item = self.itemAt(event.position().toPoint())
         self._set_drop_hover(None)
-        if not pdf_key or item is None:
+        if not pdf_keys or item is None:
             event.ignore()
             return
         event.acceptProposedAction()
-        self.folder_drop_requested.emit(pdf_key, str(item.data(0, Qt.UserRole) or ""))
+        self.folder_drop_keys_requested.emit(pdf_keys, str(item.data(0, Qt.UserRole) or ""))
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().paintEvent(event)

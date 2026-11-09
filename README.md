@@ -36,7 +36,8 @@ A Python desktop PDF reader with external anchored Markdown notes.
 - Reopen known PDFs from the Home history page.
 - Add books to the library without opening them: the Home **+** button offers *Add PDF files…* (pick several at once with `Ctrl`/`Shift`+click) and *Add all PDFs in a folder…* (subfolders included; hidden folders such as `.trash` are skipped). You can also drag PDFs or folders from Explorer or Finder onto Home, or onto a library folder in Notebooks. A folder is added with its structure: `Books/Physics/a.pdf` added as `Books` lands in the library folder *Books / Physics*, created as needed (adding it again reuses the same folders). Loose PDFs go into the open Notebooks folder. Books already in the library keep their reading position; an unfiled one moves into its folder.
 - Drag a book from the Home list or grid onto a folder in the Folders sidebar to file it there; drop it on the top entry to take it out of its folder. The sidebar appears while you drag, also from Recent.
-- On Home, `D` or `Delete` (`Backspace` on a Mac) moves the selected book to the Archive (the bin button); `Shift+Delete` removes it from the library. Typing in the search field is not affected.
+- On Home, `D` or `Delete` (`Backspace` on a Mac) moves the selected books to the Archive (the bin button); `Shift+Delete` removes them from the library, asking first when several are selected. Typing in the search field is not affected.
+- Select several books with Ctrl+click (⌘-click on a Mac), Shift+click for a range, or Ctrl+A for every book shown. Right-click them to move them to a folder, archive, restore or remove them together, or drag them onto a folder in the Folders sidebar.
 - Open, Add and Relocate use the standard Windows file dialog and start in the folder you used last.
 - Restore the last-read page when opening a PDF again.
 - Prompt for relocation when a PDF history item points to a missing absolute path.
@@ -85,13 +86,13 @@ For end-user distribution on Windows, build the executable package with PyInstal
 .\scripts\build_windows_exe.ps1
 ```
 
-Pushing a tag such as `v0.3.4` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
+Pushing a tag such as `v0.3.5` also builds the Windows files on GitHub Actions (`.github/workflows/release.yml`) and attaches the `.zip` and single-file `.exe` to the GitHub Release, next to the macOS builds. Without `release_assets\` (it is not in Git), the script uses `PDFNest-Icon.png` and generates the `.ico` with `scripts\make_windows_icon.py`.
 
 The release outputs are written under `release\`:
 
 - `PDFNest\PDFNest.exe`: portable folder build. Distribute the whole `PDFNest` folder, or the generated zip.
-- `PDFNest-0.3.4-windows-x64.zip`: zipped portable folder build.
-- `PDFNest-0.3.4-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
+- `PDFNest-0.3.5-windows-x64.zip`: zipped portable folder build.
+- `PDFNest-0.3.5-windows-x64.exe`: single-file executable. It is easier to share, but starts more slowly because it extracts bundled files at launch.
 - `*.VisualElementsManifest.xml` and `*.VisualElements\`: Windows Start menu tile assets. Keep them beside the matching executable when pinning PDFNest to Start.
 
 The app data folder remains beside the executable as `.local-data\` unless `PDF_NOTES_READER_DATA_DIR` is set.
@@ -100,14 +101,14 @@ The app data folder remains beside the executable as `.local-data\` unless `PDF_
 
 PyInstaller cannot cross-compile, so the Mac app is built on a Mac or by GitHub Actions.
 
-**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.4` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
+**GitHub Actions** (`.github/workflows/release.yml`, which also builds the Windows files): pushing a tag such as `v0.3.5` builds `PDFNest.app` on an Apple Silicon (`arm64`) and an Intel (`x86_64`) runner and attaches `PDFNest-<version>-macos-arm64.dmg` and `PDFNest-<version>-macos-x86_64.dmg` to the GitHub Release for that tag. *Actions → Build release → Run workflow* builds the same files as downloadable workflow artifacts without a release.
 
 **On a Mac** (Python 3.10+, with the Xcode command line tools for `codesign`):
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt pyinstaller
-bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.4
+bash scripts/build_macos_app.sh            # version from pyproject.toml, or pass one: 0.3.5
 ```
 
 The outputs are written under `release/`:

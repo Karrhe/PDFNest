@@ -53,7 +53,9 @@ def ensure_folder_path(state: "LibraryState", parent_id: str, names: tuple[str, 
     """The id of the library folder ``parent / names[0] / names[1] / ...``, creating missing ones.
 
     An existing folder with the same name (ignoring case) under the same parent is reused, so adding
-    the same disk folder twice does not duplicate the tree. Returns ``parent_id`` for no names.
+    the same disk folder twice does not duplicate the tree. A new folder gets an id derived from its
+    parent and name, so when both computers add the same disk folder before syncing, their folders are
+    the same record and merge into one instead of appearing twice. Returns ``parent_id`` for no names.
     """
     current = parent_id if parent_id and parent_id != UNFILED_FOLDER_ID else ""
     for raw_name in names:
@@ -68,9 +70,20 @@ def ensure_folder_path(state: "LibraryState", parent_id: str, names: tuple[str, 
         )
         if existing is None:
             existing = LibraryFolder.create(name, parent_id=current)
+            folder_id = imported_folder_id(current, name)
+            if folder_id not in {folder.id for folder in state.folders}:  # else it was renamed: keep a fresh id
+                existing.id = folder_id
             state.folders.append(existing)
         current = existing.id
     return current
+
+
+_IMPORTED_FOLDER_NAMESPACE = uuid.UUID("6f1d4c52-5a2e-4f0b-9a57-2b8f3c1e9d40")
+
+
+def imported_folder_id(parent_id: str, name: str) -> str:
+    """The same id on every computer for the folder ``name`` (ignoring case) under ``parent_id``."""
+    return str(uuid.uuid5(_IMPORTED_FOLDER_NAMESPACE, f"{parent_id}/{name.strip().casefold()}"))
 
 
 def library_path(data_dir: Path | None = None) -> Path:

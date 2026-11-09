@@ -16,6 +16,7 @@ GUI_MODULES = {
     "test_annotations",
     "test_library_history",
     "test_library_import",
+    "test_library_selection",
     "test_library_and_input",
     "test_markdown",
     "test_navigation_fit",

@@ -360,6 +360,9 @@ class MainWindow(QMainWindow):
         self.history_panel.archive_requested.connect(self.archive_history_entry)
         self.history_panel.locate_requested.connect(self.locate_history_entry)
         self.history_panel.remove_requested.connect(self.remove_history_entry)
+        self.history_panel.remove_many_requested.connect(self.remove_history_entries)
+        self.history_panel.archive_many_requested.connect(self.archive_history_entries)
+        self.history_panel.restore_many_requested.connect(self.restore_history_entries)
         self.history_panel.export_requested.connect(self.export_history_entry_notes)
         self.history_panel.add_notebook_requested.connect(self.add_planned_notebook)
         self.history_panel.add_folder_requested.connect(self.add_pdf_folder)
@@ -1094,30 +1097,75 @@ class MainWindow(QMainWindow):
             self.load_pdf(Path(filename), pdf_key=entry.pdf_key, restore_last_page=True)
 
     def remove_history_entry(self, pdf_key: str) -> None:
-        self.history_entries = remove_history_entry(self.history_entries, pdf_key)
+        self.remove_history_entries([pdf_key], confirm=False)
+
+    def remove_history_entries(self, pdf_keys: list[str], *, confirm: bool = True) -> bool:
+        """Removes the books from the library with one save. Several books are removed only after one
+        confirmation naming how many; the PDF files and their notes stay on disk."""
+        keys = [key for key in dict.fromkeys(pdf_keys) if find_history_entry(self.history_entries, key)]
+        if not keys:
+            return False
+        if confirm and len(keys) > 1:
+            answer = QMessageBox.question(
+                self,
+                "Remove PDFs",
+                f"Remove {len(keys)} PDFs from the library?\n\nThe PDF files and their notes stay on disk.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+        for key in keys:
+            self.history_entries = remove_history_entry(self.history_entries, key)
         save_history(self.history_entries)
         library = load_library()
-        library.assignments.pop(pdf_key, None)
-        library.aliases.pop(pdf_key, None)
-        library.archived.pop(pdf_key, None)
+        for key in keys:
+            library.assignments.pop(key, None)
+            library.aliases.pop(key, None)
+            library.archived.pop(key, None)
         save_library(library)
         self.history_panel.set_entries(self.history_entries)
+        if len(keys) > 1:
+            self.statusBar().showMessage(f"Removed {len(keys)} PDFs from the library.", 4000)
+        return True
 
     def archive_history_entry(self, pdf_key: str) -> None:
-        if not find_history_entry(self.history_entries, pdf_key):
+        self.archive_history_entries([pdf_key])
+
+    def archive_history_entries(self, pdf_keys: list[str]) -> None:
+        keys = [key for key in dict.fromkeys(pdf_keys) if find_history_entry(self.history_entries, key)]
+        if not keys:
             return
         library = load_library()
-        library.archived[pdf_key] = utc_now()
+        for key in keys:
+            library.archived[key] = utc_now()
         save_library(library)
         self.history_panel.set_entries(self.history_entries)
-        self.statusBar().showMessage("Moved to archive.", 3000)
+        self.statusBar().showMessage("Moved to archive." if len(keys) == 1 else f"Moved {len(keys)} PDFs to archive.", 3000)
 
     def restore_history_entry(self, pdf_key: str) -> None:
+        self.restore_history_entries([pdf_key])
+
+    def restore_history_entries(self, pdf_keys: list[str]) -> None:
         library = load_library()
-        library.archived.pop(pdf_key, None)
+        for key in pdf_keys:
+            library.archived.pop(key, None)
         save_library(library)
         self.history_panel.set_entries(self.history_entries)
-        self.statusBar().showMessage("Restored from archive.", 3000)
+        self.statusBar().showMessage("Restored from archive." if len(pdf_keys) == 1 else f"Restored {len(pdf_keys)} PDFs from archive.", 3000)
+
+    def _delete_selected_library_books(self, *, permanently: bool) -> bool:
+        """Delete / D on Home: archive the selected books; with Shift, remove them from the library."""
+        keys = self.history_panel.selected_pdf_keys
+        if not keys:
+            return False
+        if permanently:
+            self.remove_history_entries(keys)
+        else:
+            active = [key for key in keys if key not in self.history_panel.library_state.archived]
+            if active:
+                self.archive_history_entries(active)
+        return True
 
     def rename_history_entry(self, pdf_key: str, name: str) -> None:
         library = load_library()
@@ -3386,15 +3434,13 @@ class MainWindow(QMainWindow):
         modifiers = event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
         current = self.main_stack.currentWidget()
         if current is self.history_panel:
-            if key in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace) and modifiers in (Qt.NoModifier, Qt.ShiftModifier):
-                pdf_key = self.history_panel.selected_pdf_key
-                if not pdf_key or (key == Qt.Key_D and modifiers != Qt.NoModifier):
-                    return False
-                if modifiers == Qt.ShiftModifier:
-                    self.remove_history_entry(pdf_key)
-                elif pdf_key not in self.history_panel.library_state.archived:
-                    self.archive_history_entry(pdf_key)
+            if key == Qt.Key_A and modifiers == Qt.ControlModifier:
+                self.history_panel.select_all_entries()
                 return True
+            if key in (Qt.Key_D, Qt.Key_Delete, Qt.Key_Backspace) and modifiers in (Qt.NoModifier, Qt.ShiftModifier):
+                if not self.history_panel.selected_pdf_keys or (key == Qt.Key_D and modifiers != Qt.NoModifier):
+                    return False
+                return self._delete_selected_library_books(permanently=modifiers == Qt.ShiftModifier)
             return False
         if current is self.reader_splitter and self.document is not None and modifiers == Qt.NoModifier:
             if key == Qt.Key_Left:
@@ -3446,12 +3492,7 @@ class MainWindow(QMainWindow):
             return
 
         if self.main_stack.currentWidget() is self.history_panel and event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
-            key = self.history_panel.selected_pdf_key
-            if key:
-                if event.modifiers() & Qt.ShiftModifier:
-                    self.remove_history_entry(key)
-                else:
-                    self.archive_history_entry(key)
+            if self._delete_selected_library_books(permanently=bool(event.modifiers() & Qt.ShiftModifier)):
                 event.accept()
                 return
 
