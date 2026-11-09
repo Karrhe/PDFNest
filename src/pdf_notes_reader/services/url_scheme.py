@@ -33,7 +33,10 @@ def registration_hint(platform: str | None = None) -> str:
     if platform == "win32":
         return ""
     if platform == "darwin":
-        return "On macOS, PDFNest.app handles pdfnest:// links itself once it is in Applications."
+        return (
+            "On macOS, pdfnest:// links in your notes always open PDFNest at that page. "
+            "If clicking one does nothing, move PDFNest.app to Applications and open it once."
+        )
     return "Registering pdfnest:// links is only supported on Windows."
 
 

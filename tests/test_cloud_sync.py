@@ -43,7 +43,7 @@ from pdf_notes_reader.portable import (
     portable_relpath,
 )
 from pdf_notes_reader.settings import load_settings, save_settings, settings_path
-from pdf_notes_reader.storage_migration import migrate_storage
+from pdf_notes_reader.storage_migration import local_migration_state_path, migrate_storage
 
 
 @pytest.fixture
@@ -184,7 +184,9 @@ def test_migration_backfills_old_notebooks_without_rekeying(machines) -> None:
     assert manifest["relpath"] == "../Books/a.pdf"
     assert manifest["fingerprint"] == pdf_fingerprint(pc / "Books" / "a.pdf")
     assert (notebooks_dir(pc_data) / "a" / "note" / "notes.json").read_bytes() == notes_before
-    assert json.loads((pc_data / "migration_state.json").read_text(encoding="utf-8"))["schema_version"] == 2
+    # The state is kept on this computer, not in the shared folder (two writers made conflict copies).
+    assert json.loads((pc_data / "migration_state.json").read_text(encoding="utf-8"))["schema_version"] == 1
+    assert json.loads(local_migration_state_path().read_text(encoding="utf-8"))["folders"]
     assert migrate_storage(pc_data) is False  # runs once per data folder
 
     # Same machine: the old path key still opens it.
@@ -687,3 +689,110 @@ def test_folders_and_books_in_icloud_conflict_copies_are_recovered(tmp_path) -> 
     assert library.assignments == {"b1": "f-pc", "b2": "f-mac"}
     assert [e.pdf_key for e in load_history(data)] == ["b2"]
     assert not (data / "library 2.json").exists() and list((data / "conflicts").glob("library 2.*.json"))
+
+
+# --- Fewer shared writes, so the cloud drive makes no conflict copies --------------------------
+
+
+def test_settings_are_written_only_when_a_shared_preference_changes(tmp_path) -> None:
+    shared = tmp_path / "cloud" / "PDFNest"
+    settings = load_settings(shared)
+    settings["theme"] = "white"
+    save_settings(settings, data_dir=shared)
+    path = settings_path(shared)
+    before = path.stat().st_mtime_ns
+
+    # Closing the window saves its size: this computer's, so the shared file is left alone.
+    settings["window_width"] = 1400
+    save_settings(settings, data_dir=shared)
+    assert path.stat().st_mtime_ns == before
+    assert json.loads(machine_settings_path().read_text(encoding="utf-8"))["window_width"] == 1400
+
+
+def test_stale_settings_do_not_undo_the_other_computers_change(tmp_path) -> None:
+    shared = tmp_path / "cloud" / "PDFNest"
+    save_settings(load_settings(shared), data_dir=shared)
+    here = load_settings(shared)  # loaded before the other computer's change arrived
+    payload = json.loads(settings_path(shared).read_text(encoding="utf-8"))
+    payload["theme"] = "beige"  # the other computer changed the theme
+    settings_path(shared).write_text(json.dumps(payload), encoding="utf-8")
+
+    here["wheel_scroll_lines"] = 7  # this computer changes something else
+    save_settings(here, data_dir=shared)
+    saved = json.loads(settings_path(shared).read_text(encoding="utf-8"))
+    assert saved["theme"] == "beige"
+    assert saved["wheel_scroll_lines"] == 7
+
+
+def test_settings_conflict_copies_are_moved_aside(tmp_path) -> None:
+    shared = tmp_path / "cloud" / "PDFNest"
+    save_settings(load_settings(shared), data_dir=shared)
+    for name in ("user_config 2.json", "user_config(1).json"):
+        (shared / name).write_text("{}", encoding="utf-8")
+    load_settings(shared)
+    assert not (shared / "user_config 2.json").exists()
+    assert not (shared / "user_config(1).json").exists()
+    assert len(list((shared / "conflicts").glob("user_config*.json"))) == 2
+
+
+def test_migration_state_stays_on_this_computer(machines) -> None:
+    pc, _mac = machines
+    data = pc / "PDFNest"
+    data.mkdir()
+    (data / "migration_state(1).json").write_text("{}", encoding="utf-8")
+    migrate_storage(data)
+    assert not (data / "migration_state.json").exists()
+    assert not (data / "migration_state(1).json").exists()
+    assert migrate_storage(data) is False
+
+
+def test_library_and_book_list_write_only_this_computers_replica(isolated_storage) -> None:
+    from pdf_notes_reader.library import LibraryFolder, load_library, save_library
+
+    state = load_library()
+    state.folders.append(LibraryFolder.create("Physics"))
+    save_library(state)
+    assert not (isolated_storage / "library.json").exists()
+    assert any(folder.name == "Physics" for folder in load_library().folders)
+    assert len(list((isolated_storage / "library.json.sync").glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize("name", ["notes(1).json", "notes (1).json"])
+def test_windows_style_conflict_copy_names(tmp_path, name) -> None:
+    (tmp_path / "notes.json").write_text("{}", encoding="utf-8")
+    (tmp_path / name).write_text("{}", encoding="utf-8")
+    assert tmp_path / name in conflict_copies(tmp_path / "notes.json")
+
+
+# --- pdfnest:// links written on the other computer --------------------------------------------
+
+
+def test_link_from_the_other_computer_finds_the_pdf_here(machines) -> None:
+    from pdf_notes_reader.history import PdfHistoryEntry, local_pdf_for_link
+
+    _pc, mac = machines
+    here = mac / "Books" / "a.pdf"
+    windows_path = r"C:\Users\x\iCloudDrive\Books\a.pdf"
+    entry = PdfHistoryEntry(
+        pdf_key="k1", path=str(here), title="a", last_page_index=0, page_count=3, opened_at="", updated_at="",
+        machine_paths={"pc": windows_path, "mac": str(here)},
+    )
+    other = PdfHistoryEntry(pdf_key="k2", path=str(mac / "Books" / "missing.pdf"), title="b", last_page_index=0, page_count=1, opened_at="", updated_at="")
+    entries = [other, entry]
+    assert local_pdf_for_link(windows_path, "k1", entries) == here  # by key
+    assert local_pdf_for_link(windows_path, "", entries) == here  # older link: by the recorded path
+    assert local_pdf_for_link(r"D:\elsewhere\a.pdf", "", entries) == here  # by unique file name
+    assert local_pdf_for_link(r"D:\elsewhere\nothing.pdf", "", entries) is None
+
+
+def test_vault_note_keeps_the_path_it_was_written_with(tmp_path) -> None:
+    from pdf_notes_reader.services import obsidian
+
+    item = note("key-1", "body")
+    item.note_type = "point"
+    windows_text = obsidian.render_note_file(item, r"C:\Books\a.pdf")
+    blocks, _body = obsidian.parse_note_file(windows_text)
+    # Saved again on the Mac: same file, not rewritten with the Mac's path.
+    assert obsidian.render_note_file(item, Path("/Users/x/Books/a.pdf"), blocks) == windows_text
+    request = obsidian.parse_pdfnest_url(obsidian.front_matter_value(blocks, "link"))
+    assert request is not None and request.pdf_key == "key-1"

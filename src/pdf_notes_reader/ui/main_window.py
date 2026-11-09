@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 from pdf_notes_reader.history import (
     find_history_entry,
     history_path,
+    local_pdf_for_link,
     load_history,
     reload_history_into,
     remove_history_entry,
@@ -85,6 +86,7 @@ from pdf_notes_reader.settings import (
     save_settings,
     themes_dir,
 )
+from pdf_notes_reader import sync_store
 from pdf_notes_reader.portable import icloud_stub_for, request_cloud_download
 from pdf_notes_reader.storage_migration import migrate_storage
 from pdf_notes_reader.ui.canvas import PdfCanvas, wheel_zoom_delta
@@ -1322,13 +1324,8 @@ class MainWindow(QMainWindow):
         self._report_export_errors()
 
     def _library_files_stamp(self) -> tuple[int, int]:
-        stamps = []
-        for path in (history_path(), library_path()):
-            try:
-                stamps.append(path.stat().st_mtime_ns)
-            except OSError:
-                stamps.append(0)
-        return stamps[0], stamps[1]
+        # The replicas each computer writes, not only the plain files (no longer rewritten).
+        return sync_store.files_stamp(history_path()), sync_store.files_stamp(library_path())
 
     def refresh_library_from_disk(self, *, force: bool = False) -> bool:
         """Picks up books, folders, archive changes and reading positions saved by the other computer
@@ -2143,7 +2140,7 @@ class MainWindow(QMainWindow):
             title = self._default_note_title(annotation.page_index, annotation.note_number)
             quote = "\n".join(f"> {line}" if line else ">" for line in annotation.selected_text.strip().splitlines())
             if self.vault is not None and self.pdf_path is not None:
-                link = pdfnest_url(self.pdf_path, annotation.page_index + 1, annotation.id)
+                link = pdfnest_url(self.pdf_path, annotation.page_index + 1, annotation.id, self.pdf_key or "")
                 quote += f"\n> — [p.{annotation.page_index + 1}]({link})"
             annotation.markdown = f"# {title}\n\n{quote}\n\n"
         annotation.has_note = True
@@ -2454,7 +2451,7 @@ class MainWindow(QMainWindow):
         current = self.note_panel.editor.toPlainText().rstrip()
         quote = "\n".join(f"> {line}" if line else ">" for line in cleaned.splitlines())
         if link_back:
-            link = pdfnest_url(self.pdf_path, page_index + 1, marker.id if marker is not None else "")
+            link = pdfnest_url(self.pdf_path, page_index + 1, marker.id if marker is not None else "", self.pdf_key or "")
             quote += f"\n> — [p.{page_index + 1}]({link})"
         updated = f"{current}\n\n{quote}\n" if current else f"{quote}\n"
         self.note_panel.editor.setPlainText(updated)
@@ -2713,11 +2710,16 @@ class MainWindow(QMainWindow):
         request = parse_pdfnest_url(url)
         if request is None:
             return False
-        if not request.path.is_file():
-            self.statusBar().showMessage(f"The PDF was not found: {request.path}", 8000)
+        # The link may come from the other computer, with its path to the PDF: find the copy here.
+        pdf_path = local_pdf_for_link(str(request.path), request.pdf_key, self.history_entries)
+        if pdf_path is None:
+            self.refresh_library_from_disk(force=True)
+            pdf_path = local_pdf_for_link(str(request.path), request.pdf_key, self.history_entries)
+        if pdf_path is None:
+            self.statusBar().showMessage(f"The PDF was not found on this computer: {request.path}", 8000)
             return False
-        key = resolve_pdf_key(request.path)
-        self.load_pdf(request.path, pdf_key=key)
+        key = resolve_pdf_key(pdf_path)
+        self.load_pdf(pdf_path, pdf_key=key)
         if self.document is None or self.pdf_key != key:
             return False
         note = find_note(self.notes, request.note_id) if request.note_id else None

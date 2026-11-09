@@ -185,23 +185,13 @@ def _state_from_payload(payload: Any) -> LibraryState:
     return LibraryState(folders=folders, assignments=assignments, aliases=aliases, archived=archived)
 
 
-def _payload(state: LibraryState) -> dict[str, Any]:
-    return {
-        "schema_version": 1,
-        "app": "PDFNest",
-        "folders": [folder.to_dict() for folder in state.folders],
-        "assignments": dict(sorted(state.assignments.items())),
-        "aliases": dict(sorted(state.aliases.items())),
-        "archived": dict(sorted(state.archived.items())),
-    }
-
-
 def save_library(state: LibraryState, data_dir: Path | None = None) -> Path:
     """Records this computer's library changes and updates ``state`` to the merged library.
 
     Only what changed here since ``state`` was loaded is written, into this computer's own replica,
     so a state that is out of date never removes a folder, filing or archive change made on the other
-    computer. ``library.json`` is rewritten as a readable copy of the merged library.
+    computer. The plain ``library.json`` is no longer rewritten (every computer writing it made
+    cloud-sync conflict copies); it is still read, for records no replica knows yet.
     """
     path = library_path(data_dir)
     merged_records = sync_store.save_records(
@@ -209,7 +199,6 @@ def save_library(state: LibraryState, data_dir: Path | None = None) -> Path:
         _records(state),
         state.base,
         legacy=_legacy_records(path),
-        materialize=lambda records: _payload(_state_from_records(records)),
     )
     merged = _state_from_records(merged_records)
     state.folders[:] = merged.folders

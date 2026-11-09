@@ -161,14 +161,14 @@ def ensure_local(path: str | Path, *, timeout: float | None = None) -> bool:
     return path.exists()
 
 
-_CONFLICT_SUFFIX = re.compile(r"^(?: \d+| \(.*\)|-[^.]+)$")
+_CONFLICT_SUFFIX = re.compile(r"^(?: \d+| ?\(.*\)|-[^.]+)$")
 
 
 def conflict_copies(path: str | Path) -> list[Path]:
     """Copies a sync client made of ``path`` when two machines changed it at once.
 
-    iCloud names them ``notes 2.json``, Dropbox ``notes (Name's conflicted copy 2026-11-08).json`` and
-    OneDrive ``notes-PCNAME.json``. Temp files (``notes.json.x.tmp``) and quarantined copies
+    iCloud names them ``notes 2.json`` (``notes(1).json`` on Windows), Dropbox
+    ``notes (Name's conflicted copy 2026-11-08).json`` and OneDrive ``notes-PCNAME.json``. Temp files (``notes.json.x.tmp``) and quarantined copies
     (``notes.corrupt-….json``) do not match.
     """
     path = Path(path)

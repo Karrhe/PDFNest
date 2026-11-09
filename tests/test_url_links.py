@@ -178,3 +178,13 @@ def test_second_launch_hands_links_to_the_running_instance(qapp) -> None:
         assert received == [[link]]
     finally:
         server.close()
+
+
+def test_open_url_written_on_another_computer(tmp_path, window, qapp) -> None:
+    """A link from the other computer names its own path; the book's key finds the copy here."""
+    pdf_path = pdf_factory.create_sample_pdf(tmp_path / "book.pdf", page_count=5)
+    window.load_pdf(pdf_path)
+    key = window.pdf_key
+    assert window.open_url(pdfnest_url(r"Z:\not\on\this\computer\renamed.pdf", 3, pdf_key=key))
+    assert window.pdf_key == key
+    assert window.page_index == 2

@@ -6,8 +6,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from pdf_notes_reader.notes import _atomic_write_json, default_data_dir, machine_settings_path, read_json_checked, set_configured_data_dir
-from pdf_notes_reader.portable import is_native_absolute_path
+from pdf_notes_reader.notes import (
+    _atomic_write_json,
+    default_data_dir,
+    machine_settings_path,
+    read_json_checked,
+    record_storage_issue,
+    set_configured_data_dir,
+)
+from pdf_notes_reader.portable import conflict_copies, is_native_absolute_path, move_aside
 
 
 DEFAULT_THEMES: dict[str, dict[str, str]] = {
@@ -174,10 +181,49 @@ def load_theme_files(data_dir: Path | None = None) -> dict[str, dict[str, str]]:
     return themes
 
 
+# The shared preferences as this process last loaded or saved them, per user_config.json: a
+# preference that differs from it was changed here. See save_settings.
+_SHARED_BASES: dict[str, dict[str, Any]] = {}
+
+
+def _shared_values(settings: dict[str, Any]) -> dict[str, Any]:
+    return {key: settings.get(key) for key in DEFAULT_SETTINGS if key not in MACHINE_SETTINGS}
+
+
+def _base_key(path: Path) -> str:
+    return os.path.normcase(str(path))
+
+
+def _set_aside_conflict_copies(path: Path) -> None:
+    """Moves cloud-sync conflict copies of ``path`` (``user_config 2.json``...) into ``conflicts/``.
+
+    The main file wins: settings are preferences, not data, and the copies are kept for recovery.
+    """
+    copies = conflict_copies(path)
+    if not copies:
+        return
+    folder = path.parent / "conflicts"
+    moved = [copy for copy in copies if move_aside(copy, folder) is not None]
+    if moved:
+        record_storage_issue(
+            f"{path.name} had {len(moved)} conflicting cop{'y' if len(moved) == 1 else 'ies'} from cloud sync; "
+            f"they were moved to {folder}.",
+            path,
+        )
+
+
 def load_settings(data_dir: Path | None = None) -> dict[str, Any]:
+    settings = _load_settings(data_dir)
+    _SHARED_BASES[_base_key(settings_path(data_dir))] = _shared_values(settings)
+    return settings
+
+
+def _load_settings(data_dir: Path | None = None) -> dict[str, Any]:
     settings = deepcopy(DEFAULT_SETTINGS)
     ensure_default_themes(data_dir)
     path = settings_path(data_dir)
+    if path.parent.is_dir():
+        _set_aside_conflict_copies(path)
     loaded = read_json_checked(path) if path.exists() else None
     if not isinstance(loaded, dict):
         # A new (for example freshly synced, still empty) data folder: this computer's own settings
@@ -225,10 +271,39 @@ def save_settings(settings: dict[str, Any], data_dir: Path | None = None) -> Pat
     payload["window_maximized"] = bool(payload.get("window_maximized"))
     payload["storage_dir"] = str(storage_dir)
     _clean_obsidian_settings(payload)
-    _atomic_write_json(path, payload)
+    _write_shared_settings(path, payload)
     machine = {key: payload[key] for key in sorted(MACHINE_SETTINGS)}
     try:
         _atomic_write_json(machine_settings_path(), {"schema_version": 1, "app": "PDFNest", **machine})
     except OSError:
         pass  # The shared file still holds them; only the per-computer override is missing.
     return path
+
+
+def _write_shared_settings(path: Path, payload: dict[str, Any]) -> None:
+    """Writes ``user_config.json`` only when a shared preference changed here.
+
+    The file may be shared by several computers through a cloud drive, which keeps a conflict copy
+    (``user_config 2.json``) whenever two of them write it between syncs. So closing the window, or
+    any save that changes nothing shared, writes nothing. A write takes the file as it is now and
+    applies only the preferences changed here since loading, so a stale copy never undoes a change
+    made on the other computer.
+    """
+    key = _base_key(path)
+    base = _SHARED_BASES.get(key)
+    ours = _shared_values(payload)
+    on_disk = read_json_checked(path) if path.exists() else None
+    if isinstance(on_disk, dict):
+        merged = _shared_values({**DEFAULT_SETTINGS, **{k: v for k, v in on_disk.items() if k in DEFAULT_SETTINGS}})
+        for name, value in ours.items():
+            if base is None or base.get(name) != value:
+                merged[name] = value
+        unchanged = all(name in on_disk and on_disk[name] == value for name, value in merged.items())
+    else:
+        merged = ours
+        unchanged = False
+    _SHARED_BASES[key] = dict(merged)
+    if unchanged:
+        return
+    # Machine settings are written too, only as defaults for a computer without a machine file yet.
+    _atomic_write_json(path, {**payload, **merged})

@@ -2,6 +2,27 @@
 
 All notable changes to PDFNest. Issue IDs refer to [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
 
+## 0.3.6 — 2026-11-09
+
+### Fixed
+- The data folder filled up with cloud-sync conflict copies (`user_config 2.json`, `user_config(1).json`,
+  `recentnotes 2.json`, `migration_state(1).json`…). They came from both computers writing the same files:
+  - `user_config.json` was rewritten on every window close. It is now written only when a shared
+    preference changes, and only the preferences changed on this computer are applied to the file as it
+    is, so a stale copy never undoes the other computer's change.
+  - `migration_state.json` belongs to one computer; it is now kept beside the data-folder pointer, which
+    is never synced. The old file is still read, never written.
+  - `library.json` and `recentnotes.json` were rewritten as readable copies after every save. Each
+    computer's replica in `*.json.sync/` already holds everything, so the plain files are now only read.
+  - Conflict copies named like `name(1).json` were not recognised. Existing copies of every kind are
+    merged (library, book list, notes) or moved into `conflicts/` (settings, migration state) on start.
+- Obsidian “Links back” did not work on the Mac. A `pdfnest://` link held the PDF path of the computer that
+  wrote the note, so a note written on Windows pointed the Mac at `C:\…`. Links now also carry the
+  book's id, and opening one finds this computer's copy: by id, else by any computer's recorded path,
+  else by a unique file name, so older links work too. Vault note files keep the path they were written
+  with instead of flipping between the two computers' paths on every save.
+- On macOS the *Links back* setting was a greyed-out checkbox; it now says that links always work there.
+
 ## 0.3.5 — 2026-11-09
 
 ### Added

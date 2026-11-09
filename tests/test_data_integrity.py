@@ -167,8 +167,9 @@ def test_corrupt_library_is_quarantined_before_reset(isolated_storage):
     state = load_library()
     state.folders.append(LibraryFolder.create("Physics"))
     save_library(state)
+    # A damaged plain library.json (from an older PDFNest; this version only reads it).
     path = isolated_storage / "library.json"
-    good = path.read_text(encoding="utf-8")
+    good = '{"schema_version": 1, "folders": []}'
     path.write_text(good[:20], encoding="utf-8")
 
     reset = load_library()

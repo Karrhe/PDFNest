@@ -116,7 +116,7 @@ class NotesStorageTest(StorageIsolationMixin, unittest.TestCase):
             self.assertTrue(migrate_storage(data_dir, legacy_roots=[data_dir]))
 
             notebook_dir = data_dir / "notebooks" / "legacy"
-            self.assertTrue((data_dir / "recentnotes.json").exists())
+            self.assertTrue((data_dir / "recentnotes.json.sync").is_dir())
             self.assertTrue((data_dir / "notebooks" / "index.json").exists())
             self.assertTrue((notebook_dir / "note" / "notes.json").exists())
             loaded_notes, counters, bookmarks = load_notes_data(pdf_key, data_dir=data_dir)

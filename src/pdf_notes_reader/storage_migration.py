@@ -19,8 +19,10 @@ from pdf_notes_reader.notes import (
     rebuild_notebook_index,
     record_storage_issue,
     save_notes,
+    storage_pointer_path,
     utc_now,
 )
+from pdf_notes_reader.portable import conflict_copies, move_aside
 from pdf_notes_reader.settings import DEFAULT_SETTINGS, save_settings, settings_path
 
 
@@ -29,16 +31,34 @@ MIGRATION_VERSION = 2
 
 
 def migration_state_path(data_dir: Path | None = None) -> Path:
+    """The state written by PDFNest 0.3.4 and older, inside the (possibly shared) data folder.
+
+    It is still read, so a data folder migrated by an older version is not migrated again, but no
+    longer written: two computers rewriting it made cloud-sync conflict copies.
+    """
     return (data_dir or default_data_dir()) / "migration_state.json"
+
+
+def local_migration_state_path() -> Path:
+    """Per-computer migration state, beside the data-folder pointer (never synced)."""
+    return storage_pointer_path().parent / "migration_state.json"
+
+
+def _folder_key(target_dir: Path) -> str:
+    return os.path.normcase(str(Path(target_dir).expanduser().resolve(strict=False)))
 
 
 def migrate_storage(data_dir: Path | None = None, *, legacy_roots: list[Path] | None = None) -> bool:
     target_dir = data_dir or default_data_dir()
-    state_path = migration_state_path(target_dir)
-    state = _read_migration_state(state_path)
-    version = _state_version(state)
+    shared_path = migration_state_path(target_dir)
+    _set_aside_conflict_copies(shared_path)
+    shared = _read_migration_state(shared_path)
+    local = _local_state(target_dir)
+    version = max(_state_version(shared), _state_version(local))
     # Locators are relative to the data folder, so a copied or moved data folder recomputes them.
-    locators_current = version >= 2 and str(state.get("locators_dir") or "") == str(target_dir)
+    locators_current = (_state_version(local) >= 2) or (
+        _state_version(shared) >= 2 and str(shared.get("locators_dir") or "") == str(target_dir)
+    )
     if version >= MIGRATION_VERSION and locators_current:
         return False
 
@@ -52,8 +72,15 @@ def migrate_storage(data_dir: Path | None = None, *, legacy_roots: list[Path] | 
         rebuild_notebook_index(target_dir)
     if not locators_current:
         migrated = backfill_portable_locators(target_dir) or migrated
-    _write_migration_state(state_path, target_dir)
+    _write_local_state(target_dir)
     return migrated
+
+
+def _set_aside_conflict_copies(path: Path) -> None:
+    if not path.parent.is_dir():
+        return
+    for copy in conflict_copies(path):
+        move_aside(copy, path.parent / "conflicts")
 
 
 def _read_migration_state(path: Path) -> dict[str, Any]:
@@ -67,6 +94,12 @@ def _read_migration_state(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _local_state(target_dir: Path) -> dict[str, Any]:
+    folders = _read_migration_state(local_migration_state_path()).get("folders")
+    entry = folders.get(_folder_key(target_dir)) if isinstance(folders, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
 def _state_version(state: dict[str, Any]) -> int:
     try:
         return int(state.get("schema_version", 0))
@@ -74,17 +107,19 @@ def _state_version(state: dict[str, Any]) -> int:
         return 0
 
 
-def _migration_complete(path: Path) -> bool:
-    return _state_version(_read_migration_state(path)) >= MIGRATION_VERSION
-
-
-def _write_migration_state(path: Path, target_dir: Path) -> None:
-    payload = {
+def _write_local_state(target_dir: Path) -> None:
+    path = local_migration_state_path()
+    payload = _read_migration_state(path)
+    folders = payload.get("folders") if isinstance(payload.get("folders"), dict) else {}
+    folders[_folder_key(target_dir)] = {
         "schema_version": MIGRATION_VERSION,
         "migrated_at": utc_now(),
         "locators_dir": str(target_dir),
     }
-    _atomic_write_json(path, payload)
+    try:
+        _atomic_write_json(path, {"schema_version": 1, "app": "PDFNest", "folders": folders})
+    except OSError as exc:
+        record_storage_issue(f"Could not save the migration state ({exc}); it runs again next start.", path)
 
 
 def backfill_portable_locators(target_dir: Path) -> bool:

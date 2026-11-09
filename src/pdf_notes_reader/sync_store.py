@@ -9,9 +9,10 @@ So no file here is written by two computers. For a logical file ``X.json`` each 
 only its own replica, ``X.json.sync/<machine id>.json``, holding every record it knows with the
 time it last changed, and an explicit tombstone for a record it deleted. Reading merges all
 replicas: per record, the newest change wins. A stale computer can at worst re-save old knowledge
-under old timestamps, which loses to the newer change. ``X.json`` itself is still written, as a
-plain readable copy of the merged result for backups and older PDFNest versions, but it is only
-read for records no replica knows (data from before this scheme).
+under old timestamps, which loses to the newer change. A plain ``X.json`` from before this scheme is
+only read, for records no replica knows. Callers that pass ``materialize`` still rewrite it as a
+readable copy; files that every computer changes often (the library, the book list) must not, or
+the cloud drive makes conflict copies of them.
 """
 
 from __future__ import annotations
@@ -156,6 +157,17 @@ def save_records(
     if materialize is not None:
         _notes._atomic_write_json(path, materialize(merged))
     return merged
+
+
+def files_stamp(path: Path) -> int:
+    """Changes whenever ``path`` or any computer's replica of it changes: for noticing sync."""
+    stamp = 0
+    for candidate in [path, *_replica_files(path)]:
+        try:
+            stamp = max(stamp, candidate.stat().st_mtime_ns)
+        except OSError:
+            continue
+    return stamp ^ len(_replica_files(path))
 
 
 def has_replicas(path: Path) -> bool:

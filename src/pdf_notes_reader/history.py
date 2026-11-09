@@ -9,7 +9,7 @@ from pdf_notes_reader.notes import default_data_dir, notebook_dir_for_pdf, pdf_k
 from pdf_notes_reader.notes import _atomic_write_json, _ensure_cover, _manifest_payload, _markups_payload, _write_sync_lock, read_json_checked
 from pdf_notes_reader.notes import _LOCATOR_CACHE, _absorb_conflicts, _dict_list, machine_id, read_manifest
 from pdf_notes_reader import sync_store
-from pdf_notes_reader.portable import ensure_local, icloud_stub_for, portable_relpath
+from pdf_notes_reader.portable import ensure_local, foreign_basename, icloud_stub_for, normalize_portable, portable_relpath
 
 
 @dataclass
@@ -152,11 +152,6 @@ def _entries_from_records(records: dict[str, Any], data_dir: Path | None) -> lis
     return sorted(entries, key=lambda entry: entry.updated_at, reverse=True)
 
 
-def _materialize(records: dict[str, Any]) -> dict[str, Any]:
-    entries = sorted((data for data in records.values() if isinstance(data, dict)), key=lambda item: str(item.get("updated_at", "")), reverse=True)
-    return {"schema_version": 1, "app": "PDFNest", "entries": entries}
-
-
 def load_history(data_dir: Path | None = None) -> list[PdfHistoryEntry]:
     """Every computer's books, merged (see ``sync_store``): newest change per book wins."""
     path = history_path(data_dir)
@@ -219,13 +214,49 @@ def resolve_entry_path(entry: PdfHistoryEntry, data_dir: Path) -> None:
         return
 
 
+def local_pdf_for_link(path_text: str, pdf_key: str, entries: list[PdfHistoryEntry]) -> Path | None:
+    """The PDF on this computer that a pdfnest:// link points to, which another computer may have
+    written with its own path (a Windows path opened on a Mac).
+
+    In order: the path itself, when it exists here; the book with the link's ``key``; a book that
+    any computer recorded at that path (links from before keys); a unique book with that file name.
+    ``entries`` are the library's books with paths already resolved for this computer.
+    """
+    path = Path(path_text)
+    try:
+        if path_text and path.is_file():
+            return path
+    except (OSError, ValueError):
+        pass
+
+    def here(entry: PdfHistoryEntry) -> Path | None:
+        candidate = Path(entry.path)
+        return candidate if entry.path and candidate.is_file() else None
+
+    if pdf_key:
+        for entry in entries:
+            if entry.pdf_key == pdf_key and here(entry):
+                return here(entry)
+    wanted = normalize_portable(path_text)
+    for entry in entries:
+        recorded = [entry.path, *entry.machine_paths.values()]
+        if wanted and any(normalize_portable(item) == wanted for item in recorded) and here(entry):
+            return here(entry)
+    name = normalize_portable(foreign_basename(path_text))
+    matches = [entry for entry in entries if name and normalize_portable(Path(entry.path).name) == name and here(entry)]
+    if len({entry.pdf_key for entry in matches}) == 1:
+        return here(matches[0])
+    return None
+
+
 def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *, touched_pdf_keys: set[str] | None = None) -> Path:
     """Records this computer's changes to the book list and updates ``entries`` (in place) to the
     merged list of all computers sharing the data folder.
 
     Only books that changed here (or were removed here) are written as changes, into this computer's
     own replica, so saving a list that is out of date never removes or rolls back what the other
-    computer did. ``recentnotes.json`` is rewritten as a readable copy of the merged list.
+    computer did. The plain ``recentnotes.json`` is no longer rewritten: every computer writing it
+    made cloud-sync conflict copies. It is still read, for books no replica knows yet.
     """
     path = history_path(data_dir)
     root = data_dir or default_data_dir()
@@ -238,7 +269,6 @@ def save_history(entries: list[PdfHistoryEntry], data_dir: Path | None = None, *
         _HISTORY_BASES.get(str(path)),
         legacy=_legacy_records(data_dir),
         combine=_combine_machine_paths,
-        materialize=_materialize,
     )
     updated = _entries_from_records(merged, data_dir)
     _HISTORY_BASES[str(path)] = {entry.pdf_key: entry.to_dict() for entry in updated}

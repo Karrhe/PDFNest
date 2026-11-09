@@ -163,10 +163,14 @@ class SettingsDialog(QDialog):
         self.register_links_checkbox = QCheckBox("Let pdfnest:// links in notes open PDFNest at that page")
         self.register_links_checkbox.setToolTip("Registers PDFNest as the handler of pdfnest:// links for your Windows user")
         self.register_links_checkbox.setChecked(bool(settings.get("register_pdfnest_links")))
+        self.links_back_widget: QWidget = self.register_links_checkbox
         if not can_register_links():
-            # macOS declares the scheme in the app bundle's Info.plist; nothing to register.
-            self.register_links_checkbox.setEnabled(False)
-            self.register_links_checkbox.setToolTip(link_registration_hint())
+            # macOS declares the scheme in the app bundle's Info.plist: links always work, so there
+            # is nothing to switch on. A greyed-out checkbox read as "not available here".
+            self.register_links_checkbox.setVisible(False)
+            self.links_back_widget = QLabel(link_registration_hint())
+            self.links_back_widget.setWordWrap(True)
+            self.links_back_widget.setObjectName("SettingsHint")
         self.vault_hint = QLabel()
         self.vault_hint.setWordWrap(True)
         self.vault_hint.setObjectName("SettingsHint")
@@ -230,7 +234,7 @@ class SettingsDialog(QDialog):
         obsidian_form = QFormLayout()
         obsidian_form.addRow("Vault folder", vault_row)
         obsidian_form.addRow("Folder in vault", self.obsidian_subfolder_edit)
-        obsidian_form.addRow("Links back", self.register_links_checkbox)
+        obsidian_form.addRow("Links back", self.links_back_widget)
         obsidian_form.addRow("", self.vault_hint)
         self._add_settings_page("Obsidian", obsidian_form)
         self.category_list.setCurrentItem(self.category_list.topLevelItem(0))

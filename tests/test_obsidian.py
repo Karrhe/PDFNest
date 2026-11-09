@@ -51,7 +51,7 @@ def test_note_file_layout_and_front_matter(tmp_path) -> None:
     assert obsidian.front_matter_value(blocks, "page") == "25"
     assert body == note.markdown
     request = parse_pdfnest_url(obsidian.front_matter_value(blocks, "link"))
-    assert request == obsidian.OpenRequest(PDF, 25, note.id)
+    assert request == obsidian.OpenRequest(PDF, 25, note.id, note.pdf_key)
 
     index = (path.parent / INDEX_NAME).read_text(encoding="utf-8")
     assert "[[PDFNest/An Intro (Mantegna) (z-lib) -2/p25 Scaling-1|Scaling-1]]" in index
@@ -257,7 +257,7 @@ def test_appended_excerpts_link_back_to_their_marker(tmp_path, vault_window) -> 
     window.append_selected_text_to_current_note("quoted words", page_index=1, rects_norm=[[0.1, 0.1, 0.4, 0.2]])
     excerpt = next(note for note in window.notes if note.note_type == "excerpt")
     parent = window.notes[0]
-    assert f"> quoted words\n> — [p.2]({pdfnest_url(pdf_path, 2, excerpt.id)})" in parent.markdown
+    assert f"> quoted words\n> — [p.2]({pdfnest_url(pdf_path, 2, excerpt.id, window.pdf_key)})" in parent.markdown
     assert excerpt.linked_note_id == parent.id
 
 

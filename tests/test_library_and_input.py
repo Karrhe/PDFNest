@@ -359,5 +359,5 @@ def test_adding_the_pdf_on_a_second_computer_attaches_it_to_the_book(tmp_path, w
     [entry] = window.history_entries
     assert Path(entry.path) == here.resolve() and entry.located_here
     assert entry.last_page_index == 2  # reading position kept
-    saved = json.loads((default_data_dir() / "recentnotes.json").read_text(encoding="utf-8"))["entries"][0]
-    assert saved["machine_paths"] == {"other-computer": str(elsewhere), machine_id(): str(here.resolve())}
+    [saved] = load_history()
+    assert saved.machine_paths == {"other-computer": str(elsewhere), machine_id(): str(here.resolve())}
